@@ -83,14 +83,22 @@ or `native` (reject unsupported core inputs without JavaScript fallback).
 
 The core adapter targets exactly StrykerJS 10.0.0's internal `TestCoverage.from`
 and `MutantTestPlanner.prototype.makePlan`; it checks the pinned classes,
-descriptors and original helpers before installation. Rust receives ordered
+key-specific method/getter fingerprints, constructor identities and descriptors
+before installation. Instrumenter installation targets are preflighted before
+any core hooks are installed. Rust receives ordered
 coverage pairs and one batch of post-diff planning inputs. Node retains original
 test/mutant objects, Map/Set order, constructor snapshots, test-filter aliases,
 warnings, reporter events and sandbox calls. Custom helpers, subclasses,
 accessors, proxies, coverage instances created outside the installed factory and
 values the JSON boundary cannot preserve use the original path in `auto` mode.
-After incremental diff, fallback plans the already-diffed
-mutants exactly once. Errors from diff, loggers, sandbox and reporters propagate.
+Coverage containing unknown test IDs also uses upstream indexing: its warning
+callbacks can change coverage before hit totals are calculated. Native planning
+accepts only the pinned `Sandbox.sandboxFileFor` method on its data receiver with
+an ordinary, unmodified Map; custom sandbox callbacks use upstream planning
+before diff or row callbacks run. Forced `native` mode rejects these cases.
+After incremental diff, fallback invokes the live `planMutant` method for each
+already-diffed mutant, without repeating the diff. Errors from diff, loggers,
+sandbox and reporters propagate without replay.
 
 `installAcceleration()` returns the existing numeric `cache.stats` plus separate
 `cache.coreStats`: engine, actual `nativeCoreStages`, native coverage/planning
