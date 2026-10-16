@@ -235,40 +235,48 @@ grammar trigger atomic fallback. HTML and Vue bypass
 result caching and use native serial recovery for parallel requests.
 
 Native `.svelte` accepts an optional canonical `<script context="module">`
-JavaScript module script, an optional attribute-free top-level JavaScript
-instance script, and attribute-free plain JavaScript `<script>` elements nested
-inside explicitly balanced ordinary elements from a bounded lowercase set.
-At least one script is required. Static text and bare identifier mustaches
-(including Unicode), empty scripts and static templates are supported.
+JavaScript module script, an optional `<script>` instance script, and plain
+`<script>` elements nested inside explicitly balanced ordinary elements from a
+bounded lowercase set. Canonical `<script lang="ts">` and module
+`<script lang="ts" context="module">` scripts support a bounded erasable TypeScript
+slice, including simple type annotations and instance `import type` declarations.
+Instance exported functions and top-level `$:` identifier assignments are supported.
+At least one script is required. Static text, bare identifier mustaches (including
+Unicode), and ordinary identifier-call mustaches with bounded expression arguments
+are supported. Template calls use Stryker's expression-context `void 0` mutation
+and subtree filtering, preserving global IDs even when candidates are filtered.
+
 The exact Git-pinned `rsvelte_core` parser validates typed nodes, complete
-original byte boundaries and resolved deferred template expressions. Scripts
-are parsed once by the existing Oxc 0.154 engine, without transferring the
-parser's Oxc 0.149 AST. Module mutations come first; other script mutations
-follow source order. Component scripts share one lexical header in an existing
-or new module script only when mutants are placed, including with `noHeader:
-true`. Module constants cannot be written through unresolved instance
-references; document scripts have independent scope.
+original byte boundaries and resolved deferred template expressions. Original
+ranges are parsed by the existing Oxc 0.154 engine, without transferring the
+parser's Oxc 0.149 AST. Module mutations come first; other scripts and expressions
+follow source order. Component placements share one lexical header in an existing
+or new module script, including with `noHeader: true`. Module constants cannot be
+written through unresolved instance references; document scripts have independent
+scope. Original line-relative UTF-16 locations and outer source bytes are retained.
 
 Nested scripts remain classic document scripts: global lexical/var bindings,
-execution order and natural redeclaration errors on repeated mounts are
-preserved. Each nested script with actual mutation placements receives the
-existing self-contained helper header and shares `globalThis.__stryker__` with
-component scripts. This specifically fixes Stryker 10.0.0's missing-helper
-browser defect: its component-module helpers are inaccessible to document
-scripts. The bounded correction adds document-visible helper functions only
-for mutated nested scripts; ordinary component scripts keep lexical helpers.
-Ignored, unselected and otherwise inert nested scripts add no helpers. SSR
-emits nested script text without executing it; document execution and hydration
-are verified separately from server rendering. The unchanged hello-world,
-module-script and two nested-script upstream fixtures are native; the three
-broader template/TypeScript resources remain fallback.
+execution order and natural redeclaration errors on repeated mounts are preserved.
+Each nested script with actual placements receives the existing helper header and
+shares `globalThis.__stryker__` with component scripts. This fixes Stryker 10.0.0's
+missing-helper browser defect; component helpers remain lexical. Ignored,
+unselected and otherwise inert nested scripts add no helpers. SSR emits nested
+script text without executing it. Nested `lang="ts"` text is preserved with its
+natural browser syntax errors, without transpiling it into executable document JS.
 
-Duplicate top-level scripts, script attributes/other module spellings, styles,
-components, directives, blocks, entities, broader expressions, imports/exports,
-reactive labels, stores, runes, embedded hashbangs, helper collisions, BOMs and
-recovery require atomic upstream fallback. Svelte bypasses result caching,
-observes live Babel/ignorer configuration, and uses serial recovery for parallel
-requests.
+The unchanged hello-world, module-script, two nested-script, template-call and
+TypeScript upstream fixtures are native. The unchanged template-expressions
+fixture remains atomic fallback: Svelte 5.57.2 rejects its direct `<table><tr>`
+structure with `node_invalid_placement` for both server and client compilation.
+It cannot satisfy compiler/runtime qualification by parser acceptance alone.
+
+Duplicate top-level scripts, other attributes/module spellings, styles,
+components, directives, blocks, entities, broader expressions, runtime imports,
+other exports/reactive statements, non-erasable or broader TypeScript, stores,
+runes, embedded hashbangs, helper collisions, BOMs and recovery require atomic
+upstream fallback. Svelte bypasses result caching, observes live Babel/ignorer
+configuration, and uses serial recovery for parallel requests.
+
 The parser dependency has an unconditional compiler graph, duplicate Oxc
 versions and MPL-2.0 dependencies; see NOTICE. Parser qualification alone is not
 compiler or runtime proof. This adapter makes no performance claim.

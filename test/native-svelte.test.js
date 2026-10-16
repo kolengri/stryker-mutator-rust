@@ -155,7 +155,7 @@ test('unchanged 63-byte pinned hello world has one complete ordered native recor
     assert.equal(await readFile(resource, 'utf8'), sample);
     comparedResource = resource;
   } catch (error) {
-    if (process.env.STRYKER_UPSTREAM || error.code !== 'ENOENT') throw error;
+    if (process.env.STRYKER_UPSTREAM !== undefined || error.code !== 'ENOENT') throw error;
   }
   const files = [file(sample, 'svelte-hello-world.svelte')];
   const pair = await compare(files);
@@ -225,7 +225,6 @@ const unsupported = [
   '<script context="module">export const name="world";</script>',
   '<script module>const name="world";</script>',
   '<script lang="js">let name="world";</script>',
-  '<script lang="ts">let name:string="world";</script>',
   '<script>let name="world";</script><script>let other=true;</script>',
   '<script>let name="world";</script><style>p{color:red}</style>',
   '<script>let name="world";</script><Component/>',
@@ -236,7 +235,6 @@ const unsupported = [
   '<script>let name="world";</script><p>{name+1}</p>',
   '<script>let name="world";</script><p>{(name)}</p>',
   '<script>let name="world";</script><p>{\\u006eame}</p>',
-  '<script>let name="world";</script><p>{name()}</p>',
   '<script>let script0="world";</script><p>{script0}</p>',
   '<script>let name="world";</script><p>&amp;</p>',
   '<script>let name="world";</script><!-- Stryker disable all -->',
@@ -252,7 +250,6 @@ const unsupported = [
   '<script>export default {name:"world"};</script>',
   '<script>export let name="world";</script><p>{name}</p>',
   '<script>import name from "module";</script><p>{name}</p>',
-  '<script>$: name="world";</script><p>{name}</p>',
   '<script>let stryCov_9fa48=true;</script>',
   '<script>let name="world";</script><p>{stryCov_9fa48}</p>',
   '<script>const name="world";name="other";</script><p>{name}</p>',
@@ -273,10 +270,10 @@ const retainedFixtures = {
   "svelte-ts.svelte": "<script lang=\"ts\" context=\"module\">\n    function add(a: number, b: number) {\n        return a + b;\n    }\n</script>\n\n<script lang=\"ts\">\n    import type { Athlete } from './athlete.js';\n\n    const athletes: Athlete[] = [\n      { sport: \"Athletics\", name: \"Alice\", age: 16 },\n      { sport: \"Swimming\", name: \"Bob\", age: 18 },\n      { sport: \"Tennis\", name: \"Charlie\", age: 20 },\n    ];\n  \n    let a = 0;\n    let b = 0;\n    $: count = a + b;\n</script>\n\n<main>\n   <script lang=\"ts\">\n    function subtract(a: number, b: number) {\n        return a - b;\n    }\n   </script>\n</main>\n  "
 };
 
-test('three broader pinned Svelte fixtures and unsupported mixed batches retain atomic fallback and exact upstream errors', async () => {
+test('compiler-unqualified pinned Svelte fixture and unsupported mixed batches retain atomic fallback and exact upstream errors', async () => {
   assert.equal(Object.keys(retainedFixtures).length, 5);
   const ledger = [];
-  for (const [name, content] of [...Object.entries(retainedFixtures).filter(([name]) => !name.includes('multiple-script-tags') && !name.includes('only-template-script-tags')), ...unsupported.map((source, index) => [`unsupported-${index}.svelte`, source])]) {
+  for (const [name, content] of [...Object.entries(retainedFixtures).filter(([name]) => name === 'svelte-template-expressions.svelte'), ...unsupported.map((source, index) => [`unsupported-${index}.svelte`, source])]) {
     const files = [file('const before=true;', 'before.js'), file(sample, 'positive.svelte'), file(content, name)];
     const direct = raw(files);
     assert.equal(direct.supported, false, content);
@@ -314,7 +311,7 @@ test('serial four auto and serial recovery preserve exact Svelte bytes metadata 
     assert.deepEqual(direct.result, baseline.result);
     const sut = createInstrumenter(logger, { cache: false, engine: 'native', instrumentationThreads: threads === 'auto' ? undefined : threads });
     assert.deepEqual(plain(await sut.instrument(files, options)), baseline.result);
-    const rejected = [...files, file('<script lang="ts">let name:string="world";</script>', 'unproved.svelte')];
+    const rejected = [...files, file('<script lang="js">let name="world";</script>', 'unproved.svelte')];
     assert.deepEqual(raw(rejected, threads), raw(rejected));
     await assert.rejects(sut.instrument(rejected, options), /unsupported/i);
     assert.deepEqual(plain(await sut.instrument(files, options)), baseline.result);

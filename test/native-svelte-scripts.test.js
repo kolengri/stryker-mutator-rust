@@ -35,7 +35,7 @@ async function receipt(name, value) {
 async function resource(name, source) {
   const root = resolve(process.env.STRYKER_UPSTREAM ?? 'artifacts/upstream/stryker-js');
   try { assert.equal(await readFile(join(root, 'packages/instrumenter/testResources/instrumenter', name), 'utf8'), source); }
-  catch (error) { if (process.env.STRYKER_UPSTREAM || error.code !== 'ENOENT') throw error; }
+  catch (error) { if (process.env.STRYKER_UPSTREAM !== undefined || error.code !== 'ENOENT') throw error; }
 }
 function outerBytes(source, output) {
   const before = parse(source, { modern: true });
@@ -340,7 +340,7 @@ test('module-first global IDs and file metadata are stable in serial four auto a
     assert.deepEqual(direct.result, baseline.result);
     const sut = createInstrumenter(logger, { cache: false, engine: 'native', instrumentationThreads: threads === 'auto' ? undefined : threads });
     for (const input of [files, []]) assert.deepEqual(plain(await sut.instrument(input, options)), raw(input).result);
-    const rejected = [...files, file('<div><script lang="ts">let name:string="nested";</script></div>', 'nested.svelte')];
+    const rejected = [...files, file('<div><script lang="js">let name="nested";</script></div>', 'nested.svelte')];
     await assert.rejects(sut.instrument(rejected, options), /unsupported/i);
     assert.equal(raw(rejected, threads).result, undefined);
     assert.deepEqual(plain(await sut.instrument(files, options)), baseline.result);

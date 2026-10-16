@@ -20,60 +20,68 @@ pub(super) fn instrument(
     next_id: &mut usize,
 ) -> Result<String, String> {
     let scripts = script_ranges(&file.content)?;
-    // Transform the module FIRST, independently of source order, without
-    // resetting global IDs. Printing below restores original source order.
     let mut state = ScriptState::default();
     let mut replacements = Vec::new();
-    let mut additional_scripts: Vec<_> = scripts
+    // Module first; every other script/expression follows original source order.
+    let mut parts: Vec<_> = scripts
         .instance
         .iter()
         .chain(scripts.nested.iter())
+        .map(|range| (range, false))
+        .chain(scripts.expressions.iter().map(|range| (range, true)))
         .collect();
-    additional_scripts.sort_unstable_by_key(|range| range.start);
-    for (range, module) in scripts
+    parts.sort_unstable_by_key(|(range, _)| range.start);
+    for (range, expression) in scripts
         .module
         .iter()
-        .map(|range| (range, true))
-        .chain(additional_scripts.into_iter().map(|range| (range, false)))
+        .map(|range| (range, false))
+        .chain(parts)
     {
-        let nested = scripts.nested.contains(range);
-        // Document scripts cannot see component lexical helpers or constants.
-        // A separate state reuses the same parse/guards without merging scopes.
-        let mut document_state = ScriptState::default();
-        let script_state = if nested {
+        let document = scripts.nested.contains(range);
+        let mut document_state = ScriptState {
+            document: true,
+            ..ScriptState::default()
+        };
+        let current = if document {
             &mut document_state
         } else {
             &mut state
         };
-        script_state.module = module;
-        // Classic document scripts need their own header, emitted only for
-        // actual placements. Its function declarations stay document-visible;
-        // user declarations are never wrapped or moved into component scope.
-        let script_options = Options {
-            no_header: !nested,
-            excluded: options.excluded.clone(),
+        current.module = scripts.module.as_ref() == Some(range);
+        current.expression = expression;
+        let typescript = if expression {
+            !scripts.typescript.is_empty()
+        } else {
+            scripts.typescript.contains(&range.start)
         };
         let printed = instrument_program_inner(
             file,
             &file.content[range.clone()],
-            SourceType::mjs(),
-            // Svelte projects ORIGINAL text into line-relative UTF-16 columns.
+            SourceType::mjs().with_typescript(typescript),
             Positions::new(&file.content).at(range.start as u32),
-            &script_options,
+            &Options {
+                no_header: !document,
+                excluded: options.excluded.clone(),
+            },
             records,
             next_id,
             None,
-            true,
-            Some(script_state),
+            !expression,
+            Some(current),
         )?;
-        replacements.push((range, printed));
+        let printed = if expression {
+            printed.strip_suffix(';').unwrap_or(&printed).to_owned()
+        } else {
+            printed
+        };
+        replacements.push((range, printed, expression));
     }
-    // Svelte places ONE shared header only for actually placed mutants, even
-    // with outer noHeader:true. Ignored records alone never require a header.
+    // A document script owns its header and never captures component constants.
+    // Component placements share one lexical module header, including noHeader.
     if state.needed && scripts.module.is_some() {
         replacements[0].1.insert_str(0, HEADER);
     }
-    replacements.sort_unstable_by_key(|(range, _)| range.start);
+    replacements.sort_unstable_by_key(|(range, _, _)| range.start);
     let mut output = String::new();
     if state.needed && scripts.module.is_none() {
         output.push_str("<script context=\"module\">\n");
@@ -81,15 +89,18 @@ pub(super) fn instrument(
         output.push_str("\n</script>\n");
     }
     let mut cursor = 0;
-    for (range, printed) in replacements {
+    for (range, printed, expression) in replacements {
         output.push_str(&file.content[cursor..range.start]);
-        output.push('\n');
+        if !expression {
+            output.push('\n');
+        }
         output.push_str(&printed);
-        output.push('\n');
+        if !expression {
+            output.push('\n');
+        }
         cursor = range.end;
     }
     output.push_str(&file.content[cursor..]);
-    // Bare identifier expressions retain their original bytes upstream too.
     Ok(output)
 }
 
@@ -97,6 +108,8 @@ pub(super) fn instrument(
 pub(super) struct ScriptState {
     pub(super) needed: bool,
     pub(super) module: bool,
+    pub(super) document: bool,
+    pub(super) expression: bool,
     pub(super) module_constants: HashSet<String>,
 }
 
@@ -104,6 +117,8 @@ struct Scripts {
     module: Option<Range<usize>>,
     instance: Option<Range<usize>>,
     nested: Vec<Range<usize>>,
+    expressions: Vec<Range<usize>>,
+    typescript: HashSet<usize>,
 }
 
 fn script_ranges(source: &str) -> Result<Scripts, String> {
@@ -120,7 +135,6 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
             ..ParseOptions::default()
         },
     )
-    // Rust parser diagnostics are not the pinned JS compiler's diagnostics.
     .map_err(|_| UNSUPPORTED)?;
     if root.css.is_some()
         || root.options.is_some()
@@ -129,8 +143,6 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
     {
         return Err(UNSUPPORTED.into());
     }
-    // Deferred parsing also defers template expressions. Never accept lazy or
-    // recovered expressions merely because the structural parse succeeded.
     if resolve_lazy_expressions(&mut root, source).is_some() {
         return Err(UNSUPPORTED.into());
     }
@@ -144,8 +156,18 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
         .as_ref()
         .map(|script| prove_script(source, script, false))
         .transpose()?;
-    let mut nested = Vec::new();
-    let mut expressions = Vec::new();
+    let mut proof = TemplateProof {
+        source,
+        nested: vec![],
+        expressions: vec![],
+        names: vec![],
+        typescript: HashSet::new(),
+    };
+    for script in root.module.iter().chain(root.instance.iter()) {
+        if script.is_typescript {
+            proof.typescript.insert(script.content_offset as usize);
+        }
+    }
     let mut items: Vec<_> = root
         .fragment
         .nodes
@@ -163,27 +185,23 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
     for (start, end, node) in items {
         if start < cursor
             || end < start
-            || source
-                .get(cursor..start)
-                .is_none_or(|gap| !gap.chars().all(super::js_whitespace))
+            || !whitespace(source.get(cursor..start).ok_or(UNSUPPORTED)?)
         {
             return Err(UNSUPPORTED.into());
         }
         if let Some(node) = node {
-            prove_node(source, node, 0, &mut nested, &mut expressions)?;
+            proof.node(node, 0)?;
         }
         cursor = end;
     }
-    if source
-        .get(cursor..)
-        .is_none_or(|gap| !gap.chars().all(super::js_whitespace))
-    {
+    if !whitespace(source.get(cursor..).ok_or(UNSUPPORTED)?) {
         return Err(UNSUPPORTED.into());
     }
     let script_count =
-        usize::from(module.is_some()) + usize::from(instance.is_some()) + nested.len();
+        usize::from(module.is_some()) + usize::from(instance.is_some()) + proof.nested.len();
     if script_count == 0
-        || expressions
+        || proof
+            .names
             .iter()
             .any(|name| (0..script_count).any(|index| name == &format!("script{index}")))
     {
@@ -192,26 +210,31 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
     Ok(Scripts {
         module,
         instance,
-        nested,
+        nested: proof.nested,
+        expressions: proof.expressions,
+        typescript: proof.typescript,
     })
+}
+
+fn whitespace(text: &str) -> bool {
+    text.chars().all(super::js_whitespace)
 }
 
 fn prove_script(source: &str, script: &Script<'_>, module: bool) -> Result<Range<usize>, String> {
     let range =
         script.content_offset as usize..script.content_offset as usize + script.raw_content.len();
-    let (context, opening) = if module {
-        (ScriptContext::Module, "<script context=\"module\">")
-    } else {
-        (ScriptContext::Default, "<script>")
+    let opening = match (module, script.is_typescript) {
+        (false, false) => "<script>",
+        (true, false) => "<script context=\"module\">",
+        (false, true) => "<script lang=\"ts\">",
+        (true, true) => "<script lang=\"ts\" context=\"module\">",
     };
-    // The typed context AND complete original delimiters must agree. Other
-    // attribute spellings/values, TS and the `module` shorthand stay fallback.
-    if script.is_typescript
-        || script.context != context
-        || if module {
-            script.attributes.len() != 1 || script.attributes[0].name != "context"
+    // Canonical complete delimiters AND the parser's context must agree.
+    if script.context
+        != if module {
+            ScriptContext::Module
         } else {
-            !script.attributes.is_empty()
+            ScriptContext::Default
         }
         || source.get(script.start as usize..range.start) != Some(opening)
         || source.get(range.clone()) != Some(script.raw_content)
@@ -222,132 +245,156 @@ fn prove_script(source: &str, script: &Script<'_>, module: bool) -> Result<Range
     Ok(range)
 }
 
-fn prove_node(
-    source: &str,
-    node: &TemplateNode<'_>,
-    depth: usize,
-    nested: &mut Vec<Range<usize>>,
-    expressions: &mut Vec<String>,
-) -> Result<(), String> {
-    if depth > 128 {
-        return Err(UNSUPPORTED.into());
-    }
-    let (start, end) = node.span();
-    let raw = source
-        .get(start as usize..end as usize)
-        .ok_or(UNSUPPORTED)?;
-    match node {
-        TemplateNode::Text(text)
-            if raw == text.raw && raw == text.data && !raw.contains(['&', '<', '{']) =>
-        {
-            Ok(())
+struct TemplateProof<'s> {
+    source: &'s str,
+    nested: Vec<Range<usize>>,
+    expressions: Vec<Range<usize>>,
+    names: Vec<String>,
+    typescript: HashSet<usize>,
+}
+
+impl TemplateProof<'_> {
+    fn node(&mut self, node: &TemplateNode<'_>, depth: usize) -> Result<(), String> {
+        if depth > 128 {
+            return Err(UNSUPPORTED.into());
         }
-        TemplateNode::ExpressionTag(tag) => {
-            let name = tag.expression.identifier_name().ok_or(UNSUPPORTED)?;
-            let start = tag.expression.start().ok_or(UNSUPPORTED)? as usize;
-            let end = tag.expression.end().ok_or(UNSUPPORTED)? as usize;
-            // Upstream remaps actual scriptN placeholders even inside bare
-            // identifier mustaches. Validate against the final script count.
-            if forbidden_identifier(name)
-                || source.get(start..end) != Some(name)
-                || source
-                    .get(tag.start as usize..start)
-                    .and_then(|s| s.strip_prefix('{'))
-                    .is_none_or(|s| !s.chars().all(super::js_whitespace))
-                || source
-                    .get(end..tag.end as usize)
-                    .and_then(|s| s.strip_suffix('}'))
-                    .is_none_or(|s| !s.chars().all(super::js_whitespace))
+        let source = self.source;
+        let (start, end) = node.span();
+        let raw = source
+            .get(start as usize..end as usize)
+            .ok_or(UNSUPPORTED)?;
+        match node {
+            TemplateNode::Text(text)
+                if raw == text.raw && raw == text.data && !raw.contains(['&', '<', '{']) =>
             {
-                return Err(UNSUPPORTED.into());
+                Ok(())
             }
-            expressions.push(name.to_owned());
-            Ok(())
-        }
-        TemplateNode::RegularElement(element) if element.name == "script" && depth > 0 => {
-            let start = element.start as usize + "<script>".len();
-            let end = (element.end as usize)
-                .checked_sub("</script>".len())
-                .ok_or(UNSUPPORTED)?;
-            if !element.attributes.is_empty()
-                || source.get(element.start as usize..start) != Some("<script>")
-                || source.get(end..element.end as usize) != Some("</script>")
-                || start > end
-            {
-                return Err(UNSUPPORTED.into());
-            }
-            // Raw-text must occupy the ENTIRE content span, with no recovered
-            // children or HTML decoding. Empty scripts have no text child.
-            match element.fragment.nodes.as_slice() {
-                [] if start == end => {}
-                [TemplateNode::Text(text)]
-                    if text.start as usize == start
-                        && text.end as usize == end
-                        && source.get(start..end) == Some(&*text.raw)
-                        && text.raw == text.data => {}
-                _ => return Err(UNSUPPORTED.into()),
-            }
-            nested.push(start..end);
-            Ok(())
-        }
-        TemplateNode::RegularElement(element) => {
-            // Exclude raw-text, void, foreign, custom and special elements. This
-            // deliberately small ordinary set has no compiler-specific modes.
-            if !matches!(
-                element.name.as_str(),
-                "div"
-                    | "span"
-                    | "p"
-                    | "h1"
-                    | "h2"
-                    | "h3"
-                    | "h4"
-                    | "h5"
-                    | "h6"
-                    | "section"
-                    | "article"
-                    | "main"
-                    | "header"
-                    | "footer"
-                    | "nav"
-                    | "ul"
-                    | "ol"
-                    | "li"
-                    | "strong"
-                    | "em"
-                    | "b"
-                    | "i"
-                    | "small"
-                    | "code"
-                    | "pre"
-                    | "blockquote"
-            ) || !element.attributes.is_empty()
-            {
-                return Err(UNSUPPORTED.into());
-            }
-            let open = format!("<{}>", element.name);
-            let close = format!("</{}>", element.name);
-            if !raw.starts_with(&open)
-                || !raw.ends_with(&close)
-                || raw.len() < open.len() + close.len()
-            {
-                return Err(UNSUPPORTED.into());
-            }
-            let mut cursor = element.start as usize + open.len();
-            for child in &element.fragment.nodes {
-                let (start, end) = child.span();
-                if start as usize != cursor || end < start {
+            TemplateNode::ExpressionTag(tag) => {
+                // Bare identifiers and ordinary calls are the compiler-qualified
+                // template slice. Other root expressions remain atomic fallback.
+                if !matches!(
+                    tag.expression.node_type(),
+                    Some("Identifier" | "CallExpression")
+                ) {
                     return Err(UNSUPPORTED.into());
                 }
-                prove_node(source, child, depth + 1, nested, expressions)?;
-                cursor = end as usize;
+                let name = tag.expression.identifier_name();
+                let start = tag.expression.start().ok_or(UNSUPPORTED)? as usize;
+                let end = tag.expression.end().ok_or(UNSUPPORTED)? as usize;
+                // Upstream remaps actual scriptN placeholders even inside bare
+                // identifier mustaches. Validate against the final script count.
+                if name.is_some_and(forbidden_identifier)
+                    || name.is_some_and(|name| source.get(start..end) != Some(name))
+                    || source
+                        .get(tag.start as usize..start)
+                        .and_then(|s| s.strip_prefix('{'))
+                        .is_none_or(|s| !s.chars().all(super::js_whitespace))
+                    || source
+                        .get(end..tag.end as usize)
+                        .and_then(|s| s.strip_suffix('}'))
+                        .is_none_or(|s| !s.chars().all(super::js_whitespace))
+                {
+                    return Err(UNSUPPORTED.into());
+                }
+                if let Some(name) = name {
+                    self.names.push(name.to_owned());
+                }
+                self.expressions.push(start..end);
+                Ok(())
             }
-            if cursor != element.end as usize - close.len() {
-                return Err(UNSUPPORTED.into());
+            TemplateNode::RegularElement(element) if element.name == "script" && depth > 0 => {
+                let typed = raw.starts_with("<script lang=\"ts\">");
+                let opening = if typed {
+                    "<script lang=\"ts\">"
+                } else {
+                    "<script>"
+                };
+                let start = element.start as usize + opening.len();
+                let end = (element.end as usize)
+                    .checked_sub("</script>".len())
+                    .ok_or(UNSUPPORTED)?;
+                if source.get(element.start as usize..start) != Some(opening)
+                    || source.get(end..element.end as usize) != Some("</script>")
+                    || start > end
+                {
+                    return Err(UNSUPPORTED.into());
+                }
+                // Raw-text must occupy the ENTIRE content span, with no recovered
+                // children or HTML decoding. Empty scripts have no text child.
+                match element.fragment.nodes.as_slice() {
+                    [] if start == end => {}
+                    [TemplateNode::Text(text)]
+                        if text.start as usize == start
+                            && text.end as usize == end
+                            && source.get(start..end) == Some(&*text.raw)
+                            && text.raw == text.data => {}
+                    _ => return Err(UNSUPPORTED.into()),
+                }
+                self.nested.push(start..end);
+                if typed {
+                    self.typescript.insert(start);
+                }
+                Ok(())
             }
-            Ok(())
+            TemplateNode::RegularElement(element) => {
+                // Exclude raw-text, void, foreign, custom and special elements. This
+                // deliberately small ordinary set has no compiler-specific modes.
+                if !matches!(
+                    element.name.as_str(),
+                    "div"
+                        | "span"
+                        | "p"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "section"
+                        | "article"
+                        | "main"
+                        | "header"
+                        | "footer"
+                        | "nav"
+                        | "ul"
+                        | "ol"
+                        | "li"
+                        | "strong"
+                        | "em"
+                        | "b"
+                        | "i"
+                        | "small"
+                        | "code"
+                        | "pre"
+                        | "blockquote"
+                ) || !element.attributes.is_empty()
+                {
+                    return Err(UNSUPPORTED.into());
+                }
+                let open = format!("<{}>", element.name);
+                let close = format!("</{}>", element.name);
+                if !raw.starts_with(&open)
+                    || !raw.ends_with(&close)
+                    || raw.len() < open.len() + close.len()
+                {
+                    return Err(UNSUPPORTED.into());
+                }
+                let mut cursor = element.start as usize + open.len();
+                for child in &element.fragment.nodes {
+                    let (start, end) = child.span();
+                    if start as usize != cursor || end < start {
+                        return Err(UNSUPPORTED.into());
+                    }
+                    self.node(child, depth + 1)?;
+                    cursor = end as usize;
+                }
+                if cursor != element.end as usize - close.len() {
+                    return Err(UNSUPPORTED.into());
+                }
+                Ok(())
+            }
+            _ => Err(UNSUPPORTED.into()),
         }
-        _ => Err(UNSUPPORTED.into()),
     }
 }
 
@@ -359,33 +406,139 @@ fn forbidden_identifier(name: &str) -> bool {
         )
 }
 
-// Run on the SAME parsed current-version program as the mutation engine. Svelte
-// has additional compiler semantics for runes/stores, reactive labels, imports
-// and exports. These are outside this capability, even if valid JS.
 #[derive(Default)]
 pub(super) struct ScriptGuard {
     pub(super) unsupported: bool,
+    pub(super) component: bool,
+    pub(super) expression: bool,
+    reactive: HashSet<u32>,
+    typescript: bool,
+}
+
+impl ScriptGuard {
+    pub(super) fn new(component: bool, expression: bool, typescript: bool) -> Self {
+        Self {
+            component,
+            expression,
+            typescript,
+            ..Self::default()
+        }
+    }
 }
 
 impl<'a> Visit<'a> for ScriptGuard {
+    fn visit_program(&mut self, node: &oxc_ast::ast::Program<'a>) {
+        if self.component {
+            for statement in &node.body {
+                if let Statement::LabeledStatement(label) = statement
+                    && label.label.name == "$"
+                    && let Statement::ExpressionStatement(statement) = &label.body
+                    && let oxc_ast::ast::Expression::AssignmentExpression(assignment) =
+                        &statement.expression
+                    && assignment.operator == oxc_syntax::operator::AssignmentOperator::Assign
+                    && matches!(
+                        assignment.left,
+                        oxc_ast::ast::AssignmentTarget::AssignmentTargetIdentifier(_)
+                    )
+                {
+                    self.reactive.insert(label.span.start);
+                }
+            }
+        }
+        walk::walk_program(self, node);
+    }
+
     fn visit_statement(&mut self, node: &Statement<'a>) {
+        if self.typescript {
+            self.unsupported |= !matches!(
+                node,
+                Statement::ImportDeclaration(_)
+                    | Statement::FunctionDeclaration(_)
+                    | Statement::VariableDeclaration(_)
+                    | Statement::ExpressionStatement(_)
+                    | Statement::LabeledStatement(_)
+                    | Statement::ReturnStatement(_)
+                    | Statement::BlockStatement(_)
+                    | Statement::EmptyStatement(_)
+                    | Statement::ExportDeclaration(_)
+            );
+        }
+        self.unsupported |= match node {
+            Statement::ImportDeclaration(import) => {
+                !self.component || !import.import_kind.is_type()
+            }
+            Statement::ExportDeclaration(export) => {
+                !self.component
+                    || !matches!(
+                        export.declaration,
+                        oxc_ast::ast::Declaration::FunctionDeclaration(_)
+                    )
+            }
+            Statement::LabeledStatement(label) => !self.reactive.contains(&label.span.start),
+            Statement::ExportDefaultDeclaration(_)
+            | Statement::ExportNamedDeclaration(_)
+            | Statement::ExportFromDeclaration(_)
+            | Statement::ExportAllDeclaration(_) => true,
+            _ => false,
+        };
+        walk::walk_statement(self, node);
+    }
+
+    fn visit_expression(&mut self, node: &oxc_ast::ast::Expression<'a>) {
+        use oxc_ast::ast::Expression as E;
         self.unsupported |= matches!(
             node,
-            Statement::ImportDeclaration(_)
-                | Statement::ExportDeclaration(_)
-                | Statement::ExportDefaultDeclaration(_)
-                | Statement::ExportNamedDeclaration(_)
-                | Statement::ExportFromDeclaration(_)
-                | Statement::ExportAllDeclaration(_)
-                | Statement::LabeledStatement(_)
+            E::TSAsExpression(_)
+                | E::TSSatisfiesExpression(_)
+                | E::TSNonNullExpression(_)
+                | E::TSTypeAssertion(_)
+                | E::TSInstantiationExpression(_)
         );
-        walk::walk_statement(self, node);
+        if self.expression {
+            self.unsupported |= !matches!(
+                node,
+                E::Identifier(_)
+                    | E::NumericLiteral(_)
+                    | E::StringLiteral(_)
+                    | E::BooleanLiteral(_)
+                    | E::BinaryExpression(_)
+                    | E::CallExpression(_)
+            );
+            if let E::CallExpression(call) = node {
+                self.unsupported |= call.optional
+                    || !matches!(call.callee, E::Identifier(_))
+                    || call.type_arguments.is_some();
+            }
+        }
+        walk::walk_expression(self, node);
+    }
+
+    fn visit_ts_type(&mut self, node: &oxc_ast::ast::TSType<'a>) {
+        use oxc_ast::ast::TSType as T;
+        self.unsupported |= !matches!(
+            node,
+            T::TSNumberKeyword(_)
+                | T::TSStringKeyword(_)
+                | T::TSBooleanKeyword(_)
+                | T::TSArrayType(_)
+                | T::TSTypeReference(_)
+        );
+        if let T::TSTypeReference(reference) = node {
+            self.unsupported |= reference.type_arguments.is_some();
+        }
+        walk::walk_ts_type(self, node);
+    }
+
+    fn visit_ts_type_parameter_declaration(
+        &mut self,
+        _: &oxc_ast::ast::TSTypeParameterDeclaration<'a>,
+    ) {
+        self.unsupported = true;
     }
 
     fn visit_binding_identifier(&mut self, node: &BindingIdentifier<'a>) {
         self.unsupported |= forbidden_identifier(&node.name);
     }
-
     fn visit_identifier_reference(&mut self, node: &IdentifierReference<'a>) {
         self.unsupported |= forbidden_identifier(&node.name);
     }

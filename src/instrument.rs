@@ -673,7 +673,11 @@ fn instrument_program_inner(
         return Err("Source shadows an instrumentation helper or runtime global".into());
     }
     if let Some(state) = shared_header.as_mut() {
-        let mut guard = svelte::ScriptGuard::default();
+        let mut guard = svelte::ScriptGuard::new(
+            !state.document && !state.module,
+            state.expression,
+            source_type.is_typescript(),
+        );
         guard.visit_program(&parsed.program);
         // Valid JS can still fail Svelte's constant_assignment compiler check.
         // Reuse this program's resolved references, including nested writes and
@@ -738,6 +742,7 @@ fn instrument_program_inner(
         next_id,
         placed: 0,
         printed_statement: false,
+        expression_context: shared_header.as_ref().is_some_and(|state| state.expression),
         ts_skip_generation: 0,
         labels: vec![],
         comment_spans: parsed
@@ -1370,6 +1375,7 @@ struct Emitter<'s, 'r> {
     next_id: &'r mut usize,
     placed: usize,
     printed_statement: bool,
+    expression_context: bool,
     // Babel pushes filter state before path.skip(), whose exit never runs.
     // Within this grammar, a skipped TS or decorator descendant hides the enclosing
     // statement-call candidate from its exit filter. This is not a general
@@ -1616,7 +1622,32 @@ impl Emitter<'_, '_> {
             );
         }
         self.scope(node.span(), false, |emitter| {
-            emitter.expression_inner(node, context, pending)
+            let start = emitter.records.len();
+            let pending_start = pending.len();
+            let generation = emitter.ts_skip_generation;
+            let output = emitter.expression_inner(node, context, pending)?;
+            if emitter.expression_context
+                && matches!(node, Expression::CallExpression(_))
+                && generation == emitter.ts_skip_generation
+                && emitter.records[start..]
+                    .iter()
+                    .filter(|record| record.status.is_none())
+                    .count()
+                    != 1
+                && let Some(index) = pending[pending_start..].iter().position(|switch| {
+                    switch.target == node.span() && switch.replacement == "void 0"
+                })
+            {
+                let pending_index = pending_start + index;
+                if let Some(index) = emitter.records[start..].iter().position(|record| {
+                    record.id == pending[pending_index].id && record.status_reason.is_none()
+                }) {
+                    pending.remove(pending_index);
+                    emitter.records.remove(start + index);
+                    emitter.placed -= 1;
+                }
+            }
+            Ok(output)
         })
     }
 
@@ -1905,6 +1936,18 @@ impl Emitter<'_, '_> {
                 node.span(),
                 replacement.into(),
                 "ConditionalExpression",
+                &mut switches,
+            );
+        }
+        if self.expression_context
+            && let Expression::CallExpression(call) = node
+            && !call.optional
+            && !matches!(call.callee, Expression::Super(_))
+        {
+            self.collect(
+                node.span(),
+                "void 0".into(),
+                "CallExpression",
                 &mut switches,
             );
         }
@@ -3056,11 +3099,11 @@ impl Emitter<'_, '_> {
             }
             Statement::ReturnStatement(statement) => if let Some(expression) = &statement.argument { edits.push((expression.span(), self.expression(expression, Context::default())?)); },
             Statement::ExpressionStatement(statement) => {
-                let deletion = matches!(&statement.expression, Expression::CallExpression(call) if !matches!(call.callee, Expression::Super(_)));
+                let deletion = !self.expression_context && matches!(&statement.expression, Expression::CallExpression(call) if !matches!(call.callee, Expression::Super(_)));
                 return self.expression_statement(statement.span, &statement.expression, deletion, true);
             }
             Statement::ThrowStatement(statement) => {
-                return self.expression_statement(statement.span, &statement.argument, matches!(statement.argument, Expression::NewExpression(_)), false);
+                return self.expression_statement(statement.span, &statement.argument, !self.expression_context && matches!(statement.argument, Expression::NewExpression(_)), false);
             }
             Statement::IfStatement(statement) => {
                 edits.push((statement.test.span(), self.expression(&statement.test, Context { if_test: true, ..Context::default() })?));

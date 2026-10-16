@@ -231,7 +231,7 @@ test('nested original offsets line terminators selection exclusions directive ow
 
 const unsupported = [
   '<div><script lang="js">let n=true;</script></div>', '<div><script type="module">let n=true;</script></div>',
-  '<div><script lang="ts">let n:boolean=true;</script></div>', '<div><script context="module">let n=true;</script></div>',
+  '<div><script context="module">let n=true;</script></div>',
   '<div><script>let n=;</script></div>', '<div><script>#!/bin/node\nlet n=true;</script></div>',
   '<div><script>export let n=true;</script></div>', '<div><script>import x from "x";</script></div>',
   '<div><script>let n=$state(true);</script></div>', '<div><script>let stryMutAct_9fa48=true;</script></div>',
