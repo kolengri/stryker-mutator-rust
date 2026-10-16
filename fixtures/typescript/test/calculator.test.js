@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { add, positive, startup, removeOptional, nonNullValue } from '../src/calculator.ts';
+import { add, positive, startup, removeOptional, nonNullValue, total } from '../src/calculator.ts';
 
 describe('typed calculator', () => {
   it('adds values', () => assert.equal(add(2, 3), 5));
@@ -18,5 +18,11 @@ describe('typed calculator', () => {
     const value = { toString() { assert.equal(this, value); return 'value'; } };
     assert.equal(nonNullValue({ value }), 'value');
     assert.equal(nonNullValue(undefined), undefined);
+  });
+  it('evaluates defaults only when needed and collects rest arguments', () => {
+    assert.equal(total(), 3);
+    assert.equal(total(undefined, 5, 6), 5);
+    assert.equal(total(10, 20), 11);
+    assert.equal(total(0), 0);
   });
 });

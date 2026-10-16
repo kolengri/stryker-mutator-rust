@@ -482,6 +482,17 @@ fn instrument_file(
     if !semantics.diagnostics.is_empty() {
         return Err(format!("Syntax error: {:?}", semantics.diagnostics));
     }
+    // Parser compatibility is independent of mutation traversal: opaque TS
+    // expressions and unselected ranges can still contain parameter defaults.
+    let mut assignments = ParameterAssignments {
+        source: &file.content,
+        parameter_expression: false,
+        unproven: false,
+    };
+    assignments.visit_program(&parsed.program);
+    if assignments.unproven {
+        return Err("Typed or parenthesized identifier assignment targets in defaults require upstream parameter parsing".into());
+    }
     let mut bindings = ReservedBindings::default();
     bindings.visit_program(&parsed.program);
     if bindings.found {
@@ -910,28 +921,74 @@ fn is_parameter_property(parameter: &FormalParameter<'_>) -> bool {
 
 // Babel's parameter expression scope rejects some assignment targets that Oxc
 // accepts. Extra grouping can change that decision, but those source-dependent
-// forms remain conservative fallback here. Nested functions/classes establish
-// their own scopes; their parameters are validated by their respective owners.
+// forms remain conservative fallback here. This syntactic walk must also reach
+// defaults below opaque TS nodes, without depending on mutation emission owners.
+// Class heritage, computed keys, and static blocks inherit the current parser
+// expression scope. Field initializers and function/arrow bodies reset it, while
+// every nested parameter list establishes its own parameter expression scope.
 struct ParameterAssignments<'s> {
     source: &'s str,
+    parameter_expression: bool,
     unproven: bool,
+}
+
+impl ParameterAssignments<'_> {
+    fn expression_scope(&mut self, parameter_expression: bool, visit: impl FnOnce(&mut Self)) {
+        let previous = self.parameter_expression;
+        self.parameter_expression = parameter_expression;
+        visit(self);
+        self.parameter_expression = previous;
+    }
 }
 
 impl<'a> Visit<'a> for ParameterAssignments<'_> {
     fn visit_assignment_expression(&mut self, node: &AssignmentExpression<'a>) {
-        self.unproven |= match &node.left {
-            AssignmentTarget::TSAsExpression(_) => true,
-            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
-                self.source[node.span.start as usize..identifier.span.start as usize].contains('(')
-            }
-            _ => false,
-        };
+        self.unproven |= self.parameter_expression
+            && match &node.left {
+                AssignmentTarget::TSAsExpression(_) => true,
+                AssignmentTarget::AssignmentTargetIdentifier(identifier) => self.source
+                    [node.span.start as usize..identifier.span.start as usize]
+                    .contains('('),
+                _ => false,
+            };
         walk::walk_assignment_expression(self, node);
     }
 
-    fn visit_function(&mut self, _: &Function<'a>, _: oxc_syntax::scope::ScopeFlags) {}
-    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
-    fn visit_class(&mut self, _: &Class<'a>) {}
+    fn visit_formal_parameters(&mut self, node: &FormalParameters<'a>) {
+        self.expression_scope(true, |visitor| walk::walk_formal_parameters(visitor, node));
+    }
+
+    fn visit_function(&mut self, node: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        self.expression_scope(false, |visitor| walk::walk_function(visitor, node, flags));
+    }
+
+    fn visit_arrow_function_expression(&mut self, node: &ArrowFunctionExpression<'a>) {
+        self.expression_scope(false, |visitor| {
+            walk::walk_arrow_function_expression(visitor, node)
+        });
+    }
+
+    fn visit_property_definition(&mut self, node: &PropertyDefinition<'a>) {
+        self.visit_decorators(&node.decorators);
+        self.visit_property_key(&node.key);
+        if let Some(annotation) = &node.type_annotation {
+            self.visit_ts_type_annotation(annotation);
+        }
+        if let Some(value) = &node.value {
+            self.expression_scope(false, |visitor| visitor.visit_expression(value));
+        }
+    }
+
+    fn visit_accessor_property(&mut self, node: &AccessorProperty<'a>) {
+        self.visit_decorators(&node.decorators);
+        self.visit_property_key(&node.key);
+        if let Some(annotation) = &node.type_annotation {
+            self.visit_ts_type_annotation(annotation);
+        }
+        if let Some(value) = &node.value {
+            self.expression_scope(false, |visitor| visitor.visit_expression(value));
+        }
+    }
 }
 
 struct InvalidatedContinue<'a> {
@@ -1857,16 +1914,6 @@ impl Emitter<'_, '_> {
         }
         let mut edits = vec![];
         for parameter in &params.items {
-            if let Some(initializer) = &parameter.initializer {
-                let mut assignments = ParameterAssignments {
-                    source: self.source,
-                    unproven: false,
-                };
-                assignments.visit_expression(initializer);
-                if assignments.unproven {
-                    return Err("Typed or parenthesized identifier assignment targets in defaults require upstream parameter parsing".into());
-                }
-            }
             // Oxc combines Babel's TSParameterProperty, AssignmentPattern and
             // typed Identifier. Enter only those actual Babel node boundaries;
             // FormalParameters itself is not a Babel node.

@@ -302,13 +302,95 @@ async function fallback(source, name = 'unsupported.ts', mutate = true) {
   let expected, failure;
   try { expected = await new Instrumenter(logger).instrument(files, options); } catch (error) { failure = error; }
   const automatic = createInstrumenter(logger, { cache: false, engine: 'auto' });
-  if (failure) await assert.rejects(automatic.instrument(files, options), error =>
-    error.name === failure.name && error.message.split(/\n\s+at /)[0] === failure.message.split(/\n\s+at /)[0]);
+  let automaticFailure;
+  if (failure) await assert.rejects(automatic.instrument(files, options), error => {
+    automaticFailure = error;
+    return error.name === failure.name && error.message.split(/\n\s+at /)[0] === failure.message.split(/\n\s+at /)[0];
+  });
   else assert.deepEqual(await automatic.instrument(files, options), expected);
   assert.equal(automatic.stats.nativeBatches, 0);
   assert.equal(automatic.stats.fallbackBatches, 1);
   assert.equal(automatic.stats.nativeErrors, 0);
+  return { raw, failure, automaticFailure };
 }
+
+test('parameter parser preflight rejects inherited class scopes and nested opaque defaults atomically', async () => {
+  const sources = target => [
+    `function f(a=class extends factory(${target}=B){}){return a;}`,
+    `function f(a=class{static{${target}=1;}}){return a;}`,
+    `function f(a=(function inner(b=${target}=1){}) as any){return a;}`,
+    `function f(a=((b=${target}=1)=>b) as any){return a;}`,
+    `function f(a=(class{m(b=${target}=1){}}) as any){return a;}`,
+    `const hidden=(function inner(b=${target}=1){}) as any;`,
+    `const hidden=((b=${target}=1)=>b) as any;`,
+    `const hidden=(class{constructor(b=${target}=1){}}) as any;`,
+    `function f(a=class{value=(function inner(b=${target}=1){}) as any;}){return a;}`,
+    `function f(a=class{value=((b=${target}=1)=>b) as any;}){return a;}`,
+    `function f(a=function(){return (function inner(b=${target}=1){}) as any;}){return a;}`,
+    `function f(a=()=>((b=${target}=1)=>b) as any){return a;}`,
+    `function f(a=class{value=0;static{${target}=1;}}){return a;}`,
+    `function f(a=class{m(){${target}=1;}static{${target}=2;}}){return a;}`,
+    `function f(a=function inner(){${target}=1;},b=${target}=2){return a;}`,
+  ];
+  for (const [target, reason] of [['(target as any)', 'UnexpectedTypeCastInParameter'], ['(target)', 'InvalidParenthesizedAssignment']]) {
+    for (const source of sources(target)) {
+      for (const mutate of [true, false, []]) {
+        const { raw, failure, automaticFailure } = await fallback(source, 'parser-scope.ts', mutate);
+        assert.match(raw.reason, /Typed or parenthesized identifier assignment targets in defaults/);
+        assert.equal(failure?.code, 'BABEL_PARSE_ERROR', source);
+        assert.equal(failure.reasonCode, reason, source);
+        assert.equal(automaticFailure.code, failure.code);
+        assert.equal(automaticFailure.reasonCode, failure.reasonCode);
+        assert.equal(automaticFailure.message, failure.message, 'auto must preserve the exact upstream parser error');
+        assert.deepEqual(automaticFailure.loc, failure.loc);
+      }
+    }
+  }
+});
+
+test('grouped inherited class assignments retain conservative fallback and exact upstream behavior', async () => {
+  for (const target of ['(target as any)', '(target)']) {
+    for (const source of [
+      `function f(a=(class extends factory(${target}=B){}) as any){return a;}`,
+      `function f(a=(class{static{${target}=1;}}) as any){return a;}`,
+    ]) {
+      for (const mutate of [true, false, []]) await fallback(source, 'grouped-class.ts', mutate);
+    }
+  }
+});
+
+test('field initializers and function bodies reset parser scope while nested valid defaults retain records and runtime', async () => {
+  for (const target of ['(target as any)', '(target)']) {
+    const fixtures = [
+      [`function f(a=1+2){${target}=a;return a;}`, '[f(),f(0),target]'],
+      [`function f(a=function inner(b=true){${target}=b;return b;}){return a;}`,
+        '[capture(()=>f()()),capture(()=>f()(0)),target]'],
+      [`function f(a=(b=true)=>(${target}=b)){return a;}`,
+        '[capture(()=>f()()),capture(()=>f()(0)),target]'],
+      [`function f(a=class{value=${target}=1;static value=${target}=2;m(b=true){${target}=b;return b;}}){return a;}`,
+        'capture(()=>{const C=f();const c=new C();return [C.value,c.value,c.m(),target];})'],
+      [`function f(a=class{value=class extends factory(${target}=B){static{${target}=3;}};}){return a;}`,
+        'capture(()=>{const Outer=f();const c=new Outer();return [typeof c.value,target];})'],
+      [`function f(a=class{value=(function inner(b=true){${target}=b;return b;}) as any;}){return a;}`,
+        'capture(()=>{const C=f();return [new C().value(),target];})'],
+    ];
+    for (const [source, observation] of fixtures) {
+      runtime(await compare([file(source, 'scope-resets.ts')]),
+        'let target=0;class B{};function factory(value){return value;}', observation, { state: 'target' });
+    }
+  }
+});
+
+test('syntactic inspection of opaque defaults adds no mutation records or ID gaps', async () => {
+  const source = 'function f(a=(function inner(b=1+2){(target as any)=b;return b;}) as any){return a;}';
+  const pair = await compare([file(source, 'opaque-default.ts')]);
+  assert.deepEqual(pair.actual.mutants.map(({ id, mutatorName }) => [id, mutatorName]), [['0', 'BlockStatement']]);
+  runtime(pair, 'let target=0;', '[capture(()=>f()()),capture(()=>f()(7)),target]', { state: 'target' });
+  const hidden = 'const hidden=(class{value=(target as any)=1;m(b=1+2){(target as any)=b;return b;}}) as any;function f(a=true){return a;}';
+  const hiddenPair = await compare([file(hidden, 'opaque-class.ts')]);
+  assert.deepEqual(hiddenPair.actual.mutants.map(({ id, mutatorName }) => [id, mutatorName]), [['0', 'BooleanLiteral'], ['1', 'BlockStatement']]);
+  runtime(hiddenPair, 'let target=0;', 'capture(()=>{const c=new hidden();return [c.value,c.m(),f(),target];})', { state: 'target' });
+});
 
 test('unproven parameter patterns and existing grammar and printer boundaries reject atomically', async () => {
   for (const source of [

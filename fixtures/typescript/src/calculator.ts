@@ -18,3 +18,7 @@ export function removeOptional(container?: { value?: number }): boolean {
 export function nonNullValue(box?: { value: { toString(): string } }): string | undefined {
   return box?.value!.toString();
 }
+
+export function total(value: number = 1 + 2, ...rest: number[]): number {
+  return value + rest.length;
+}

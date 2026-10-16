@@ -112,7 +112,8 @@ This slice makes no speed claim. Full Rust core replacement remains unfinished.
 
 The accepted native grammar includes ordinary JS named function declarations,
 synchronous function expressions,
-simple parameters/bindings, variable declarations, concise/block arrows,
+identifier parameters/bindings, identifier defaults and final identifier rest
+parameters, variable declarations, concise/block arrows,
 return/if/block/expression statements, plain imports/named exports and pure
 arithmetic, comparisons, equality, boolean, logical, unary and conditional
 expressions. Strings, untagged templates, dense array literals and plain object
@@ -174,8 +175,12 @@ Simple constructor parameter properties support accessibility/readonly modifiers
 and proven combinations with `override`. Constructor-body deletion also follows
 upstream's parameter-property/direct-super-call predicate. A standalone `override`
 uses fallback because the pinned Babel generator drops that modifier, changing
-subsequent parameter-property transformation. Defaults, decorators and non-simple
-parameter properties remain unsupported. Rust preserves original TypeScript;
+subsequent parameter-property transformation. Identifier parameter properties can
+have supported defaults; decorated and destructured forms remain unsupported.
+Defaults retain signature evaluation and parameter environments;
+rest parameters do not enable spread expressions. Typed or parenthesized-identifier
+assignment targets inside defaults use fallback for pinned Babel/Oxc parser
+differences, including conservatively excluded grouped variants. Rust preserves original TypeScript;
 runtime syntax such as enum and parameter properties still needs the project's
 TypeScript transformation. Runtime tests transform completed upstream/native
 instrumentation identically; they do not transpile before mutation.
