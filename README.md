@@ -5,8 +5,9 @@ Node-API addon. Existing Stryker configuration, test runners, reporters, coverag
 collection and incremental diff remain provided by the pinned StrykerJS core.
 
 **This is not a completed Rust rewrite.** Native instrumentation currently supports
-a conservative JavaScript subset. An unsupported batch is delegated in full to
-StrykerJS rather than silently losing mutations. TypeScript, JSX, frameworks,
+a conservative JavaScript and erasable TypeScript subset. An unsupported batch is
+delegated in full to StrykerJS rather than silently losing mutations. Unproven
+TypeScript constructs, JSX, frameworks,
 complex expressions and arbitrary Babel plugins still use the compatibility path.
 Rust also indexes coverage and calculates batched test-plan decisions. Node still
 owns incremental diff, plugins, sandbox, worker lifecycle and test execution.
@@ -138,6 +139,17 @@ in unambiguous gaps between statements, including `next-line` and ignore reasons
 Comments inside expressions, ambiguous attachments and directives requiring
 upstream warnings still trigger whole-batch fallback.
 
+TypeScript bindings, identifier parameters, optional parameters, generic
+function/arrow signatures and return annotations preserve the original source.
+Type aliases, interfaces and ambient declarations are inert. `as` expressions
+remain opaque, matching upstream's skipped subtree. Generic calls retain type
+arguments in original code and drop them only in the replacements reconstructed
+by upstream. Statement-call filtering preserves the pinned TS skip behavior.
+`.ts`, `.mts`, `.cts` and their declaration extensions use the same runtime
+parsing policy as the reference instrumenter. Non-null assertions, `satisfies`,
+angle-bracket assertions, typed assignment targets, runtime enums/namespaces,
+TSX and unproven typed replacement printing still require fallback.
+
 Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
 Private members, `super`, `new`, dynamic imports, regex,
@@ -188,6 +200,7 @@ npm run check
 npm run test:integration
 node scripts/integration.js native
 node scripts/integration.js vitest
+node scripts/integration.js typescript
 npm run test:corpus
 npm run bench
 ```

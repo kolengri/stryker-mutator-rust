@@ -8,14 +8,16 @@ import { normalizeReport } from './report.js';
 const require = createRequire(import.meta.url);
 const root = resolve('.');
 const fixture = process.argv[2] || 'basic';
-if (!['basic', 'native', 'vitest'].includes(fixture)) throw new Error('Unknown fixture');
+if (!['basic', 'native', 'vitest', 'typescript'].includes(fixture)) throw new Error('Unknown fixture');
+const nativeFixture = ['native', 'typescript'].includes(fixture);
+const sourceFile = fixture === 'typescript' ? 'src/calculator.ts' : 'src/calculator.js';
 const directory = resolve(process.env.STRYKER_RUST_INTEGRATION_ARTIFACTS ?? 'artifacts/verification', `integration-${fixture}`);
 await mkdir(directory, { recursive: true });
 const working = join(directory, 'project');
 await rm(working, { recursive: true, force: true });
 await cp(resolve(`fixtures/${fixture}`), working, { recursive: true });
 await rm(join(directory, 'cache'), { recursive: true, force: true });
-const before = await readFile(join(working, 'src/calculator.js'), 'utf8');
+const before = await readFile(join(working, sourceFile), 'utf8');
 const upstream = resolve(require.resolve('@stryker-mutator/core/package.json'), '../bin/stryker.js');
 const accelerated = resolve('bin/stryker-rust.js');
 const results = [];
@@ -25,7 +27,7 @@ const coreNativeProof = [];
 for (const [label, entry] of [['upstream', upstream], ['cold', accelerated], ['warm', accelerated]]) {
   const started = performance.now();
   let log = '';
-  const child = spawn(process.execPath, [entry, 'run'], { cwd: working, env: { ...process.env, STRYKER_RUST_ENGINE: fixture === 'native' ? 'native' : 'auto', STRYKER_RUST_CORE_ENGINE: 'native', STRYKER_RUST_CACHE_DIR: join(directory, 'cache'), STRYKER_RUST_DIAGNOSTICS: '1' } });
+  const child = spawn(process.execPath, [entry, 'run'], { cwd: working, env: { ...process.env, STRYKER_RUST_ENGINE: nativeFixture ? 'native' : 'auto', STRYKER_RUST_CORE_ENGINE: 'native', STRYKER_RUST_CACHE_DIR: join(directory, 'cache'), STRYKER_RUST_DIAGNOSTICS: '1' } });
   child.stdout.on('data', (data) => { log += data; });
   child.stderr.on('data', (data) => { log += data; });
   const code = await new Promise((done, reject) => { child.on('error', reject); child.on('close', done); });
@@ -43,7 +45,7 @@ for (const [label, entry] of [['upstream', upstream], ['cold', accelerated], ['w
     assert.equal(core.nativeErrors, 0);
     coreNativeProof.push({ label, ...core });
   }
-  if (fixture === 'native' && label === 'cold') {
+  if (nativeFixture && label === 'cold') {
     const diagnostic = log.match(/\[stryker-rust\] (\{[^\n]+\})/);
     assert.ok(diagnostic, 'native execution must have diagnostics');
     const nativeStats = JSON.parse(diagnostic[1]);
@@ -53,7 +55,7 @@ for (const [label, entry] of [['upstream', upstream], ['cold', accelerated], ['w
   const report = JSON.parse(await readFile(join(working, 'reports/mutation.json'), 'utf8'));
   if (label !== 'upstream') assert.equal(coreNativeProof.at(-1).nativePlannedMutants, Object.values(report.files).flatMap((file) => file.mutants).length);
   await writeFile(join(directory, `${label}.json`), JSON.stringify(report, null, 2));
-  assert.equal(await readFile(join(working, 'src/calculator.js'), 'utf8'), before, 'source tree modified');
+  assert.equal(await readFile(join(working, sourceFile), 'utf8'), before, 'source tree modified');
   results.push(normalizeReport(report));
   // Preserve every field; only asynchronous mutant completion order differs.
   fullReports.push({ ...report, files: Object.fromEntries(Object.entries(report.files).map(([name, file]) => [name, {
