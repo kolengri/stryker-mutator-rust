@@ -61,14 +61,16 @@ jobs:
         if: matrix.musl
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          export CC=musl-gcc
-          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-          npm run build -- --target ${{ matrix.target }}
-        env:
-          RUSTUP_TOOLCHAIN: 1.99.0
+          # Build against musl's own shared compiler runtime, not Ubuntu's glibc libgcc.
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e CC=cc \
+            -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=cc \
+            rust:1.99.0-alpine3.24 sh -ec '
+              apk add --no-cache nodejs npm
+              npm ci --ignore-scripts
+              npm run build -- --target ${{ matrix.target }}
+            '
       - name: Unit, semantic, corpus and real-run parity
         if: ${{ !matrix.musl }}
         run: |
