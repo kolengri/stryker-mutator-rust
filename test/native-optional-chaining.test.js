@@ -229,7 +229,7 @@ test('unproven parenthesized spines and prior unsupported grammar reject batches
     '(obj?.trim)?.();', '(obj?.trim)();', '(obj?.trim()).length;', '(obj?.x)?.trim();',
     'obj?.trim(...args);', 'obj?.x++;', '[obj.x]=items;', 'delete obj?.x;',
     'new obj?.x();', 'obj?.x`tag`;', 'class C{#x;f(){return this?.#x;}}',
-    'class C extends B{f(){return super.x?.();}}', 'const x: number=obj?.x;',
+    'class C extends B{f(){return super.x?.();}}', 'const x: number=(obj?.x)!;',
     'obj?.trim("single quoted");'.replace('"single quoted"', "'single quoted'"),
     'obj?.trim(/* comment */ arg());', 'obj?.trim(()=>1);', 'obj?.run({key:1});',
   ]) {

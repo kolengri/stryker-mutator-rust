@@ -424,11 +424,12 @@ fn instrument_file(
         return Err("Source exceeds 32-bit span limits".into());
     }
     let source_type = SourceType::from_path(&file.name).map_err(|error| error.to_string())?;
-    if source_type.is_typescript() || source_type.is_jsx() {
-        return Err(
-            "Native instrumentation supports .js/.mjs/.cjs without TypeScript or JSX".into(),
-        );
+    if source_type.is_jsx() {
+        return Err("JSX and TSX require upstream instrumentation".into());
     }
+    // Babel uses the TS parser for declaration extensions too, without Oxc's
+    // ambient-definition restrictions on otherwise ordinary runtime statements.
+    let source_type = source_type.with_typescript(source_type.is_typescript());
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, &file.content, source_type.with_module(true))
         .with_options(ParseOptions {
@@ -471,6 +472,7 @@ fn instrument_file(
         next_id,
         placed: 0,
         printed_statement: false,
+        ts_skip_generation: 0,
         labels: vec![],
         comment_spans: parsed
             .program
@@ -509,6 +511,38 @@ struct ReservedBindings {
 }
 
 impl<'a> Visit<'a> for ReservedBindings {
+    fn visit_ts_as_expression(&mut self, _: &TSAsExpression<'a>) {}
+    fn visit_ts_type_annotation(&mut self, _: &TSTypeAnnotation<'a>) {}
+    fn visit_ts_type_parameter_declaration(&mut self, _: &TSTypeParameterDeclaration<'a>) {}
+    fn visit_ts_type_parameter_instantiation(&mut self, _: &TSTypeParameterInstantiation<'a>) {}
+    fn visit_ts_type_alias_declaration(&mut self, _: &TSTypeAliasDeclaration<'a>) {}
+    fn visit_ts_interface_declaration(&mut self, _: &TSInterfaceDeclaration<'a>) {}
+    fn visit_function(&mut self, node: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        if !node.declare && node.body.is_some() {
+            walk::walk_function(self, node, flags);
+        }
+    }
+    fn visit_variable_declaration(&mut self, node: &VariableDeclaration<'a>) {
+        if !node.declare {
+            walk::walk_variable_declaration(self, node);
+        }
+    }
+    fn visit_ts_external_module_declaration(&mut self, node: &TSExternalModuleDeclaration<'a>) {
+        if !node.declare {
+            walk::walk_ts_external_module_declaration(self, node);
+        }
+    }
+    fn visit_ts_namespace_declaration(&mut self, node: &TSNamespaceDeclaration<'a>) {
+        if !node.declare {
+            walk::walk_ts_namespace_declaration(self, node);
+        }
+    }
+    fn visit_ts_global_declaration(&mut self, node: &TSGlobalDeclaration<'a>) {
+        if !node.declare {
+            walk::walk_ts_global_declaration(self, node);
+        }
+    }
+
     fn visit_binding_identifier(&mut self, node: &BindingIdentifier<'a>) {
         self.found |= matches!(
             node.name.as_str(),
@@ -679,6 +713,28 @@ fn own_optional(node: &Expression<'_>) -> bool {
     }
 }
 
+fn simple_printed_type(node: &TSType<'_>) -> bool {
+    match node {
+        TSType::TSTypeReference(reference) => {
+            reference.type_arguments.is_none()
+                && matches!(reference.type_name, TSTypeName::IdentifierReference(_))
+        }
+        TSType::TSAnyKeyword(_)
+        | TSType::TSBigIntKeyword(_)
+        | TSType::TSBooleanKeyword(_)
+        | TSType::TSNeverKeyword(_)
+        | TSType::TSNullKeyword(_)
+        | TSType::TSNumberKeyword(_)
+        | TSType::TSObjectKeyword(_)
+        | TSType::TSStringKeyword(_)
+        | TSType::TSSymbolKeyword(_)
+        | TSType::TSUndefinedKeyword(_)
+        | TSType::TSUnknownKeyword(_)
+        | TSType::TSVoidKeyword(_) => true,
+        _ => false,
+    }
+}
+
 fn chain_prints(node: &Expression<'_>) -> bool {
     if own_optional(node) {
         return true;
@@ -790,11 +846,37 @@ struct Emitter<'s, 'r> {
     next_id: &'r mut usize,
     placed: usize,
     printed_statement: bool,
+    // Babel pushes filter state before path.skip(), whose exit never runs.
+    // Within this grammar, a skipped TS descendant hides the enclosing
+    // statement-call candidate from its exit filter. This is not a general
+    // emulation of Babel's traversal stack.
+    ts_skip_generation: usize,
     labels: Vec<(Span, String)>,
     comment_spans: Vec<Span>,
 }
 
 impl Emitter<'_, '_> {
+    fn skip_ts(&mut self, span: Span) -> Result<String, String> {
+        if !self.pruned {
+            self.ts_skip_generation += 1;
+        }
+        self.scope(span, false, |emitter| Ok(emitter.text(span).into()))
+    }
+
+    fn skip_signature(
+        &mut self,
+        parameters: Option<&TSTypeParameterDeclaration<'_>>,
+        returns: Option<&TSTypeAnnotation<'_>>,
+    ) -> Result<(), String> {
+        if let Some(parameters) = parameters {
+            self.skip_ts(parameters.span)?;
+        }
+        if let Some(returns) = returns {
+            self.skip_ts(returns.span)?;
+        }
+        Ok(())
+    }
+
     fn location(&self, span: Span) -> Location {
         Location {
             start: self.positions.at(span.start),
@@ -977,6 +1059,12 @@ impl Emitter<'_, '_> {
             let inner = Expression::from(chain.expression.clone_in(&allocator));
             return self.expression_deferred(&inner, context, pending);
         }
+        if matches!(node, Expression::TSAsExpression(_)) {
+            if context.printed_ancestor {
+                return Err("Opaque as expression inside a printed replacement requires upstream formatting".into());
+            }
+            return self.skip_ts(node.span());
+        }
         self.scope(node.span(), false, |emitter| {
             emitter.expression_inner(node, context, pending)
         })
@@ -1008,7 +1096,7 @@ impl Emitter<'_, '_> {
         text: &str,
     ) -> Result<String, String> {
         let allocator = Allocator::default();
-        let replacement = Parser::new(&allocator, text, SourceType::mjs())
+        let replacement = Parser::new(&allocator, text, SourceType::mjs().with_typescript(true))
             .parse_expression()
             .map_err(|error| format!("Invalid native replacement: {error:?}"))?;
         let mut branch = root.clone_in(&allocator);
@@ -1045,6 +1133,9 @@ impl Emitter<'_, '_> {
         // Upstream intentionally turns a computed Identifier into a static
         // property on rename, preserving the member and call optional markers.
         let builder = AstBuilder::new(&allocator);
+        // Babel constructs a new call for MethodExpression, dropping only
+        // this call's type arguments; untouched calls in its spine retain theirs.
+        mutated.type_arguments = None;
         mutated.callee = Expression::StaticMemberExpression(StaticMemberExpression::boxed(
             call.callee.span(),
             object.clone_in(&allocator),
@@ -1303,7 +1394,10 @@ impl Emitter<'_, '_> {
 
         if own_optional(node) {
             let replacement = self.changed(node, |node| match node {
-                Expression::CallExpression(call) => call.optional = false,
+                Expression::CallExpression(call) => {
+                    call.optional = false;
+                    call.type_arguments = None;
+                }
                 Expression::StaticMemberExpression(member) => member.optional = false,
                 Expression::ComputedMemberExpression(member) => member.optional = false,
                 _ => unreachable!("own_optional accepts only calls and public members"),
@@ -1335,7 +1429,12 @@ impl Emitter<'_, '_> {
         match node {
             Expression::Identifier(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) | Expression::ThisExpression(_) => {},
             Expression::CallExpression(call) => {
-                if call.type_arguments.is_some() { return Err("Typed calls require upstream instrumentation".into()); }
+                if let Some(arguments) = &call.type_arguments {
+                    if context.printed_ancestor && !arguments.params.iter().all(simple_printed_type) {
+                        return Err("Complex call type arguments inside a printed replacement require upstream formatting".into());
+                    }
+                    self.skip_ts(arguments.span)?;
+                }
                 let child_context = Context { printed_ancestor: context.printed_ancestor, ..Context::default() };
                 edits.push((call.callee.span(), self.chain_child(&call.callee, child_context, pending)?));
                 let skip_string = !optional_kind(node) && matches!(&call.callee, Expression::Identifier(identifier) if matches!(identifier.name.as_str(), "require" | "Symbol"));
@@ -1446,7 +1545,8 @@ impl Emitter<'_, '_> {
                 }
             }
             Expression::ArrowFunctionExpression(arrow) => {
-                if arrow.r#async || arrow.type_parameters.is_some() || arrow.return_type.is_some() { return Err("Async or typed arrows require upstream instrumentation".into()); }
+                if arrow.r#async { return Err("Async arrows require upstream instrumentation".into()); }
+                self.skip_signature(arrow.type_parameters.as_deref(), arrow.return_type.as_deref())?;
                 self.parameters(&arrow.params)?;
                 match &arrow.body {
                     ArrowFunctionBody::FunctionBody(body) => edits.push((body.span, self.body(body)?)),
@@ -1461,33 +1561,41 @@ impl Emitter<'_, '_> {
         Ok(self.apply(node.span(), edits))
     }
 
-    fn parameters(&self, params: &FormalParameters<'_>) -> Result<(), String> {
+    fn parameters(&mut self, params: &FormalParameters<'_>) -> Result<(), String> {
         if params.rest.is_some()
             || params.items.iter().any(|parameter| {
                 !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
                     || parameter.initializer.is_some()
-                    || parameter.type_annotation.is_some()
+                    || parameter.accessibility.is_some()
+                    || parameter.readonly
+                    || parameter.r#override
                     || !parameter.decorators.is_empty()
             })
         {
             return Err("Only simple identifier function parameters are supported natively".into());
         }
+        for parameter in &params.items {
+            if let Some(annotation) = &parameter.type_annotation {
+                self.skip_ts(annotation.span)?;
+            }
+        }
         Ok(())
     }
 
     fn function(&mut self, function: &Function<'_>) -> Result<String, String> {
-        if function.r#async
-            || function.generator
-            || function.declare
-            || function.type_parameters.is_some()
-            || function.return_type.is_some()
-            || function.this_param.is_some()
-        {
+        if function.declare || function.body.is_none() {
+            return self.skip_ts(function.span);
+        }
+        if function.r#async || function.generator || function.this_param.is_some() {
             return Err(
-                "Async, generator, declared, or typed functions require upstream instrumentation"
+                "Async, generator, or this-parameter functions require upstream instrumentation"
                     .into(),
             );
         }
+        self.skip_signature(
+            function.type_parameters.as_deref(),
+            function.return_type.as_deref(),
+        )?;
         self.parameters(&function.params)?;
         let body = function.body.as_ref().ok_or("Function without body")?;
         let rendered = self.body(body)?;
@@ -1495,6 +1603,9 @@ impl Emitter<'_, '_> {
     }
 
     fn variables(&mut self, variables: &VariableDeclaration<'_>) -> Result<String, String> {
+        if variables.declare {
+            return self.skip_ts(variables.span);
+        }
         if !matches!(
             variables.kind,
             VariableDeclarationKind::Var
@@ -1508,8 +1619,11 @@ impl Emitter<'_, '_> {
             let BindingPattern::BindingIdentifier(binding) = &variable.id else {
                 return Err("Destructuring bindings require upstream instrumentation".into());
             };
-            if variable.type_annotation.is_some() || variable.definite {
-                return Err("Typed bindings require upstream instrumentation".into());
+            if variable.definite {
+                return Err("Definite assignment bindings require upstream instrumentation".into());
+            }
+            if let Some(annotation) = &variable.type_annotation {
+                self.skip_ts(annotation.span)?;
             }
             if let Some(initializer) = &variable.init {
                 edits.push((
@@ -1585,6 +1699,16 @@ impl Emitter<'_, '_> {
         match node {
             Declaration::FunctionDeclaration(function) => self.function(function),
             Declaration::VariableDeclaration(variables) => self.variables(variables),
+            Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {
+                self.skip_ts(node.span())
+            }
+            Declaration::TSExternalModuleDeclaration(module) if module.declare => {
+                self.skip_ts(node.span())
+            }
+            Declaration::TSNamespaceDeclaration(module) if module.declare => {
+                self.skip_ts(node.span())
+            }
+            Declaration::TSGlobalDeclaration(module) if module.declare => self.skip_ts(node.span()),
             _ => Err("Unsupported exported declaration in native grammar".into()),
         }
     }
@@ -1671,6 +1795,12 @@ impl Emitter<'_, '_> {
         let variables = |node: &VariableDeclaration<'_>, header: bool| -> Result<String, String> {
             let mut declarations = vec![];
             for declaration in &node.declarations {
+                if node.declare || declaration.type_annotation.is_some() || declaration.definite {
+                    return Err(
+                        "Typed declarations in whole-for replacements require upstream formatting"
+                            .into(),
+                    );
+                }
                 let BindingPattern::BindingIdentifier(binding) = &declaration.id else {
                     return Err("Destructuring bindings require upstream instrumentation".into());
                 };
@@ -1873,10 +2003,14 @@ impl Emitter<'_, '_> {
         let mut edits = vec![];
         match node {
             Statement::FunctionDeclaration(function) => {
-                if !top_level { return Err("Nested function declarations require upstream hoisting semantics".into()); }
+                if !top_level && function.body.is_some() && !function.declare { return Err("Nested function declarations require upstream hoisting semantics".into()); }
                 return self.function(function);
             }
             Statement::VariableDeclaration(variables) => return self.variables(variables),
+            Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => return self.skip_ts(node.span()),
+            Statement::TSExternalModuleDeclaration(module) if module.declare => return self.skip_ts(node.span()),
+            Statement::TSNamespaceDeclaration(module) if module.declare => return self.skip_ts(node.span()),
+            Statement::TSGlobalDeclaration(module) if module.declare => return self.skip_ts(node.span()),
             Statement::BlockStatement(block) => return self.block(block.span, &block.body),
             Statement::ReturnStatement(statement) => if let Some(expression) = &statement.argument { edits.push((expression.span(), self.expression(expression, Context::default())?)); },
             Statement::ExpressionStatement(statement) => {
@@ -1886,9 +2020,10 @@ impl Emitter<'_, '_> {
                     self.collect(statement.span, ";".into(), "CallExpression", &mut switches);
                 }
                 let own = self.records.get(start).filter(|record| record.mutator_name == "CallExpression").map(|record| record.id.clone());
+                let skip_generation = self.ts_skip_generation;
                 let original = self.expression(&statement.expression, Context { skip_string: true, ..Context::default() })?;
                 let active = self.records[start..].iter().filter(|record| record.status.is_none()).count();
-                if active != 1 && let Some(id) = own
+                if self.ts_skip_generation == skip_generation && active != 1 && let Some(id) = own
                     && self.records[start].id == id && self.records[start].status_reason.is_none()
                 {
                     self.records.remove(start);
