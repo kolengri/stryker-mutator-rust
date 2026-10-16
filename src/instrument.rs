@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use oxc_allocator::{Allocator, Box as ArenaBox, CloneIn};
 use oxc_ast::{ast::*, builder::AstBuilder};
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
-use oxc_codegen::{Codegen, Gen};
+use oxc_codegen::{Codegen, CodegenOptions, Gen};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -639,6 +639,7 @@ struct Context<'a> {
     binding_name: Option<&'a str>,
     printed_ancestor: bool,
     skip_string: bool,
+    raw_string_rhs: Option<Span>,
 }
 
 fn arithmetic_replacement(binary: &BinaryExpression<'_>) -> Option<B> {
@@ -700,6 +701,7 @@ enum ChainKind {
     StaticMember,
     ComputedMember,
     PrivateMember,
+    NonNull,
 }
 
 fn chain_kind(node: &Expression<'_>) -> Option<ChainKind> {
@@ -708,11 +710,13 @@ fn chain_kind(node: &Expression<'_>) -> Option<ChainKind> {
         Expression::StaticMemberExpression(_) => Some(ChainKind::StaticMember),
         Expression::ComputedMemberExpression(_) => Some(ChainKind::ComputedMember),
         Expression::PrivateFieldExpression(_) => Some(ChainKind::PrivateMember),
+        Expression::TSNonNullExpression(_) => Some(ChainKind::NonNull),
         // The wrapper aliases the effective ChainElement, including its kind.
         Expression::ChainExpression(chain) => match &chain.expression {
             ChainElement::CallExpression(_) => Some(ChainKind::Call),
             ChainElement::StaticMemberExpression(_) => Some(ChainKind::StaticMember),
             ChainElement::ComputedMemberExpression(_) => Some(ChainKind::ComputedMember),
+            ChainElement::TSNonNullExpression(_) => Some(ChainKind::NonNull),
             _ => None,
         },
         _ => None,
@@ -725,6 +729,43 @@ fn private_chain(node: &Expression<'_>) -> bool {
         Expression::CallExpression(call) => private_chain(&call.callee),
         Expression::StaticMemberExpression(member) => private_chain(&member.object),
         Expression::ComputedMemberExpression(member) => private_chain(&member.object),
+        Expression::TSNonNullExpression(non_null) => private_chain(&non_null.expression),
+        _ => false,
+    }
+}
+
+fn super_chain(node: &Expression<'_>) -> bool {
+    match node {
+        Expression::Super(_) => true,
+        Expression::CallExpression(call) => super_chain(&call.callee),
+        Expression::StaticMemberExpression(member) => super_chain(&member.object),
+        Expression::ComputedMemberExpression(member) => super_chain(&member.object),
+        Expression::TSNonNullExpression(non_null) => super_chain(&non_null.expression),
+        _ => false,
+    }
+}
+
+fn non_null_chain(node: &Expression<'_>) -> bool {
+    match node {
+        Expression::TSNonNullExpression(_) => true,
+        Expression::CallExpression(call) => non_null_chain(&call.callee),
+        Expression::StaticMemberExpression(member) => non_null_chain(&member.object),
+        Expression::ComputedMemberExpression(member) => non_null_chain(&member.object),
+        Expression::PrivateFieldExpression(member) => non_null_chain(&member.object),
+        _ => false,
+    }
+}
+
+fn delete_reference(node: &Expression<'_>) -> bool {
+    match node {
+        Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_) => true,
+        Expression::TSNonNullExpression(non_null) => delete_reference(&non_null.expression),
+        Expression::ChainExpression(chain) => {
+            matches!(
+                &chain.expression,
+                ChainElement::StaticMemberExpression(_) | ChainElement::ComputedMemberExpression(_)
+            ) || matches!(&chain.expression, ChainElement::TSNonNullExpression(non_null) if delete_reference(&non_null.expression))
+        }
         _ => false,
     }
 }
@@ -740,6 +781,7 @@ fn optional_kind(node: &Expression<'_>) -> bool {
         Expression::ComputedMemberExpression(member) => {
             member.optional || optional_kind(&member.object)
         }
+        Expression::TSNonNullExpression(non_null) => optional_kind(&non_null.expression),
         _ => false,
     }
 }
@@ -790,7 +832,17 @@ fn chain_prints(node: &Expression<'_>) -> bool {
         Expression::StaticMemberExpression(member) => chain_prints(&member.object),
         Expression::ComputedMemberExpression(member) => chain_prints(&member.object),
         Expression::PrivateFieldExpression(member) => chain_prints(&member.object),
+        Expression::TSNonNullExpression(non_null) => chain_prints(&non_null.expression),
         _ => false,
+    }
+}
+
+#[derive(Default)]
+struct StringLiteralCount(usize);
+
+impl<'a> Visit<'a> for StringLiteralCount {
+    fn visit_string_literal(&mut self, _: &StringLiteral<'a>) {
+        self.0 += 1;
     }
 }
 
@@ -1024,6 +1076,36 @@ impl Emitter<'_, '_> {
         generator.into_source_text()
     }
 
+    fn single_quoted_logical_rhs(
+        &self,
+        node: &Expression<'_>,
+        context: Context<'_>,
+    ) -> Option<Span> {
+        if context.printed_ancestor {
+            return None;
+        }
+        let Expression::LogicalExpression(logical) = node else {
+            return None;
+        };
+        let Expression::StringLiteral(string) = &logical.right else {
+            return None;
+        };
+        let raw = self
+            .text(string.span)
+            .strip_prefix('\'')?
+            .strip_suffix('\'')?;
+        if !raw
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+            || raw.contains(['\\', '\'', '"'])
+        {
+            return None;
+        }
+        let mut strings = StringLiteralCount::default();
+        strings.visit_expression(node);
+        (strings.0 == 1).then_some(string.span)
+    }
+
     fn changed(
         &self,
         expression: &Expression<'_>,
@@ -1074,7 +1156,7 @@ impl Emitter<'_, '_> {
         node: &Expression<'_>,
         mut context: Context<'_>,
     ) -> Result<String, String> {
-        // Only call/member nodes on a callee/object spine defer placement. Keys
+        // Only call/member/non-null nodes on a callee/object spine defer placement. Keys
         // and arguments keep independent placements in the original branch.
         context.printed_ancestor |= chain_prints(node);
         context.printed_ancestor |= self.printed_statement;
@@ -1095,7 +1177,7 @@ impl Emitter<'_, '_> {
             .join(", ");
         let mut output = format!("(stryCov_9fa48({ids}), ({original}))");
         for switch in switches {
-            let replacement = if switch.target == node.span() {
+            let replacement = if switch.target == node.span() && switch.kind == chain_kind(node) {
                 switch.replacement
             } else {
                 self.replace_in_chain(node, switch.target, switch.kind, &switch.replacement)?
@@ -1129,6 +1211,11 @@ impl Emitter<'_, '_> {
                 return Err("Opaque as expression inside a printed replacement requires upstream formatting".into());
             }
             return self.skip_ts(node.span());
+        }
+        if non_null_chain(node) && (private_chain(node) || super_chain(node)) {
+            return Err(
+                "Non-null private and super spines require upstream instrumentation".into(),
+            );
         }
         self.scope(node.span(), false, |emitter| {
             emitter.expression_inner(node, context, pending)
@@ -1281,6 +1368,7 @@ impl Emitter<'_, '_> {
         }
         // Collect before descending: Stryker IDs follow Babel pre-order and the
         // allMutators ordering. Mutation branches use the uninstrumented snapshot.
+        let raw_string_rhs = self.single_quoted_logical_rhs(node, context);
         let mut switches = vec![];
         if let Expression::BinaryExpression(binary) = node
             && let Some(replacement) = arithmetic_replacement(binary)
@@ -1431,11 +1519,23 @@ impl Emitter<'_, '_> {
             } else {
                 L::And
             };
-            let text = self.changed(node, |node| {
-                if let Expression::LogicalExpression(logical) = node {
-                    logical.operator = replacement;
-                }
-            });
+            let allocator = Allocator::default();
+            let mut cloned = node.clone_in(&allocator);
+            let Expression::LogicalExpression(cloned_logical) = &mut cloned else {
+                unreachable!()
+            };
+            cloned_logical.operator = replacement;
+            // Babel preserves this one validated raw RHS when cloning. Oxc's
+            // quote option is safe only for a clone with this sole literal.
+            let mut generator =
+                Codegen::new()
+                    .with_source_text(self.source)
+                    .with_options(CodegenOptions {
+                        single_quote: raw_string_rhs.is_some(),
+                        ..CodegenOptions::default()
+                    });
+            generator.print_expression(&cloned);
+            let text = generator.into_source_text();
             self.collect(node.span(), text, "LogicalOperator", &mut switches);
         }
         if let Expression::CallExpression(call) = node
@@ -1588,6 +1688,11 @@ impl Emitter<'_, '_> {
                 edits.push((member.object.span(), self.chain_child(&member.object, child_context, pending)?));
                 edits.push((member.expression.span(), self.expression(&member.expression, child_context)?));
             }
+            Expression::TSNonNullExpression(non_null) => {
+                edits.push((non_null.expression.span(), self.chain_child(&non_null.expression, Context {
+                    printed_ancestor: context.printed_ancestor, ..Context::default()
+                }, pending)?));
+            }
             Expression::AssignmentExpression(assignment) => {
                 let target = assignment.left.as_simple_assignment_target().ok_or("Destructuring assignment targets require upstream instrumentation")?;
                 if matches!(target, SimpleAssignmentTarget::TSAsExpression(_)) && !assignment.operator.is_assign() {
@@ -1611,7 +1716,7 @@ impl Emitter<'_, '_> {
                 // Babel keeps raw string spellings in cloned operator mutants;
                 // Oxc prints the decoded value. Standalone switches preserve the
                 // original bytes, but printed ancestors need identical spelling.
-                if context.printed_ancestor && self.print(node) != self.text(node.span()) {
+                if context.printed_ancestor && context.raw_string_rhs != Some(node.span()) && self.print(node) != self.text(node.span()) {
                     return Err("String literal spelling requires upstream replacement formatting".into());
                 }
             }
@@ -1667,10 +1772,19 @@ impl Emitter<'_, '_> {
             Expression::LogicalExpression(logical) => {
                 let child_context = Context { logical_parent: Some(logical.operator), printed_ancestor: true, ..Context::default() };
                 edits.push((logical.left.span(), self.expression(&logical.left, child_context)?));
-                edits.push((logical.right.span(), self.expression(&logical.right, child_context)?));
+                edits.push((logical.right.span(), self.expression(&logical.right, Context { raw_string_rhs, ..child_context })?));
             }
             Expression::UnaryExpression(unary) => {
-                if unary.operator == U::Delete { return Err("delete requires upstream placement semantics".into()); }
+                if unary.operator == U::Delete {
+                    if !delete_reference(&unary.argument) {
+                        return Err("Only public member delete references have native placement semantics".into());
+                    }
+                    // Keep the reference intact. Only its callee/object spine
+                    // defers to delete; keys and arguments place their own switches.
+                    let child_context = Context { printed_ancestor: context.printed_ancestor || chain_prints(&unary.argument), ..Context::default() };
+                    edits.push((unary.argument.span(), self.expression_deferred(&unary.argument, child_context, pending)?));
+                    return Ok(self.apply(node.span(), edits));
+                }
                 let printed = context.printed_ancestor || matches!(unary.operator, U::UnaryPlus | U::UnaryNegation | U::LogicalNot | U::BitwiseNot);
                 edits.push((unary.argument.span(), self.expression(&unary.argument, Context { printed_ancestor: printed, ..Context::default() })?));
             }
@@ -2769,6 +2883,35 @@ mod tests {
             let response = run(source, Value::Null);
             assert!(!response.supported, "{source}");
             assert!(response.result.is_none());
+        }
+    }
+
+    #[test]
+    fn non_null_chain_replacement_uses_effective_kind_and_visits_alias_once() {
+        for source in ["obj!", "obj?.x!"] {
+            let allocator = Allocator::default();
+            let mut root = Parser::new(&allocator, source, SourceType::mjs().with_typescript(true))
+                .parse_expression()
+                .unwrap();
+            let replacement = Parser::new(&allocator, "obj", SourceType::mjs())
+                .parse_expression()
+                .unwrap();
+            let mut visitor = ReplaceExpression {
+                target: root.span(),
+                kind: ChainKind::Call,
+                replacement: &replacement,
+                allocator: &allocator,
+                replaced: 0,
+            };
+            visitor.visit_expression(&mut root);
+            assert_eq!(visitor.replaced, 0, "span alone must not match {source}");
+            visitor.kind = ChainKind::NonNull;
+            visitor.visit_expression(&mut root);
+            assert_eq!(
+                visitor.replaced, 1,
+                "wrapper aliases must enter once: {source}"
+            );
+            assert!(matches!(root, Expression::Identifier(_)));
         }
     }
 

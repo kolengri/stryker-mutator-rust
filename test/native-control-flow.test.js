@@ -272,7 +272,7 @@ test('labelled continue across an active whole-for wrapper preserves upstream in
 test('unsupported bindings, async iteration, expression targets and formatter boundaries remain atomic', async () => {
   for (const [content, extension='js'] of [
     ['for(let [x] of list)foo();'], ['for({x} of list)foo();'], ['for([x] in list)foo();'],
-    ['for await(const x of list)foo();'], ['for(let i:number=0;i<2;i++)foo(i!);','ts'],
+    ['for await(const x of list)foo();'], ['for(let i:number=0;i<2;i++)foo(i satisfies number);','ts'],
     ['for(;tick(true);)new Thing(...args);'], ['while(tick(true)) /x/.test(value);'],
     ['for(;;){ /* ordinary comment */ break;}'], ['for(;;){note({x:1});break;}'],
     ['// Stryker disable ConditionalExpression: reason\nfor(;;)break;'],

@@ -9,7 +9,7 @@ import { createInstrumenter } from '../lib/index.js';
 import { serializePlain } from '../lib/cache.js';
 import { logger, options } from './helpers.js';
 
-const files = [{ name: '/fixture/values.ts', content: 'export function add(a: number,b: number) { return (a + b)!; }', mutate: true }];
+const files = [{ name: '/fixture/values.ts', content: 'export function add(a: number,b: number) { return (a + b)! satisfies number; }', mutate: true }];
 
 async function context(t) {
   const directory = await mkdtemp(join(tmpdir(), 'stryker-rust-test-'));

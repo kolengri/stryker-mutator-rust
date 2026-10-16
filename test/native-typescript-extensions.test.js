@@ -391,7 +391,7 @@ moduleTest('original pinned TS extension corpus executes every active mutant for
   }
 });
 
-test('original non null error and optional chain blockers remain fallback', async () => {
+test('original non null error and unproven optional chain shapes remain fallback', async () => {
   const root = process.env.STRYKER_UPSTREAM ?? resolve('artifacts/upstream/stryker-js');
   const nonNull = join(root, 'packages/instrumenter/testResources/instrumenter/non-null-expression.ts');
   if (existsSync(nonNull)) {
@@ -403,7 +403,5 @@ test('original non null error and optional chain blockers remain fallback', asyn
     assert.ok(failure);
     assert.match(failure.message, /TSNonNullExpression/);
   }
-  const optional = join(root, 'packages/instrumenter/testResources/instrumenter/optional-chains.ts');
-  if (existsSync(optional)) await fallback(await readFile(optional, 'utf8'));
-  for (const source of ["const value=a||'qux';", 'input?.id!.toString();', 'delete obj?.[index];']) await fallback(source);
+  for (const source of ["const value=(a||'qux')+b;", '(input?.id)!.toString();', 'delete obj?.method();']) await fallback(source);
 });
