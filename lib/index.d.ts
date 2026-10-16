@@ -3,6 +3,16 @@ import type { Instrumenter, InstrumenterOptions, InstrumentResult, File } from '
 import type { Logger } from '@stryker-mutator/api/logging';
 
 export interface AccelerationStats { hits: number; misses: number; bypasses: number; errors: number; nativeBatches: number; fallbackBatches: number; nativeErrors: number }
+export interface InstrumentationStats {
+  configuredThreads?: number;
+  parallelBatches: number;
+  serialBatches: number;
+  serialRecoveries: number;
+  lastThreadsUsed: number;
+  lastSpawnedThreads: number;
+  lastParallelFiles: number;
+  lastReason?: string;
+}
 export interface CoreStats {
   engine: 'auto' | 'upstream' | 'native';
   nativeCoreStages: ('coverage' | 'planning')[];
@@ -18,6 +28,8 @@ export interface AccelerationOptions {
   cache?: boolean;
   engine?: 'auto' | 'upstream' | 'native';
   coreEngine?: 'auto' | 'upstream' | 'native';
+  /** Captured once; undefined uses STRYKER_RUST_THREADS, then native auto selection. */
+  instrumentationThreads?: number;
   cacheDir?: string;
   onEvent?: (event: { type: keyof AccelerationStats; reason?: string }) => void;
 }
@@ -29,6 +41,7 @@ export class InstrumentationCache {
   constructor(options?: AccelerationOptions);
   readonly stats: AccelerationStats;
   readonly coreStats?: CoreStats;
+  readonly instrumentationStats: InstrumentationStats;
   instrument(instrument: Instrumenter['instrument'], files: readonly File[], options: InstrumenterOptions): Promise<InstrumentResult>;
 }
 /** Process-wide; the first call sets options for all subsequent Stryker instances. */
@@ -36,6 +49,7 @@ export function installAcceleration(options?: AccelerationOptions): Instrumentat
 export function createInstrumenter(logger: Logger, options?: AccelerationOptions): {
   instrument(files: readonly File[], options: InstrumenterOptions): Promise<InstrumentResult>;
   stats: AccelerationStats;
+  instrumentationStats: InstrumentationStats;
 };
 export class Stryker extends UpstreamStryker {
   constructor(options?: ConstructorParameters<typeof UpstreamStryker>[0], acceleration?: AccelerationOptions);

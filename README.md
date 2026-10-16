@@ -47,6 +47,7 @@ npx stryker-rust --rust-info
 npx stryker-rust run stryker.config.json
 npx stryker-rust run --rust-no-cache
 STRYKER_RUST_DIAGNOSTICS=1 npx stryker-rust run
+STRYKER_RUST_THREADS=4 npx stryker-rust run
 ```
 
 `--version` reports the embedded StrykerJS version. `--rust-info` reports native
@@ -81,6 +82,47 @@ or `native` (reject unsupported core inputs without JavaScript fallback).
 `STRYKER_RUST_CORE_ENGINE` supplies the default when the option is omitted.
 `createInstrumenter` remains instrumentation-only. `nativeStatus()` reports
 `nativeCoverage` and `nativePlanning` separately from `nativeInstrumentation`.
+
+### Instrumentation threads
+
+`instrumentationThreads` selects a positive safe integer thread limit. The option
+overrides `STRYKER_RUST_THREADS`; an omitted option uses that environment variable,
+then native automatic selection. The setting is captured when the instrumenter
+or process-wide hook is created. `1` selects serial execution. Empty environment
+values select automatic mode; invalid values throw before hooks are installed.
+
+```js
+import { createInstrumenter } from 'stryker-mutator-rust';
+
+const instrumenter = createInstrumenter(logger, {
+  engine: 'native',
+  instrumentationThreads: 4,
+  cache: false,
+});
+const result = await instrumenter.instrument(files, instrumenterOptions);
+console.log(instrumenter.instrumentationStats);
+```
+
+Rust distributes files among bounded scoped threads; each owns its parser and
+arena. The calling thread participates. The limit is capped by available CPUs
+and file count. Automatic mode currently stays serial: measured workloads have
+not established a convincing parallel gain. Use an explicit limit above `1` to
+opt into parallel execution. Empty/single-file inputs remain serial.
+A nonblocking process-wide lease keeps simultaneous Node worker calls from
+creating multiple Rust worker groups: contending calls run serially.
+
+Files and records retain input order and serial global IDs. Relocation edits only
+verified generated ID argument spans. When provenance cannot be established, the
+whole batch retries serially in Rust. Unsupported syntax retains the existing
+atomic compatibility behavior. This parallelism operates between files; one file
+is not split, and test execution still uses Stryker's existing Node workers.
+
+`instrumentationStats` is separate from the seven cache counters in `stats`.
+It reports successful native serial/parallel batches, serial recoveries, the
+configured limit, and the last actual thread/spawn/file counts and reason.
+CLI diagnostics include it under `instrumentation`. Requested limits alone do
+not prove parallel execution. Cache hits skip instrumentation and leave these
+execution counters unchanged; thread settings do not change cache identity.
 
 The core adapter targets exactly StrykerJS 10.0.0's internal `TestCoverage.from`
 and `MutantTestPlanner.prototype.makePlan`; it checks the pinned classes,
@@ -253,6 +295,8 @@ node scripts/integration.js typescript
 node scripts/integration.js classes
 npm run test:corpus
 npm run bench
+node scripts/benchmark-parallelism.js
+node scripts/benchmark-parallelism.js --e2e
 ```
 
 The corpus and benchmark commands expect the upstream source at
@@ -270,6 +314,14 @@ Logs, raw benchmark samples and reports belong under `artifacts/verification/`
 and `artifacts/benchmark/`. Benchmark reports explicitly distinguish native
 instrumentation, compatibility/caching, cold/warm cache and end-to-end execution.
 A parser microbenchmark or a single full-run sample is not a whole-run speed claim.
+Real-project Bun checks also compare mutation records/outcomes and error messages.
+Native and Babel printers can produce different generated code frames and
+production stack coordinates; the preview does not claim text-identical raw
+diagnostic rendering. Raw reports are retained before semantic normalization.
+The parallelism benchmark writes to `artifacts/native-parallelism/benchmark/`.
+It compares explicit serial/parallel execution for 2/8/32 balanced and skewed
+files, including repeated uncached batches. Its separate end-to-end run imports
+and tests all eight generated modules and compares complete reports with upstream.
 
 One upstream corpus fixture, `non-null-expression.ts`, currently fails in the
 reference 10.0.0 instrumenter/Babel combination (`TSNonNullExpression` in an update
