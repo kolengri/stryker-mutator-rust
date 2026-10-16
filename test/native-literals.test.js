@@ -139,7 +139,7 @@ test('array printing threshold preserves exact records or rejects the entire bat
 test('unsupported literal contexts reject the complete batch atomically', async () => {
   const sources = [
     'const a = [,];', 'const a = [1,,2];', 'const a = [...[]];',
-    'const a = { ...{} };', 'const a = { method() { return "x"; } };',
+    'const a = { ...{} };',
     'const a = { get value() { return "x"; } };', 'const a = { set value(x) {} };',
     'const a = { ["x" + "y"]: "value" };', 'const a = { [`x`]: "value" };',
     'const [a="default"] = ["x"];', 'const { a="default" } = { a: "x" };',

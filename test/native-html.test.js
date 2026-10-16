@@ -246,7 +246,7 @@ const unsupported = [
   '<script>const x=true;</SCRIPT>', '<script type="js" type="ts">const x=true;</script>',
   '<script type="js" TYPE="json">const x=true;</script>', '<script type="tsx">const x=<p/>;</script>',
   '<script lang="tsx">const x=true;</script>', '<script/>', '<div/><script>const x=true;</script>',
-  '<template><script>const x=true;</script></template>', '<svg><script>const x=true;</script></svg>',
+  '<svg><script>const x=true;</script></svg>',
   '<table><script>const x=true;</script><tr><td>x</td></tr></table>',
   '<div><p>implicit</div><script>const x=true;</script>', '<div><span></div></span>',
   '<script>const x=true;', '<script>const x=true;</script extra>', '<script>const x=true;</script/>',
@@ -259,7 +259,7 @@ const unsupported = [
   '<script>const x:number=1;</script>', '<textarea><script>const opaque=true;</script></textarea>',
   '<html><head></head><body></body><script>const moved=true;</script></html>',
   '<html><head></head><body></body></html><span>moved</span>',
-  '<script>"use strict";const x=true;</script>', '<script>const f=()=>({method(){return true;}});</script>',
+  '<script>"use strict";const x=true;</script>',
 ];
 
 test('ambiguous markup and JS reject atomically and auto preserves complete upstream results or errors', async () => {
@@ -290,7 +290,7 @@ test('serial four auto serial recovery and cache bypass retain exact native sour
     assert.deepEqual(raw(files, threads).result, baseline.result);
     const strict = createInstrumenter(logger, { cache: false, engine: 'native', instrumentationThreads: threads === 'auto' ? undefined : threads });
     assert.deepEqual(plain(await strict.instrument(files, options)), baseline.result);
-    const bad = [...files, file('<template><script>const bad=true;</script></template>', 'bad.html')];
+    const bad = [...files, file('<template><script lang="tsx">const bad=true;</script></template>', 'bad.html')];
     await assert.rejects(strict.instrument(bad, options), /unsupported/i);
     assert.deepEqual(plain(await strict.instrument(files, options)), baseline.result);
     assert.equal(strict.stats.nativeErrors, 0);

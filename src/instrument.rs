@@ -520,7 +520,11 @@ fn instrument_file_inner(
     if std::path::Path::new(&file.name)
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"))
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("html")
+                || ext.eq_ignore_ascii_case("htm")
+                || ext.eq_ignore_ascii_case("vue")
+        })
     {
         // The parallel relocation scanner accepts standalone JS/TS only. Keep
         // HTML on its existing atomic serial-recovery path until it has a
@@ -2028,8 +2032,25 @@ impl Emitter<'_, '_> {
                     let ObjectPropertyKind::ObjectProperty(property) = property else {
                         return Err("Object spread requires upstream instrumentation".into());
                     };
-                    if property.method || property.kind != PropertyKind::Init {
-                        return Err("Object methods and accessors require upstream instrumentation".into());
+                    if property.kind != PropertyKind::Init {
+                        return Err("Object accessors require upstream instrumentation".into());
+                    }
+                    if property.method {
+                        if property.computed || !matches!(property.key, PropertyKey::StaticIdentifier(_) | PropertyKey::StringLiteral(_) | PropertyKey::NumericLiteral(_)) {
+                            return Err("Computed object methods require upstream placement semantics".into());
+                        }
+                        let Expression::FunctionExpression(function) = &property.value else {
+                            return Err("Object method without function body".into());
+                        };
+                        if function.r#async {
+                            return Err("Async object methods require upstream instrumentation".into());
+                        }
+                        let rendered = self.scope(property.span, true, |emitter| {
+                            let edits = emitter.function_edits(function, false, false)?;
+                            Ok(emitter.apply(property.span, edits))
+                        })?;
+                        edits.push((property.span, rendered));
+                        continue;
                     }
                     // A mutated computed key is placed at an ancestor by Babel,
                     // rather than at the key itself. Only inert literal keys are
@@ -2976,6 +2997,15 @@ impl Emitter<'_, '_> {
                 edits.push((statement.body.span(), result?));
             }
             Statement::BreakStatement(_) | Statement::ContinueStatement(_) => return Ok(Self::terminate(self.text(node.span()).into())),
+            Statement::ExportDefaultDeclaration(export) => {
+                // Only the proven object-expression default export is admitted.
+                // Keep function/class declarations and other default forms atomic.
+                let ExportDefaultDeclarationKind::ObjectExpression(_) = &export.declaration else {
+                    return Err("Only object default exports have native placement semantics".into());
+                };
+                let expression = export.declaration.as_expression().ok_or("Default export without expression")?;
+                edits.push((expression.span(), self.expression(expression, Context::default())?));
+            }
             Statement::ExportDeclaration(export) => edits.push((export.declaration.span(), self.declaration(&export.declaration)?)),
             Statement::ExportNamedDeclaration(export) => {
                 if export.specifiers.iter().any(|specifier| matches!(specifier.local, ModuleExportName::StringLiteral(_)) || matches!(specifier.exported, ModuleExportName::StringLiteral(_))) {
@@ -3090,7 +3120,7 @@ mod tests {
     fn rejects_batches_atomically_and_rejects_options() {
         for source in [
             "function f(){ return (obj?.call)(); }",
-            "const o = {method(){ return 1; }};",
+            "const o = {[key](){ return 1; }};",
             "const x = 1 /* Stryker disable all */ + 2;",
             "function f({x} = obj) { return x; }",
             "const x = (a?.value).next;",

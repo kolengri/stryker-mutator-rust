@@ -202,7 +202,37 @@ fn ordinary(name: &str) -> bool {
                 | "em"
                 | "i"
                 | "a"
+                | "template"
+                | "ul"
+                | "li"
         )
+}
+
+// Angular treats single braces as ICU syntax. Admit only a bounded, closed
+// interpolation containing an identifier; all other braces remain upstream.
+fn plain_text(mut raw: &str) -> bool {
+    if raw.contains('&') {
+        return false;
+    }
+    while let Some(start) = raw.find(['{', '}']) {
+        let Some(rest) = raw[start..].strip_prefix("{{") else {
+            return false;
+        };
+        let Some((value, rest)) = rest.split_once("}}") else {
+            return false;
+        };
+        let value = value.trim_matches(|ch: char| ch.is_ascii_whitespace());
+        let mut chars = value.bytes();
+        if !chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, b'_' | b'$'))
+            || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'_' | b'$'))
+        {
+            return false;
+        }
+        raw = rest;
+    }
+    true
 }
 
 fn plain_attribute(name: &str) -> bool {
@@ -304,8 +334,7 @@ impl Proof<'_> {
                 Child::Element(element) => self.element(element, depth + 1)?,
                 Child::Text(_) => {
                     let raw = self.raw(range)?;
-                    if !raw_text && (raw.contains('&') || raw.contains("{{") || raw.contains("}}"))
-                    {
+                    if !raw_text && !plain_text(raw) {
                         return Err("HTML entities/interpolation require upstream parsing".into());
                     }
                 }
@@ -335,7 +364,7 @@ impl Proof<'_> {
 
     fn element(&mut self, element: &Element, depth: usize) -> Result<(), String> {
         let name = element.tag_name.as_ref();
-        if element.namespace != Namespace::HTML || element.content.is_some() || !ordinary(name) {
+        if element.namespace != Namespace::HTML || !ordinary(name) {
             return Err(UNSUPPORTED.into());
         }
         let range = self.element_range(element)?;
@@ -401,7 +430,31 @@ impl Proof<'_> {
         {
             return Err(UNSUPPORTED.into());
         }
-        self.children(&element.children, open.end..range.end, raw_text, depth)?;
+        let children = if name == "template" {
+            // HTML5 stores template descendants in a fragment. They consume the
+            // SAME structural token stream and containment proof as ordinary
+            // children; templates are never opaque to script discovery.
+            if !element.children.is_empty() {
+                return Err(UNSUPPORTED.into());
+            }
+            &element.content.as_ref().ok_or(UNSUPPORTED)?.children
+        } else {
+            if element.content.is_some() {
+                return Err(UNSUPPORTED.into());
+            }
+            &element.children
+        };
+        // Locate the tree's explicit closing boundary in the recorded stream
+        // before descending, so fragment children must fit the actual interior.
+        let closing_index = self
+            .tokens
+            .partition_point(|token| token.span.hi.0 as usize <= range.end);
+        let boundary = self.tokens.get(closing_index).ok_or(UNSUPPORTED)?;
+        let boundary_range = bytes(boundary.span)?;
+        if boundary_range.end != range.end || !matches!(boundary.token, Token::EndTag { .. }) {
+            return Err(UNSUPPORTED.into());
+        }
+        self.children(children, open.end..boundary_range.start, raw_text, depth)?;
         let closing = self.token()?.clone();
         let Token::EndTag {
             tag_name,
@@ -492,6 +545,27 @@ mod tests {
     }
 
     #[test]
+    fn templates_preserve_preorder_and_require_explicit_fragment_boundaries() {
+        let source = "<template><ul><li>{{ msg }}</li></ul><script>const first=true;</script><template><script lang=\"ts\">const second:number=2;</script></template></template><script>const third=false;</script>";
+        let programs = segments(source).unwrap();
+        assert_eq!(programs.len(), 3);
+        assert_eq!(&source[programs[0].bytes.clone()], "const first=true;");
+        assert_eq!(&source[programs[1].bytes.clone()], "const second:number=2;");
+        assert_eq!(&source[programs[2].bytes.clone()], "const third=false;");
+        assert!(programs[1].source_type.is_typescript());
+        for source in [
+            "<template><ul><li>one<li>two</li></ul></template>",
+            "<template><div>{{ foo() }}</div></template>",
+            "<template><div>{foo}</div></template>",
+            "<template><div>{{ foo }</div></template>",
+            "<template><div>&amp;</div></template>",
+            "<template><script>const x=true;</script></template extra>",
+        ] {
+            assert!(segments(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn opening_attributes_select_formats_and_exclude_external_or_unknown_scripts() {
         let source = "<script lang=\"tsx\" type=\"js\">const js=true;</script><script lang=\"ts\">const ts:number=1;</script><script type=\"json\" lang=\"js\">invalid JS</script><script src>also invalid JS</script>";
         let programs = segments(source).unwrap();
@@ -511,7 +585,6 @@ mod tests {
             "<div><p>implicit</div><script>const x=true;</script>",
             "<html><head></head><body></body><script>const moved=true;</script></html>",
             "<html><head></head><body></body></html><span>moved</span>",
-            "<template><script>const hidden=true;</script></template>",
             "<script>const x=\"</ script>\";</script>",
         ] {
             assert!(segments(source).is_err(), "{source}");
