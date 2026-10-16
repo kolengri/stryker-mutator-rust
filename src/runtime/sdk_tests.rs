@@ -132,14 +132,17 @@ async fn selected_test_files_execute_without_filename_as_title_filter_for_off_an
         )
         .unwrap();
         for coverage in ["off", "perTest"] {
+            // Selection is the contract here; leave room for SDK reloads and ESM loading.
             let response = execute(
             directory.path(),
-            json!({"testRunner":runner,"coverageAnalysis":coverage,"testFiles":["test/math.test.js"]}),
+            json!({"testRunner":runner,"coverageAnalysis":coverage,"testFiles":["test/math.test.js"],"timeoutMS":5000}),
         )
         .await
         .unwrap();
             assert_eq!(response["supported"], true, "{response}");
             let records = mutants(&response);
+            assert_eq!(records.len(), 3, "{response}");
+            assert_eq!(response["stats"]["timeouts"], 0, "{response}");
             let startup = records
                 .iter()
                 .find(|mutant| mutant["mutatorName"] == "BooleanLiteral")
@@ -153,9 +156,22 @@ async fn selected_test_files_execute_without_filename_as_title_filter_for_off_an
                 records.iter().all(|mutant| mutant["status"] == "Killed"),
                 "{records:?}"
             );
+            for mutant in &records {
+                assert_eq!(mutant["killedBy"], json!(["0"]), "{response}");
+                assert_eq!(mutant["testsCompleted"], 1, "{response}");
+            }
             assert_eq!(
                 response["report"]["testFiles"].as_object().unwrap().len(),
                 1
+            );
+            assert_eq!(
+                response["report"]["testFiles"]["test/math.test.js"]["tests"],
+                json!([{"id":"0","name":"selected # suite has an unrelated # title"}]),
+                "{response}"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.path().join("src/math.js")).unwrap(),
+                source
             );
             assert!(!directory.path().join(".stryker-tmp").exists());
         }

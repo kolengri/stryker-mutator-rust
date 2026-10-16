@@ -543,11 +543,10 @@ fn instrument_file_inner(
     if parsed.fatal_error || !parsed.diagnostics.is_empty() {
         return Err(format!("Syntax error: {:?}", parsed.diagnostics));
     }
-    if parsed.is_flow_language
-        || parsed.program.hashbang.is_some()
-        || !parsed.program.directives.is_empty()
-    {
-        return Err("Directive prologues, hashbangs, and Flow preprocessing require upstream instrumentation".into());
+    if parsed.is_flow_language || !parsed.program.directives.is_empty() {
+        return Err(
+            "Directive prologues and Flow preprocessing require upstream instrumentation".into(),
+        );
     }
     let directives = CommentBoundaries::directives(&parsed.program, &file.content)?;
     let semantics = SemanticBuilder::new()
@@ -622,7 +621,9 @@ fn instrument_file_inner(
         .collect::<Result<Vec<_>, _>>()?;
     let mut output = emitter.apply(Span::new(0, file.content.len() as u32), edits);
     if emitter.placed != 0 && !options.no_header {
-        // Leave the first statement's comment preamble ahead of the helpers.
+        // Leave the parsed hashbang and first statement's comment preamble ahead
+        // of the helpers. A statement after a hashbang necessarily follows a line
+        // terminator; a hashbang ending at EOF has no mutants and needs no header.
         let preamble = parsed
             .program
             .body
@@ -3006,6 +3007,35 @@ mod tests {
                 .contains("(() => { const positive = n =>")
         );
         assert!(result.files[0].content.starts_with(HEADER));
+    }
+
+    #[test]
+    fn hashbang_keeps_its_line_and_utf16_mutant_locations() {
+        for newline in ["\n", "\r\n", "\r", "\u{2028}", "\u{2029}"] {
+            let prefix = format!("#!/usr/bin/env node 😀{newline}// preamble{newline}");
+            let source = format!("{prefix}const a = true;");
+            let response = run(&source, Value::Null);
+            assert!(response.supported, "{:?}", response.reason);
+            let result = response.result.unwrap();
+            assert!(
+                result.files[0]
+                    .content
+                    .starts_with(&format!("{prefix}{HEADER}"))
+            );
+            assert_eq!(result.mutants.len(), 1);
+            let mutant = &result.mutants[0];
+            assert_eq!(mutant.id, "0");
+            assert_eq!(mutant.replacement, "false");
+            assert_eq!(mutant.location.start.line, 2);
+            assert_eq!(mutant.location.start.column, 10);
+        }
+        for source in ["#!", "#!/usr/bin/env node", "#!/usr/bin/env node; true"] {
+            let response = run(source, Value::Null);
+            assert!(response.supported, "{:?}", response.reason);
+            let result = response.result.unwrap();
+            assert!(result.mutants.is_empty());
+            assert_eq!(result.files[0].content, source);
+        }
     }
 
     #[test]

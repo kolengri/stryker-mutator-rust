@@ -345,7 +345,8 @@ unsupported parameter-property forms, computed/quoted method keys, computed fiel
 mapped super calls, dynamic imports,
 argument spread, array holes/spread, object methods,
 accessors/spread, complex computed keys, destructuring targets,
-async/generators, `for-await`, directive prologues and hashbangs trigger whole-batch fallback.
+async/generators, `for-await` and directive prologues trigger whole-batch fallback.
+Parsed leading hashbangs are preserved ahead of the instrumentation header.
 Noncanonical number spellings and incompatible raw string/template spellings
 inside printed mutation replacements also fall back, as do objects and arrays
 with more than two elements inside those replacements. One guarded logical-clone

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { join, resolve, dirname, win32 } from 'node:path';
@@ -42,6 +42,18 @@ async function fixture(t, files = {}) {
 }
 const esm = (extra = '') => `export default ${JSON.stringify(base)}; ${extra}`;
 const request = (cwd, overrides = {}) => JSON.stringify({ version: 1, cwd, overrides });
+function assertStopped(pid) {
+  if (process.platform === 'win32') {
+    assert.throws(() => process.kill(pid, 0), error => error.code === 'ESRCH', `Child ${pid} remains active`);
+    return;
+  }
+  const status = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+  assert.equal(status.error, undefined, status.error?.message);
+  assert.ok(status.status === 0 || status.status === 1, status.stderr);
+  // Adopted POSIX descendants may remain zombies until init reaps them. Match
+  // the native-runtime cancellation oracle: no child may still execute code.
+  assert.ok(!status.stdout.trim() || status.stdout.trim().startsWith('Z'), `Child ${pid} remains active: ${status.stdout}`);
+}
 const success = async (input, options) => {
   const result = await runNativeMutationTest(input, options);
   assert.equal(result.supported, true, result.reason);
@@ -306,7 +318,7 @@ test('worker teardown awaits active native Task and releases child, registration
   assert.ok(pid > 0);
   await worker.terminate();
   assert.equal(loadNative().cancelNativeRun('worker-active'), false);
-  assert.throws(() => process.kill(pid, 0), e => e.code === 'ESRCH');
+  assertStopped(pid);
   await assert.rejects(readFile(join(cwd, '.stryker-tmp')), e => e.code === 'ENOENT');
   await success({ overrides: base });
 });
@@ -333,9 +345,10 @@ test('public abort after executable preparation keeps registration and lease thr
     }
     assert.ok(pid > 0);
     assert.throws(() => loadNative().runNativeMutationTest(request(cwd)), /exclusive native run ownership/);
+    assert.throws(() => assertStopped(pid), /remains active/, 'The termination oracle must reject the live command');
   } finally { controller.abort(reason); }
   assert.equal((await settled).error, reason);
-  assert.throws(() => process.kill(pid, 0), e => e.code === 'ESRCH');
+  assertStopped(pid);
   await assert.rejects(readFile(join(cwd, '.stryker-tmp')), e => e.code === 'ENOENT');
   await writeFile('recovered.mjs', esm());
   await success({ args: ['recovered.mjs'] });
