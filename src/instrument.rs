@@ -4,7 +4,7 @@
 //! grammar. An unsupported node/options value rejects the entire batch. This is
 //! essential: silently omitting one mutant would change mutation scores.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::*;
@@ -73,7 +73,7 @@ struct Input {
 #[derive(Deserialize, Serialize)]
 struct File {
     name: String,
-    mutate: bool,
+    mutate: Selection,
     content: String,
 }
 
@@ -106,16 +106,237 @@ struct ApiMutant {
     status: Option<&'static str>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct Location {
     start: Position,
     end: Position,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct Position {
     line: usize,
     column: u32,
+}
+
+// Preserve the caller's boolean/array representation in returned files. These
+// comparisons intentionally include touching boundaries, matching Stryker 10.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum Selection {
+    Boolean(bool),
+    Ranges(Vec<Location>),
+}
+
+impl Selection {
+    fn includes(&self, location: &Location) -> bool {
+        match self {
+            Self::Boolean(enabled) => *enabled,
+            Self::Ranges(ranges) => ranges
+                .iter()
+                .any(|range| range.start <= location.start && range.end >= location.end),
+        }
+    }
+
+    fn overlaps(&self, location: &Location) -> bool {
+        match self {
+            Self::Boolean(enabled) => *enabled,
+            Self::Ranges(ranges) => ranges
+                .iter()
+                .any(|range| range.start <= location.end && range.end >= location.start),
+        }
+    }
+}
+
+// Validation uses the entire upstream registry, not just native mutators.
+const MUTATOR_NAMES: &[&str] = &[
+    "arithmeticoperator",
+    "arraydeclaration",
+    "arrowfunction",
+    "blockstatement",
+    "booleanliteral",
+    "conditionalexpression",
+    "callexpression",
+    "equalityoperator",
+    "logicaloperator",
+    "methodexpression",
+    "objectliteral",
+    "stringliteral",
+    "unaryoperator",
+    "updateoperator",
+    "regex",
+    "optionalchaining",
+    "assignmentoperator",
+];
+
+struct Directive {
+    names: Vec<String>,
+    next_line: bool,
+    reason: Option<String>,
+    warns: bool,
+}
+
+fn js_whitespace(ch: char) -> bool {
+    matches!(
+        ch,
+        '\t' | '\u{000b}'
+            | '\u{000c}'
+            | ' '
+            | '\u{00a0}'
+            | '\u{feff}'
+            | '\n'
+            | '\r'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}'
+    )
+}
+
+impl Directive {
+    fn parse(text: &str) -> Option<Self> {
+        // Equivalent to upstream's anchored regex, including its single optional
+        // whitespace, greedy ASCII name list, unanchored tail and optional reason.
+        let text = if text.chars().next().is_some_and(js_whitespace) {
+            &text[text.chars().next()?.len_utf8()..]
+        } else {
+            text
+        };
+        let text = text.strip_prefix("Stryker ")?;
+        let (disable, text) = if let Some(text) = text.strip_prefix("disable ") {
+            (true, text)
+        } else {
+            (false, text.strip_prefix("restore ")?)
+        };
+        // The optional scope backtracks when it leaves no valid name. In that
+        // case upstream matches "next" as a name and emits an unused warning.
+        let (next_line, text) = if let Some(scoped) = text.strip_prefix("next-line ")
+            && scoped
+                .bytes()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, b',' | b' '))
+        {
+            (true, scoped)
+        } else {
+            (false, text)
+        };
+        let length = text
+            .bytes()
+            .take_while(|ch| ch.is_ascii_alphabetic() || matches!(ch, b',' | b' '))
+            .count();
+        if length == 0 {
+            return None;
+        }
+        let names: Vec<_> = text[..length]
+            .split(',')
+            .map(|name| name.trim_matches(js_whitespace).to_string())
+            .collect();
+        let warns = names.iter().any(|name| {
+            name != "all" && !MUTATOR_NAMES.contains(&name.to_ascii_lowercase().as_str())
+        });
+        let reason = text[length..]
+            .strip_prefix(':')
+            .map(|text| {
+                text.split(['\r', '\n', '\u{2028}', '\u{2029}'])
+                    .next()
+                    .unwrap_or_default()
+            })
+            .filter(|text| !text.is_empty())
+            .unwrap_or("Ignored using a comment")
+            .trim_matches(js_whitespace)
+            .to_string();
+        Some(Self {
+            names: names
+                .into_iter()
+                .map(|name| name.to_ascii_lowercase())
+                .collect(),
+            next_line,
+            reason: disable.then_some(reason),
+            warns,
+        })
+    }
+}
+
+struct Rule {
+    names: Vec<String>,
+    line: Option<usize>,
+    reason: Option<String>,
+}
+
+// Token attachment is not Babel leading-comment ownership. Only gaps in actual
+// Program/BlockStatement statement lists are proven here. Unowned closing/EOF
+// comments are preserved but do not create rules.
+#[derive(Default)]
+struct CommentBoundaries {
+    gaps: Vec<(Span, Option<u32>)>,
+}
+
+impl CommentBoundaries {
+    fn list(&mut self, start: u32, end: u32, statements: &[Statement<'_>]) {
+        let mut previous = start;
+        for statement in statements {
+            let span = statement.span();
+            self.gaps
+                .push((Span::new(previous, span.start), Some(span.start)));
+            previous = span.end;
+        }
+        self.gaps.push((Span::new(previous, end), None));
+    }
+
+    fn directives(
+        program: &Program<'_>,
+        source: &str,
+    ) -> Result<HashMap<u32, Vec<Directive>>, String> {
+        let mut boundaries = Self::default();
+        boundaries.visit_program(program);
+        boundaries.gaps.sort_unstable_by_key(|(span, _)| span.start);
+        let mut directives: HashMap<u32, Vec<Directive>> = HashMap::new();
+        for comment in &program.comments {
+            if !matches!(
+                comment.kind,
+                CommentKind::Line | CommentKind::SingleLineBlock | CommentKind::MultiLineBlock
+            ) {
+                return Err("HTML comments require upstream instrumentation".into());
+            }
+            let index = boundaries
+                .gaps
+                .partition_point(|(gap, _)| gap.start <= comment.span.start);
+            let Some((gap, owner)) = index
+                .checked_sub(1)
+                .and_then(|index| boundaries.gaps.get(index))
+            else {
+                return Err(
+                    "Ambiguous comment attachment requires upstream instrumentation".into(),
+                );
+            };
+            if comment.span.end > gap.end {
+                return Err("Comments outside statement-list boundaries require upstream attachment and replacement printing".into());
+            }
+            if let Some(owner) = owner
+                && let Some(directive) =
+                    Directive::parse(comment.content_span().source_text(source))
+            {
+                directives.entry(*owner).or_default().push(directive);
+            }
+        }
+        Ok(directives)
+    }
+}
+
+impl<'a> Visit<'a> for CommentBoundaries {
+    fn visit_program(&mut self, node: &Program<'a>) {
+        self.list(node.span.start, node.span.end, &node.body);
+        walk::walk_program(self, node);
+    }
+
+    fn visit_block_statement(&mut self, node: &BlockStatement<'a>) {
+        self.list(node.span.start + 1, node.span.end - 1, &node.body);
+        walk::walk_block_statement(self, node);
+    }
+
+    fn visit_function_body(&mut self, node: &FunctionBody<'a>) {
+        self.list(node.span.start + 1, node.span.end - 1, &node.statements);
+        walk::walk_function_body(self, node);
+    }
 }
 
 #[derive(Default)]
@@ -214,12 +435,12 @@ fn instrument_file(
         return Err(format!("Syntax error: {:?}", parsed.diagnostics));
     }
     if parsed.is_flow_language
-        || !parsed.program.comments.is_empty()
         || parsed.program.hashbang.is_some()
         || !parsed.program.directives.is_empty()
     {
-        return Err("Comments, directives, hashbangs, and Flow preprocessing require upstream instrumentation".into());
+        return Err("Directive prologues, hashbangs, and Flow preprocessing require upstream instrumentation".into());
     }
+    let directives = CommentBoundaries::directives(&parsed.program, &file.content)?;
     let semantics = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&parsed.program);
@@ -236,10 +457,14 @@ fn instrument_file(
         file_name: &file.name,
         positions: Positions::new(&file.content),
         options,
-        enabled: file.mutate,
+        selection: &file.mutate,
+        pruned: false,
+        directives,
+        rules: vec![],
         records,
         placed: 0,
     };
+    emitter.pruned = !file.mutate.overlaps(&emitter.location(parsed.program.span));
     let edits = parsed
         .program
         .body
@@ -252,7 +477,13 @@ fn instrument_file(
         .collect::<Result<Vec<_>, _>>()?;
     let mut output = emitter.apply(Span::new(0, file.content.len() as u32), edits);
     if emitter.placed != 0 && !options.no_header {
-        output.insert_str(0, HEADER);
+        // Leave the first statement's comment preamble ahead of the helpers.
+        let preamble = parsed
+            .program
+            .body
+            .first()
+            .map_or(0, |statement| statement.span().start as usize);
+        output.insert_str(preamble, HEADER);
     }
     Ok(output)
 }
@@ -366,12 +597,76 @@ struct Emitter<'s, 'r> {
     file_name: &'s str,
     positions: Positions,
     options: &'s Options,
-    enabled: bool,
+    selection: &'s Selection,
+    pruned: bool,
+    directives: HashMap<u32, Vec<Directive>>,
+    rules: Vec<Rule>,
     records: &'r mut Vec<ApiMutant>,
     placed: usize,
 }
 
 impl Emitter<'_, '_> {
+    fn location(&self, span: Span) -> Location {
+        Location {
+            start: self.positions.at(span.start),
+            end: self.positions.at(span.end),
+        }
+    }
+
+    fn scope<T>(
+        &mut self,
+        span: Span,
+        leading_comments: bool,
+        emit: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let previous = self.pruned;
+        if !previous
+            && leading_comments
+            && let Some(directives) = self.directives.remove(&span.start)
+        {
+            for directive in directives {
+                if directive.warns {
+                    return Err(
+                        "Warning-producing Stryker directives require upstream logging".into(),
+                    );
+                }
+                self.rules.push(Rule {
+                    names: directive.names,
+                    line: directive
+                        .next_line
+                        .then(|| self.positions.at(span.start).line),
+                    reason: directive.reason,
+                });
+            }
+        }
+        self.pruned |= !self.selection.overlaps(&self.location(span));
+        // Still validate pruned grammar, but neither collect nor process its
+        // descendant directives. This preserves the conservative grammar gate.
+        let result = emit(self);
+        self.pruned = previous;
+        result
+    }
+
+    fn ignore_reason(&self, line: usize, name: &str) -> Option<String> {
+        self.rules
+            .iter()
+            .rev()
+            .find(|rule| {
+                rule.line.is_none_or(|target| target == line)
+                    && rule
+                        .names
+                        .iter()
+                        .any(|candidate| candidate == "all" || candidate.eq_ignore_ascii_case(name))
+            })
+            .and_then(|rule| rule.reason.clone())
+            .or_else(|| {
+                self.options
+                    .excluded
+                    .contains(name)
+                    .then(|| format!("Ignored because of excluded mutation \"{name}\""))
+            })
+    }
+
     fn text(&self, span: Span) -> &str {
         &self.source[span.start as usize..span.end as usize]
     }
@@ -414,22 +709,19 @@ impl Emitter<'_, '_> {
         name: &'static str,
         switches: &mut Vec<Switch>,
     ) {
-        if !self.enabled {
+        if self.pruned || !self.selection.includes(&self.location(span)) {
             return;
         }
         let id = self.records.len().to_string();
-        let ignored = self.options.excluded.contains(name);
+        let reason = self.ignore_reason(self.positions.at(span.start).line, name);
+        let ignored = reason.as_ref().is_some_and(|reason| !reason.is_empty());
         self.records.push(ApiMutant {
             file_name: self.file_name.into(),
             id: id.clone(),
-            location: Location {
-                start: self.positions.at(span.start),
-                end: self.positions.at(span.end),
-            },
+            location: self.location(span),
             mutator_name: name,
             replacement: replacement.clone(),
-            status_reason: ignored
-                .then(|| format!("Ignored because of excluded mutation \"{name}\"")),
+            status_reason: reason,
             status: ignored.then_some("Ignored"),
         });
         if !ignored {
@@ -439,6 +731,16 @@ impl Emitter<'_, '_> {
     }
 
     fn expression(
+        &mut self,
+        node: &Expression<'_>,
+        context: Context<'_>,
+    ) -> Result<String, String> {
+        self.scope(node.span(), false, |emitter| {
+            emitter.expression_inner(node, context)
+        })
+    }
+
+    fn expression_inner(
         &mut self,
         node: &Expression<'_>,
         context: Context<'_>,
@@ -777,13 +1079,15 @@ impl Emitter<'_, '_> {
             if let Some(initializer) = &variable.init {
                 edits.push((
                     initializer.span(),
-                    self.expression(
-                        initializer,
-                        Context {
-                            binding_name: Some(binding.name.as_str()),
-                            ..Context::default()
-                        },
-                    )?,
+                    self.scope(variable.span, false, |emitter| {
+                        emitter.expression(
+                            initializer,
+                            Context {
+                                binding_name: Some(binding.name.as_str()),
+                                ..Context::default()
+                            },
+                        )
+                    })?,
                 ));
             }
         }
@@ -807,6 +1111,10 @@ impl Emitter<'_, '_> {
     }
 
     fn block(&mut self, span: Span, statements: &[Statement<'_>]) -> Result<String, String> {
+        self.scope(span, false, |emitter| emitter.block_inner(span, statements))
+    }
+
+    fn block_inner(&mut self, span: Span, statements: &[Statement<'_>]) -> Result<String, String> {
         let mut switches = vec![];
         if !statements.is_empty() {
             self.collect(span, "{}".into(), "BlockStatement", &mut switches);
@@ -833,6 +1141,12 @@ impl Emitter<'_, '_> {
     }
 
     fn declaration(&mut self, node: &Declaration<'_>) -> Result<String, String> {
+        self.scope(node.span(), false, |emitter| {
+            emitter.declaration_inner(node)
+        })
+    }
+
+    fn declaration_inner(&mut self, node: &Declaration<'_>) -> Result<String, String> {
         match node {
             Declaration::FunctionDeclaration(function) => self.function(function),
             Declaration::VariableDeclaration(variables) => self.variables(variables),
@@ -841,6 +1155,12 @@ impl Emitter<'_, '_> {
     }
 
     fn statement(&mut self, node: &Statement<'_>, top_level: bool) -> Result<String, String> {
+        self.scope(node.span(), true, |emitter| {
+            emitter.statement_inner(node, top_level)
+        })
+    }
+
+    fn statement_inner(&mut self, node: &Statement<'_>, top_level: bool) -> Result<String, String> {
         let mut edits = vec![];
         match node {
             Statement::FunctionDeclaration(function) => {
@@ -943,7 +1263,7 @@ mod tests {
             "function f(){ return call(); }",
             "const o = {method(){ return 1; }};",
             "const x = a === 'string';",
-            "// Stryker disable all\nconst x = 1;",
+            "const x = 1 /* Stryker disable all */ + 2;",
             "function f(x = 1) { return x; }",
             "const x = a.value;",
             "const stryCov_9fa48 = 1;",
