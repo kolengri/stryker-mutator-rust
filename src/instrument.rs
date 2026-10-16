@@ -13,11 +13,15 @@ use oxc_codegen::Codegen;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
-use oxc_syntax::operator::{BinaryOperator as B, LogicalOperator as L, UnaryOperator as U};
+use oxc_syntax::operator::{
+    BinaryOperator as B, LogicalOperator as L, UnaryOperator as U, UpdateOperator,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::mutations::{Utf16Offsets, method_replacement as method_mapping};
+use crate::mutations::{
+    Utf16Offsets, assignment_operator_replacement, method_replacement as method_mapping,
+};
 
 // Keep the protocol and caching behavior in sync with Stryker 10 syntax-helpers.
 // This includes truthy currentTestId selection, dynamic activeMutant checks, and
@@ -590,6 +594,22 @@ fn arithmetic_replacement(binary: &BinaryExpression<'_>) -> Option<B> {
     }
 }
 
+fn assignment_replacement(
+    node: &AssignmentExpression<'_>,
+) -> Option<oxc_syntax::operator::AssignmentOperator> {
+    // Match the direct syntactic RHS exclusion, without inferring its value.
+    if !node.operator.is_logical()
+        && matches!(
+            node.right,
+            Expression::StringLiteral(_) | Expression::TemplateLiteral(_)
+        )
+    {
+        None
+    } else {
+        assignment_operator_replacement(node.operator)
+    }
+}
+
 fn method_target<'b, 'a>(callee: &'b Expression<'a>) -> Option<(&'b Expression<'a>, &'b str)> {
     match callee {
         Expression::StaticMemberExpression(member) => {
@@ -699,6 +719,27 @@ impl<'a> VisitMut<'a> for ReplaceExpression<'a, '_> {
             walk_mut::walk_expression(self, node);
         }
     }
+
+    fn visit_simple_assignment_target(&mut self, node: &mut SimpleAssignmentTarget<'a>) {
+        // Lvalue roots do not pass through visit_expression. Only their object
+        // and computed key are expressions; never replace the reference itself.
+        match node {
+            SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                self.visit_expression(&mut member.object);
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                self.visit_expression(&mut member.object);
+                self.visit_expression(&mut member.expression);
+            }
+            _ => walk_mut::walk_simple_assignment_target(self, node),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TargetPlacement {
+    Assignment,
+    Update,
 }
 
 struct Switch {
@@ -984,6 +1025,42 @@ impl Emitter<'_, '_> {
         ))))
     }
 
+    fn lvalue(
+        &mut self,
+        target: &SimpleAssignmentTarget<'_>,
+        context: Context<'_>,
+        pending: &mut Vec<Switch>,
+        placement: TargetPlacement,
+    ) -> Result<String, String> {
+        self.scope(target.span(), false, |emitter| {
+            let start = pending.len();
+            let mut edits = vec![];
+            let (object, key) = match target {
+                SimpleAssignmentTarget::AssignmentTargetIdentifier(_) => return Ok(emitter.text(target.span()).into()),
+                SimpleAssignmentTarget::StaticMemberExpression(member) if !member.optional => (&member.object, None),
+                SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => (&member.object, Some(&member.expression)),
+                _ => return Err("Destructuring, private, optional, and typed assignment targets require upstream instrumentation".into()),
+            };
+            let mut child_context = Context {
+                printed_ancestor: context.printed_ancestor || chain_prints(object),
+                ..Context::default()
+            };
+            edits.push((object.span(), emitter.chain_child(object, child_context, pending)?));
+            if pending.len() != start {
+                if placement == TargetPlacement::Update {
+                    // Babel attempts a ConditionalExpression in UpdateExpression's
+                    // argument and throws. Preserve that diagnostic via fallback.
+                    return Err("Active update target-object mutations require upstream placement (invalid conditional lvalue)".into());
+                }
+                child_context.printed_ancestor = true;
+            }
+            if let Some(key) = key {
+                edits.push((key.span(), emitter.expression(key, child_context)?));
+            }
+            Ok(emitter.apply(target.span(), edits))
+        })
+    }
+
     fn expression_inner(
         &mut self,
         node: &Expression<'_>,
@@ -1178,6 +1255,18 @@ impl Emitter<'_, '_> {
             }
         }
 
+        if let Expression::UpdateExpression(_) = node {
+            let replacement = self.changed(node, |node| {
+                if let Expression::UpdateExpression(update) = node {
+                    update.operator = match update.operator {
+                        UpdateOperator::Increment => UpdateOperator::Decrement,
+                        UpdateOperator::Decrement => UpdateOperator::Increment,
+                    };
+                }
+            });
+            self.collect(node.span(), replacement, "UpdateOperator", &mut switches);
+        }
+
         if own_optional(node) {
             let replacement = self.changed(node, |node| match node {
                 Expression::CallExpression(call) => call.optional = false,
@@ -1186,6 +1275,22 @@ impl Emitter<'_, '_> {
                 _ => unreachable!("own_optional accepts only calls and public members"),
             });
             self.collect(node.span(), replacement, "OptionalChaining", &mut switches);
+        }
+
+        if let Expression::AssignmentExpression(assignment) = node
+            && let Some(operator) = assignment_replacement(assignment)
+        {
+            let replacement = self.changed(node, |node| {
+                if let Expression::AssignmentExpression(assignment) = node {
+                    assignment.operator = operator;
+                }
+            });
+            self.collect(
+                node.span(),
+                replacement,
+                "AssignmentOperator",
+                &mut switches,
+            );
         }
 
         for switch in &mut switches {
@@ -1212,6 +1317,17 @@ impl Emitter<'_, '_> {
                 let child_context = Context { printed_ancestor: context.printed_ancestor, ..Context::default() };
                 edits.push((member.object.span(), self.chain_child(&member.object, child_context, pending)?));
                 edits.push((member.expression.span(), self.expression(&member.expression, child_context)?));
+            }
+            Expression::AssignmentExpression(assignment) => {
+                let target = assignment.left.as_simple_assignment_target().ok_or("Destructuring assignment targets require upstream instrumentation")?;
+                let start = pending.len();
+                let mut child_context = Context { printed_ancestor: context.printed_ancestor || assignment_replacement(assignment).is_some(), ..Context::default() };
+                edits.push((target.span(), self.lvalue(target, child_context, pending, TargetPlacement::Assignment)?));
+                child_context.printed_ancestor |= pending.len() != start;
+                edits.push((assignment.right.span(), self.expression(&assignment.right, child_context)?));
+            }
+            Expression::UpdateExpression(update) => {
+                edits.push((update.argument.span(), self.lvalue(&update.argument, Context { printed_ancestor: true, ..Context::default() }, pending, TargetPlacement::Update)?));
             }
             Expression::NumericLiteral(_) => {
                 // Oxc normalizes some number spellings while Babel preserves raw
@@ -1298,7 +1414,7 @@ impl Emitter<'_, '_> {
                     }
                 }
             }
-            _ => return Err("Unsupported expression in native grammar (private members, new, import, regex, classes, assignments, updates, and type syntax require upstream)".into()),
+            _ => return Err("Unsupported expression in native grammar (private members, new, import, regex, classes, sequences, and type syntax require upstream)".into()),
         }
         Ok(self.apply(node.span(), edits))
     }
@@ -1739,5 +1855,124 @@ mod tests {
                 .content
                 .contains("obj.trim((stryMutAct_9fa48(\"1\")")
         );
+    }
+
+    #[test]
+    fn assignments_lift_only_target_spine_switches_and_keep_child_preorder() {
+        let response = run(
+            "factory().trim().field += rhs?.value; obj[key.trim()] += x++;",
+            Value::Null,
+        );
+        assert!(response.supported, "{:?}", response.reason);
+        let result = response.result.unwrap();
+        assert_eq!(
+            result
+                .mutants
+                .iter()
+                .map(|m| (m.id.as_str(), m.mutator_name, m.replacement.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "0",
+                    "AssignmentOperator",
+                    "factory().trim().field -= rhs?.value"
+                ),
+                ("1", "MethodExpression", "factory()"),
+                ("2", "OptionalChaining", "rhs.value"),
+                ("3", "AssignmentOperator", "obj[key.trim()] -= x++"),
+                ("4", "MethodExpression", "key"),
+                ("5", "UpdateOperator", "x--"),
+            ]
+        );
+        let output = &result.files[0].content;
+        assert!(output.contains("? (factory().field += rhs?.value)"));
+        assert!(output.contains("stryCov_9fa48(\"0\", \"1\")"));
+        assert!(output.contains("stryCov_9fa48(\"2\")"));
+        assert!(output.contains("obj[(stryMutAct_9fa48(\"4\")"));
+    }
+
+    #[test]
+    fn update_target_spines_reject_only_active_pending_mutations() {
+        let source = "factory().trim().field++;";
+        let rejected = run(source, Value::Null);
+        assert!(!rejected.supported);
+        assert!(rejected.result.is_none());
+        assert!(rejected.reason.unwrap().contains("update target-object"));
+
+        let ignored = run(
+            source,
+            serde_json::json!({"excludedMutations": ["MethodExpression"]}),
+        );
+        assert!(ignored.supported, "{:?}", ignored.reason);
+        let result = ignored.result.unwrap();
+        assert_eq!(result.mutants[0].replacement, "factory().trim().field--");
+        assert_eq!(result.mutants[1].status, Some("Ignored"));
+        assert!(!result.files[0].content.contains("stryMutAct_9fa48(\"1\")"));
+        for source in [
+            "factory().field++;",
+            "obj[key.trim()]++;",
+            "++obj[index++];",
+        ] {
+            let accepted = run(source, Value::Null);
+            assert!(accepted.supported, "{source}: {:?}", accepted.reason);
+        }
+    }
+
+    #[test]
+    fn assignment_and_update_printer_guards_follow_serialized_ancestors() {
+        for source in [
+            "a += 'raw';", // No assignment candidate: only the string is printed.
+            "a = x => x;",
+            "obj.x = {key: 1};",
+        ] {
+            let response = run(source, Value::Null);
+            assert!(response.supported, "{source}: {:?}", response.reason);
+        }
+        for source in [
+            "obj['raw']++;",
+            "a += ('raw' + b);",
+            "factory().trim().field = 'raw';",
+            "factory().trim().field = x => x;",
+            "a += {key: 1};",
+            "[a] = b;",
+            "(a++, b++);",
+        ] {
+            let response = run(source, Value::Null);
+            assert!(!response.supported, "{source}");
+            assert!(response.result.is_none());
+        }
+    }
+
+    #[test]
+    fn typed_chain_replacement_rejects_missing_or_ambiguous_target_identity() {
+        let allocator = Allocator::default();
+        let mut root = Parser::new(&allocator, "obj.trim() + obj.trim()", SourceType::mjs())
+            .parse_expression()
+            .unwrap();
+        let Expression::BinaryExpression(binary) = &mut root else {
+            unreachable!()
+        };
+        let target = binary.left.span();
+        // Deliberately alias the source span to exercise exact-one validation.
+        let Expression::CallExpression(right) = &mut binary.right else {
+            unreachable!()
+        };
+        right.span = target;
+        let replacement = Parser::new(&allocator, "obj", SourceType::mjs())
+            .parse_expression()
+            .unwrap();
+        let mut visitor = ReplaceExpression {
+            target,
+            kind: ChainKind::Call,
+            replacement: &replacement,
+            allocator: &allocator,
+            replaced: 0,
+        };
+        visitor.visit_expression(&mut root);
+        assert_eq!(visitor.replaced, 2);
+        visitor.target = Span::new(100, 101);
+        visitor.replaced = 0;
+        visitor.visit_expression(&mut root);
+        assert_eq!(visitor.replaced, 0);
     }
 }

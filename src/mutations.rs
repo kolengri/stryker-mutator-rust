@@ -6,6 +6,7 @@ use oxc_ast_visit::{Visit, walk};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
+use oxc_syntax::operator::AssignmentOperator as A;
 use serde::Serialize;
 
 const PREVIEW_REASON: &str = "Experimental candidate subset; not a drop-in Stryker mutation result. Regex mutations, empty-expression filtering, constructor handling, ignore directives, framework preprocessing, and instrumentation are not implemented. Type positions are excluded.";
@@ -384,20 +385,7 @@ impl<'a> Visit<'a> for MutationVisitor<'_, 'a> {
 
     fn visit_assignment_expression(&mut self, node: &AssignmentExpression<'a>) {
         let operator = node.operator.as_str();
-        let replacement = match operator {
-            "+=" => Some("-="),
-            "-=" => Some("+="),
-            "*=" => Some("/="),
-            "/=" | "%=" => Some("*="),
-            "<<=" => Some(">>="),
-            ">>=" => Some("<<="),
-            "&=" => Some("|="),
-            "|=" => Some("&="),
-            "&&=" => Some("||="),
-            "||=" | "??=" => Some("&&="),
-            _ => None,
-        };
-        if let Some(replacement) = replacement
+        if let Some(replacement) = assignment_operator_replacement(node.operator)
             && (!is_string(&node.right) || matches!(operator, "&&=" | "||=" | "??="))
         {
             self.replace_operator(
@@ -405,7 +393,7 @@ impl<'a> Visit<'a> for MutationVisitor<'_, 'a> {
                 node.left.span().end,
                 node.right.span().start,
                 operator,
-                replacement,
+                replacement.as_str(),
                 "AssignmentOperator",
             );
         }
@@ -617,6 +605,23 @@ impl<'a> Visit<'a> for MutationVisitor<'_, 'a> {
             );
         }
         walk::walk_new_expression(self, node);
+    }
+}
+
+// Shared pure assignment mapping; preview and native placement keep their own exclusions.
+pub(crate) fn assignment_operator_replacement(operator: A) -> Option<A> {
+    match operator {
+        A::Addition => Some(A::Subtraction),
+        A::Subtraction => Some(A::Addition),
+        A::Multiplication => Some(A::Division),
+        A::Division | A::Remainder => Some(A::Multiplication),
+        A::ShiftLeft => Some(A::ShiftRight),
+        A::ShiftRight => Some(A::ShiftLeft),
+        A::BitwiseAnd => Some(A::BitwiseOR),
+        A::BitwiseOR => Some(A::BitwiseAnd),
+        A::LogicalAnd => Some(A::LogicalOr),
+        A::LogicalOr | A::LogicalNullish => Some(A::LogicalAnd),
+        _ => None,
     }
 }
 
