@@ -244,8 +244,8 @@ test('script-relative selections directives exclusions and noHeader retain pinne
 const unsupported = [
   '<SCRIPT>const x=true;</SCRIPT>', '<script TYPE="js">const x=true;</script>', '<script SRC="x">const x=true;</script>',
   '<script>const x=true;</SCRIPT>', '<script type="js" type="ts">const x=true;</script>',
-  '<script type="js" TYPE="json">const x=true;</script>', '<script type="tsx">const x=<p/>;</script>',
-  '<script lang="tsx">const x=true;</script>', '<script/>', '<div/><script>const x=true;</script>',
+  '<script type="js" TYPE="json">const x=true;</script>', '<script type="tsx">const x=<p attr/>;</script>',
+  '<script lang="tsx">const x=<p>{true}</p>;</script>', '<script/>', '<div/><script>const x=true;</script>',
   '<svg><script>const x=true;</script></svg>',
   '<table><script>const x=true;</script><tr><td>x</td></tr></table>',
   '<div><p>implicit</div><script>const x=true;</script>', '<div><span></div></span>',
@@ -290,7 +290,7 @@ test('serial four auto serial recovery and cache bypass retain exact native sour
     assert.deepEqual(raw(files, threads).result, baseline.result);
     const strict = createInstrumenter(logger, { cache: false, engine: 'native', instrumentationThreads: threads === 'auto' ? undefined : threads });
     assert.deepEqual(plain(await strict.instrument(files, options)), baseline.result);
-    const bad = [...files, file('<template><script lang="tsx">const bad=true;</script></template>', 'bad.html')];
+    const bad = [...files, file('<template><script lang="tsx">const bad=<p attr/>;</script></template>', 'bad.html')];
     await assert.rejects(strict.instrument(bad, options), /unsupported/i);
     assert.deepEqual(plain(await strict.instrument(files, options)), baseline.result);
     assert.equal(strict.stats.nativeErrors, 0);

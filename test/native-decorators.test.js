@@ -225,7 +225,7 @@ test('unproven decorated forms retain atomic fallback for the whole mixed batch'
     'class C{@dec [key]=true;}', 'class C{@dec [key](){return true;}}', 'class C{@dec "method"(){return true;}}',
     'class C{@dec #method(){return true;}}', 'class C{@dec *method(){return true;}}',
     'class C{constructor(@dec x:number){}}', 'class C{method(@dec x:number){return true;}}',
-    '@dec class C{x=receiver.html`unsupported`;}', 'export default @dec class C{@dec x:number=1+2;}']) {
+    '@dec class C{x=receiver.html`unsupported`;}', 'export default @dec class {@dec x:number=1+2;}']) {
     const files = [file('const first=true;', 'first.ts'), file(source)];
     const raw = JSON.parse(loadNative().instrumentBatch(JSON.stringify({ files, options })));
     assert.equal(raw.supported, false, source);

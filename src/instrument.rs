@@ -544,6 +544,7 @@ fn instrument_file_inner(
         records,
         next_id,
         relocation_proven,
+        false,
     )
 }
 
@@ -557,14 +558,12 @@ fn instrument_program(
     records: &mut Vec<ApiMutant>,
     next_id: &mut usize,
     relocation_proven: Option<&mut bool>,
+    html_raw_text: bool,
 ) -> Result<String, String> {
     #[cfg(test)]
     let parse_timer = parallel::diagnostic::Timer::start(0);
     if source.len() > u32::MAX as usize {
         return Err("Source exceeds 32-bit span limits".into());
-    }
-    if source_type.is_jsx() {
-        return Err("JSX and TSX require upstream instrumentation".into());
     }
     // Babel uses the TS parser for declaration extensions too, without Oxc's
     // ambient-definition restrictions on otherwise ordinary runtime statements.
@@ -583,6 +582,24 @@ fn instrument_program(
     let guards_timer = parallel::diagnostic::Timer::start(1);
     if parsed.fatal_error || !parsed.diagnostics.is_empty() {
         return Err(format!("Syntax error: {:?}", parsed.diagnostics));
+    }
+    let mut jsx = LeafJsx::default();
+    if source_type.is_jsx() {
+        jsx.visit_program(&parsed.program);
+    }
+    if jsx.unsupported {
+        return Err(
+            "Only lowercase attribute-free text-only JSX leaves have native semantics".into(),
+        );
+    }
+    // The HTML frontend defers selected TSX raw-text closing sequences to this
+    // SAME parsed tree. Strings, comments and JSX text cannot authorize a close.
+    if html_raw_text
+        && source
+            .match_indices("</")
+            .any(|(start, _)| !jsx.closings.contains(&(start as u32)))
+    {
+        return Err("Unproven HTML raw-text closing sequence".into());
     }
     if parsed.is_flow_language || !parsed.program.directives.is_empty() {
         return Err(
@@ -674,6 +691,46 @@ fn instrument_program(
         output.insert_str(preamble, HEADER);
     }
     Ok(output)
+}
+
+#[derive(Default)]
+struct LeafJsx {
+    found: bool,
+    unsupported: bool,
+    closings: HashSet<u32>,
+}
+
+impl<'a> Visit<'a> for LeafJsx {
+    fn visit_jsx_element(&mut self, element: &JSXElement<'a>) {
+        self.found = true;
+        let opening = &element.opening_element;
+        let JSXElementName::Identifier(name) = &opening.name else {
+            self.unsupported = true;
+            return;
+        };
+        let mut letters = name.name.bytes();
+        let lowercase = letters.next().is_some_and(|ch| ch.is_ascii_lowercase())
+            && letters.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit());
+        self.unsupported |= !lowercase
+            || !opening.attributes.is_empty()
+            || opening.type_arguments.is_some()
+            || element
+                .children
+                .iter()
+                .any(|child| !matches!(child, JSXChild::Text(_)));
+        if let Some(closing) = &element.closing_element {
+            self.unsupported |= !matches!(&closing.name,
+                JSXElementName::Identifier(close) if close.name == name.name);
+            self.closings.insert(closing.span.start);
+        }
+        // No recursive walk: all admitted children are inert JSXText. Nested
+        // elements and expression containers reject the entire program above.
+    }
+
+    fn visit_jsx_fragment(&mut self, _: &JSXFragment<'a>) {
+        self.found = true;
+        self.unsupported = true;
+    }
 }
 
 #[derive(Default)]
@@ -1336,6 +1393,11 @@ impl Emitter<'_, '_> {
     }
 
     fn print(&self, node: &Expression<'_>) -> Result<String, String> {
+        let mut jsx = LeafJsx::default();
+        jsx.visit_expression(node);
+        if jsx.found {
+            return Err("JSX inside cloned replacements requires upstream formatting".into());
+        }
         string_spelling::expression(node, self.source)
     }
 
@@ -1613,7 +1675,9 @@ impl Emitter<'_, '_> {
         if context.printed_ancestor
             && matches!(
                 node,
-                Expression::FunctionExpression(_) | Expression::ClassExpression(_)
+                Expression::FunctionExpression(_)
+                    | Expression::ClassExpression(_)
+                    | Expression::JSXElement(_)
             )
         {
             return Err(
@@ -1948,6 +2012,9 @@ impl Emitter<'_, '_> {
                 return self.function(function);
             }
             Expression::ClassExpression(class) => return self.class(class),
+            // LeafJsx already proved the complete subtree. JSXText is not a
+            // StringLiteral and upstream introduces no JSX-specific mutants.
+            Expression::JSXElement(_) => {},
             Expression::PrivateFieldExpression(member) => {
                 if member.optional {
                     return Err("Optional private members require upstream instrumentation".into());
@@ -2998,13 +3065,16 @@ impl Emitter<'_, '_> {
             }
             Statement::BreakStatement(_) | Statement::ContinueStatement(_) => return Ok(Self::terminate(self.text(node.span()).into())),
             Statement::ExportDefaultDeclaration(export) => {
-                // Only the proven object-expression default export is admitted.
-                // Keep function/class declarations and other default forms atomic.
-                let ExportDefaultDeclarationKind::ObjectExpression(_) = &export.declaration else {
-                    return Err("Only object default exports have native placement semantics".into());
-                };
-                let expression = export.declaration.as_expression().ok_or("Default export without expression")?;
-                edits.push((expression.span(), self.expression(expression, Context::default())?));
+                match &export.declaration {
+                    ExportDefaultDeclarationKind::ClassDeclaration(class) if class.id.is_some() => {
+                        edits.push((class.span, self.class(class)?));
+                    }
+                    ExportDefaultDeclarationKind::ObjectExpression(_) => {
+                        let expression = export.declaration.as_expression().ok_or("Default export without expression")?;
+                        edits.push((expression.span(), self.expression(expression, Context::default())?));
+                    }
+                    _ => return Err("Only object and named class default exports have native placement semantics".into()),
+                }
             }
             Statement::ExportDeclaration(export) => edits.push((export.declaration.span(), self.declaration(&export.declaration)?)),
             Statement::ExportNamedDeclaration(export) => {

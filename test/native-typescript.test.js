@@ -273,7 +273,7 @@ test('deferred TS wrappers, targets and unproven printing preserve fallback and 
     const failure=await fallback(source);
     assert.ok(failure,'pinned upstream type-literal placement must throw');
   }
-  await fallback('const x=<div/>;',options,'unsupported.tsx');
+  await fallback('const x=<div attr/>;',options,'unsupported.tsx');
 });
 
 test('invalid TS is parsed even for mutate:false and empty ranges', async () => {

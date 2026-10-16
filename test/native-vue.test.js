@@ -22,8 +22,6 @@ const resource = new URL(resourceOverride ?? '../artifacts/upstream/stryker-js/p
 // Exact pinned upstream bytes, deliberately independent of an ignored checkout.
 const vueSample = "<template>\n  <div class=\"hello\">\n    <h1>{{ msg }}</h1>\n    <h2>Essential Links</h2>\n    <ul>\n      <li>\n        <a href=\"https://vuejs.org\" target=\"_blank\"> Core Docs </a>\n      </li>\n      <li>\n        <a href=\"https://forum.vuejs.org\" target=\"_blank\"> Forum </a>\n      </li>\n      <li>\n        <a href=\"https://chat.vuejs.org\" target=\"_blank\"> Community Chat </a>\n      </li>\n      <li>\n        <a href=\"https://twitter.com/vuejs\" target=\"_blank\"> Twitter </a>\n      </li>\n      <br />\n      <li>\n        <a href=\"http://vuejs-templates.github.io/webpack/\" target=\"_blank\">\n          Docs for This Template\n        </a>\n      </li>\n    </ul>\n    <h2>Ecosystem</h2>\n    <ul>\n      <li>\n        <a href=\"http://router.vuejs.org/\" target=\"_blank\"> vue-router </a>\n      </li>\n      <li>\n        <a href=\"http://vuex.vuejs.org/\" target=\"_blank\"> vuex </a>\n      </li>\n      <li>\n        <a href=\"http://vue-loader.vuejs.org/\" target=\"_blank\"> vue-loader </a>\n      </li>\n      <li>\n        <a href=\"https://github.com/vuejs/awesome-vue\" target=\"_blank\">\n          awesome-vue\n        </a>\n      </li>\n    </ul>\n  </div>\n</template>\n\n<script>\nexport default {\n  name: 'HelloWorld',\n  data() {\n    return {\n      msg: 'Welcome to Your Vue.js App',\n    };\n  },\n  watch: {\n    'category.type'(categoryType) {\n      if (this.isNew && this.category) {\n        this.category.permissions =\n          getDefaultDocumentCategoryPermissions(categoryType);\n      }\n    },\n  },\n};\n</script>\n<script>\nconst b = a + c;\n</script>\n\n<!-- Add \"scoped\" attribute to limit CSS to this component only -->\n<style scoped>\nh1,\nh2 {\n  font-weight: normal;\n}\nul {\n  list-style-type: none;\n  padding: 0;\n}\nli {\n  display: inline-block;\n  margin: 0 10px;\n}\na {\n  color: #42b983;\n}\n</style>\n";
 const vueSha = "dc8c662823d82b134dde1816d077b66816d525a0d48fdc337dfc679085452c94";
-const tsxSample = "<template>\n  <div class=\"test\">\n    <h1>Hello</h1>\n  </div>\n</template>\n<script lang=\"tsx\">\nimport { Vue, Component, Prop, Watch, Emit } from 'vue-property-decorator';\n@Component({\n  name: 'example-tsx-component',\n})\nexport default class AuditDrawerInfo extends Vue {\n  public renderFunction = (h, context) => {\n    return <button>button</button>;\n  };\n}\n</script>\n<style lang=\"scss\"></style>\n";
-const tsxSha = '28cac85bca322820ec5a82e60c24a66b2be000cfdff55d907abb9ee0a7423a8c';
 const raw = (files, threads = 1, config = options) => JSON.parse(loadNative().instrumentBatch(JSON.stringify({
   files, options: config, execution: threads === 'auto' ? {} : { threads },
 })));
@@ -273,10 +271,10 @@ export default { method(){return '😀';} };
 });
 
 const unsupported = [
-  tsxSample,
+  '<script lang="tsx">const value=<p a/>;</script>',
   `<script>export default {\n// Stryker disable next-line BlockStatement: method body\n'quoted'(){return true;}\n};</script>`,
-  '<template><script lang="tsx">const value=<p/>;</script></template>',
-  '<template><script type="text/tsx">const value=true;</script></template>',
+  '<template><script lang="tsx">const value=<p a/>;</script></template>',
+  '<template><script type="text/tsx">const value=<p><p/></p>;</script></template>',
   '<template><script>const value=<p/>;</script></template>',
   '<TEMPLATE><script>const value=true;</script></TEMPLATE>',
   '<template><SCRIPT>const value=true;</SCRIPT></template>',
@@ -301,17 +299,12 @@ const unsupported = [
   '<script>export default {[key](){return true;}};</script>',
   '<script>export default {*method(){yield true;}};</script>',
   '<script>export default {async method(){return true;}};</script>',
-  '<script>export default class C{method(){return true;}}</script>',
+  '<script>export default class {method(){return true;}}</script>',
   '<script>export default function calc(){return true;}</script>',
   '<script>export default {method(){"use strict";return true;}};</script>',
   '<script>const value=true;</script><script>export default {method(){return receiver.tag`x`;}};</script>',
 ];
-test('unproven Vue markup embedded grammar and TSX reject the entire mixed batch with exact fallback or errors', async () => {
-  assert.equal(hash(tsxSample), tsxSha, 'pinned unsupported TSX bytes');
-  try {
-    const resource = new URL('../artifacts/upstream/stryker-js/packages/instrumenter/testResources/instrumenter/vue-tsx-sample.vue', import.meta.url);
-    assert.equal(await readFile(resource, 'utf8'), tsxSample);
-  } catch (error) { if (error.code !== 'ENOENT') throw error; }
+test('unproven Vue markup embedded grammar and broader TSX reject the entire mixed batch with exact fallback or errors', async () => {
   const ledger = [];
   for (const content of unsupported) {
     const files = [file('const before=true;', 'before.js'), file(vueSample, 'positive.vue'), file(content, 'unsupported.vue')];
@@ -340,7 +333,7 @@ test('serial four auto recovery retain exact output bytes metadata and global ID
     assert.deepEqual(direct.result, baseline.result);
     const strict = createInstrumenter(logger, { cache: false, engine: 'native', instrumentationThreads: threads === 'auto' ? undefined : threads });
     assert.deepEqual(plain(await strict.instrument(files, options)), baseline.result);
-    await assert.rejects(strict.instrument([...files, file('<script lang="tsx">const bad=<p/>;</script>', 'bad.vue')], options), /unsupported/i);
+    await assert.rejects(strict.instrument([...files, file('<script lang="tsx">const bad=<p a/>;</script>', 'bad.vue')], options), /unsupported/i);
     assert.deepEqual(plain(await strict.instrument(files, options)), baseline.result);
     assert.deepEqual([strict.stats.nativeBatches, strict.stats.fallbackBatches, strict.stats.nativeErrors], [2, 0, 0]);
     if (direct.execution.spawnedThreads) {

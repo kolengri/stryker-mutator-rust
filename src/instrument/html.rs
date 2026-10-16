@@ -83,6 +83,7 @@ pub(super) fn instrument(
             records,
             next_id,
             None,
+            true,
         )?;
         output.push_str(&file.content[cursor..segment.bytes.start]);
         output.push('\n');
@@ -489,13 +490,7 @@ impl Proof<'_> {
             return Err(UNSUPPORTED.into());
         }
         let content = open.end..close.start;
-        if raw_text {
-            let raw = self.raw(content.clone())?;
-            if raw.contains("</") || raw.contains("<!--") || (name != "script" && raw.contains('&'))
-            {
-                return Err("Ambiguous HTML raw-text boundaries require upstream parsing".into());
-            }
-        }
+        let mut selected_type = None;
         if name == "script" && !opening_attributes.iter().any(|attr| attr.name == "src") {
             let format = opening_attributes
                 .iter()
@@ -508,11 +503,10 @@ impl Proof<'_> {
                     Some(SourceType::mjs())
                 }
                 Some("ts" | "text/typescript" | "typescript") => Some(SourceType::ts()),
-                Some("tsx" | "text/tsx") => {
-                    return Err("HTML TSX scripts require upstream instrumentation".into());
-                }
+                Some("tsx" | "text/tsx") => Some(SourceType::tsx()),
                 _ => None,
             };
+            selected_type = source_type;
             if let Some(source_type) = source_type {
                 // Angular's line counter increments on LF only. Its column in
                 // html-parser.js is the ABSOLUTE UTF-16 offset, not line column.
@@ -525,6 +519,17 @@ impl Proof<'_> {
                         column: prefix.encode_utf16().count() as u32,
                     },
                 });
+            }
+        }
+        if raw_text {
+            let raw = self.raw(open.end..close.start)?;
+            // Only selected TSX can defer `</` to instrument_program's admitted
+            // JSX closing spans. Opaque/external scripts retain the old guard.
+            if (raw.contains("</") && !selected_type.is_some_and(|kind| kind.is_jsx()))
+                || raw.contains("<!--")
+                || (name != "script" && raw.contains('&'))
+            {
+                return Err("Ambiguous HTML raw-text boundaries require upstream parsing".into());
             }
         }
         Ok(())
@@ -541,7 +546,11 @@ mod tests {
         assert_eq!(segments(source).unwrap().len(), 1);
         let typed = segments("<script lang=\"ts\">const x:number=1+2;</script>").unwrap();
         assert!(typed[0].source_type.is_typescript());
-        assert!(segments("<script lang=\"tsx\">const x=true;</script>").is_err());
+        assert!(
+            segments("<script lang=\"tsx\">const x=true;</script>").unwrap()[0]
+                .source_type
+                .is_jsx()
+        );
     }
 
     #[test]

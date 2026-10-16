@@ -224,8 +224,14 @@ explicit boundaries. Template descendants, including nested scripts, are visited
 in source order; outer template/style bytes and pinned embedded locations are
 preserved. Explicit `ul`/`li`, ASCII identifier text interpolations, object default
 exports, and noncomputed synchronous object methods (including quoted keys) are
-supported. Ambiguous markup, entities, other interpolation/ICU syntax, JSX/TSX,
-and unsupported script grammar trigger atomic fallback. HTML and Vue bypass
+supported. Named default class declarations reuse native class instrumentation.
+JSX/TSX admits only lowercase identifier tags without attributes, either self-closing
+or paired with text-only children; original JSX bytes are preserved without JSX
+mutations. Nested elements, fragments, expression containers, component/member tags,
+and unproved cloned replacement contexts trigger atomic fallback. Selected TSX
+scripts prove each raw-text closing sequence against the admitted JSX AST.
+Ambiguous markup, entities, other interpolation/ICU syntax, and unsupported script
+grammar trigger atomic fallback. HTML and Vue bypass
 result caching and use native serial recovery for parallel requests. Svelte
 remains outside native support.
 
