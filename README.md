@@ -9,8 +9,24 @@ a conservative JavaScript and erasable TypeScript subset. An unsupported batch i
 delegated in full to StrykerJS rather than silently losing mutations. Unproven
 TypeScript constructs, JSX, frameworks,
 complex expressions and arbitrary Babel plugins still use the compatibility path.
-Rust also indexes coverage and calculates batched test-plan decisions. Node still
-owns incremental diff, plugins, sandbox, worker lifecycle and test execution.
+Rust also indexes coverage and calculates batched test-plan decisions. In the
+default legacy runner, Node still owns incremental diff, plugins, sandboxes,
+worker lifecycle and test execution.
+
+An experimental native coordinator is being added separately from that legacy
+runner. `STRYKER_RUST_COORDINATOR_ENGINE=native stryker-rust run` selects it without
+an upstream coordinator fallback. Its current scope is POSIX, JSON configuration,
+the built-in command runner with coverage off, or Mocha through the pinned
+`@stryker-mutator/mocha-runner` plugin. Checker plugins are not yet supported;
+reporters are limited to JSON or none. Rust owns file selection, instrumentation,
+coverage indexing, test planning, sandboxes, process scheduling, deadlines,
+cancellation, cleanup, and report assembly. Node workers retain the actual Mocha
+plugin and test framework. Unsupported configuration exits before starting a
+mutation run. This scope does not establish full compatibility; performance must
+be measured for the chosen runner and workload.
+
+The corresponding API is `runNativeMutationTest({ cwd, args, overrides }, { signal })`
+from `stryker-mutator-rust/native`. Cancellation settles only after native cleanup.
 
 ## Build and install
 
@@ -39,8 +55,9 @@ framework. No npm release has been published.
 
 ## CLI and API
 
-All upstream commands and flags are forwarded, including config files, `init`,
-`serve`, `--coverageAnalysis`, `--concurrency` and `--incremental`.
+The default legacy entry forwards upstream commands and flags, including config
+files, `init`, `serve`, `--coverageAnalysis`, `--concurrency` and `--incremental`.
+The explicit native coordinator supports only its documented migration scope.
 
 ```sh
 npx stryker-rust --rust-info

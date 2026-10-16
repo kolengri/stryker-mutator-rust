@@ -1,0 +1,80 @@
+{
+  "allowConsoleColors": true,
+  "checkers": [],
+  "checkerNodeArgs": [],
+  "commandRunner": {
+    "command": "npm test"
+  },
+  "coverageAnalysis": "perTest",
+  "clearTextReporter": {
+    "allowColor": true,
+    "allowEmojis": false,
+    "logTests": true,
+    "maxTestsToLog": 3,
+    "reportTests": true,
+    "reportMutants": true,
+    "reportScoreTable": true,
+    "skipFull": false
+  },
+  "dashboard": {
+    "baseUrl": "https://dashboard.stryker-mutator.io/api/reports",
+    "reportType": "full"
+  },
+  "dryRunOnly": false,
+  "eventReporter": {
+    "baseDir": "reports/mutation/events"
+  },
+  "ignorePatterns": [],
+  "ignoreStatic": false,
+  "incremental": false,
+  "incrementalFile": "reports/stryker-incremental.json",
+  "force": false,
+  "fileLogLevel": "off",
+  "inPlace": false,
+  "logLevel": "info",
+  "maxConcurrentTestRunners": 9007199254740991,
+  "maxTestRunnerReuse": 0,
+  "mutate": [
+    "{src,lib}/**/!(*.+(s|S)pec|*.+(t|T)est).+(cjs|mjs|js|ts|mts|cts|jsx|tsx|html|vue|svelte)",
+    "!{src,lib}/**/__tests__/**/*.+(cjs|mjs|js|ts|mts|cts|jsx|tsx|html|vue|svelte)"
+  ],
+  "mutator": {
+    "plugins": null,
+    "excludedMutations": []
+  },
+  "plugins": [
+    "@stryker-mutator/*"
+  ],
+  "appendPlugins": [],
+  "reporters": [
+    "clear-text",
+    "progress",
+    "html"
+  ],
+  "htmlReporter": {
+    "fileName": "reports/mutation/mutation.html"
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
+  },
+  "disableTypeChecks": true,
+  "symlinkNodeModules": true,
+  "tempDirName": ".stryker-tmp",
+  "cleanTempDir": true,
+  "testRunner": "command",
+  "testRunnerNodeArgs": [],
+  "thresholds": {
+    "high": 80,
+    "low": 60,
+    "break": null
+  },
+  "timeoutFactor": 1.5,
+  "timeoutMS": 5000,
+  "dryRunTimeoutMinutes": 5,
+  "tsconfigFile": "tsconfig.json",
+  "warnings": true,
+  "disableBail": false,
+  "allowEmpty": false,
+  "ignorers": [],
+  "testFiles": []
+}

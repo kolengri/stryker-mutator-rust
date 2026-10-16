@@ -10,6 +10,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 blake3 = "1.8"
+globset = "0.4"
+getrandom = "0.4"
+jsonschema = { version = "0.58", default-features = false }
+jsonc-parser = { version = "0.34", features = ["serde"] }
 napi = { version = "3.14", default-features = false, features = ["napi8", "dyn-symbols"] }
 napi-derive = "3.5"
 oxc_allocator = "0.154.0"
@@ -20,8 +24,14 @@ oxc_parser = "0.154.0"
 oxc_semantic = "0.154.0"
 oxc_span = "0.154.0"
 oxc_syntax = "0.154.0"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }
+tokio = { version = "1.53", features = ["rt", "net", "process", "time", "sync", "io-util", "io-std", "macros"] }
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
 
 [build-dependencies]
 napi-build = "2.6"

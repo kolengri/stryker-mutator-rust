@@ -21,6 +21,7 @@ await writeFile(join(output, 'install.log'), installation);
 const info = run(process.execPath, [join(directory, 'node_modules/stryker-mutator-rust/bin/stryker-rust.js'), '--rust-info']);
 assert.equal(JSON.parse(info).available, true);
 assert.equal(JSON.parse(info).nativeInstrumentation, true);
+assert.equal(JSON.parse(info).nativeCoordinator, true);
 const execution = run(process.execPath, [join(directory, 'node_modules/stryker-mutator-rust/bin/stryker-rust.js'), 'run'], { env: { ...process.env, STRYKER_RUST_ENGINE: 'native', STRYKER_RUST_DIAGNOSTICS: '1' } });
 await writeFile(join(output, 'run.log'), execution);
 assert.match(execution, /"nativeBatches":1/);
@@ -28,5 +29,23 @@ const report = JSON.parse(await readFile(join(directory, 'reports/mutation.json'
 const mutants = Object.values(report.files).flatMap((file) => file.mutants);
 assert.equal(mutants.length, 10);
 assert.ok(mutants.some((mutant) => mutant.status === 'Killed'));
-await writeFile(join(output, 'result.json'), JSON.stringify({ archive, ignoreScripts: true, native: JSON.parse(info), mutants: mutants.length }, null, 2));
-console.log(JSON.stringify({ archive, installed: true, native: true, mutants: mutants.length }));
+let nativeCoordinator;
+if (process.platform !== 'win32') {
+  const nativeExecution = run(process.execPath, [join(directory, 'node_modules/stryker-mutator-rust/bin/stryker-rust.js'), 'run'], {
+    env: { ...process.env, STRYKER_RUST_COORDINATOR_ENGINE: 'native', STRYKER_RUST_DIAGNOSTICS: '1' },
+  });
+  await writeFile(join(output, 'native-run.log'), nativeExecution);
+  const match = nativeExecution.match(/\[stryker-rust\] (\{[^\n]+\})/);
+  assert.ok(match, 'Installed package must expose native coordinator diagnostics');
+  nativeCoordinator = JSON.parse(match[1]);
+  assert.equal(nativeCoordinator.coordinator, 'rust');
+  assert.equal(nativeCoordinator.nativePlannedMutants, mutants.length);
+  const nativeReport = JSON.parse(await readFile(join(directory, 'reports/mutation.json'), 'utf8'));
+  const canonical = (value) => ({ ...value, files: Object.fromEntries(Object.entries(value.files).map(([name, file]) => [name, {
+    ...file, mutants: [...file.mutants].sort((a, b) => a.id.localeCompare(b.id)),
+  }])) });
+  assert.deepEqual(canonical(nativeReport), canonical(report), 'Installed native and legacy reports must match');
+}
+const result = { archive, ignoreScripts: true, native: JSON.parse(info), mutants: mutants.length, nativeCoordinator };
+await writeFile(join(output, 'result.json'), JSON.stringify(result, null, 2));
+console.log(JSON.stringify({ archive, installed: true, native: true, mutants: mutants.length, nativeCoordinator: Boolean(nativeCoordinator) }));

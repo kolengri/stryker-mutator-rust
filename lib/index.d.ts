@@ -36,7 +36,7 @@ export interface AccelerationOptions {
 export interface Candidate { start: number; end: number; replacement: string; mutatorName: string }
 /** Experimental candidates only; supported is false until complete semantic parity. */
 export function analyze(source: string, fileName?: string): { supported: false; reason: string; mutants: Candidate[] };
-export function nativeStatus(): { available: boolean; target: string; nativeInstrumentation: boolean; nativeCoverage: boolean; nativePlanning: boolean; napi?: number; candidateEngine?: string; error?: string };
+export function nativeStatus(): { available: boolean; target: string; nativeCoordinator: boolean; nativeInstrumentation: boolean; nativeCoverage: boolean; nativePlanning: boolean; napi?: number; candidateEngine?: string; error?: string };
 export class InstrumentationCache {
   constructor(options?: AccelerationOptions);
   readonly stats: AccelerationStats;

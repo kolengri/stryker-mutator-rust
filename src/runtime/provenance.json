@@ -1,0 +1,9 @@
+{
+  "source": "Installed pinned @stryker-mutator/core and @stryker-mutator/api 10.0.0",
+  "license": "Apache-2.0; see repository NOTICE and upstream project",
+  "resources": {
+    "defaults.json": "core/dist/src/config/options-validator.js defaultOptions",
+    "schema.json": "api/core strykerCoreSchema",
+    "framework.json": "core/dist/src/reporters/mutation-test-report-helper.js STRYKER_FRAMEWORK"
+  }
+}

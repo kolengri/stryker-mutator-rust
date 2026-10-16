@@ -4,6 +4,22 @@ mod coverage;
 mod instrument;
 mod mutations;
 mod planner;
+mod runtime;
+
+/// Own a complete supported mutation run on a background libuv task.
+#[napi(js_name = "runNativeMutationTest", strict)]
+pub fn run_native_mutation_test(
+    input_json: String,
+    cancellation_id: Option<String>,
+) -> napi::Result<napi::bindgen_prelude::AsyncTask<runtime::NativeRunTask>> {
+    runtime::task(input_json, cancellation_id)
+}
+
+/// Signal cancellation; the run Promise settles only after Rust cleanup.
+#[napi(js_name = "cancelNativeRun", strict)]
+pub fn cancel_native_run(cancellation_id: String) -> bool {
+    runtime::cancel(&cancellation_id)
+}
 
 /// Hash UTF-8 input with BLAKE3, returning lowercase hexadecimal.
 #[napi(js_name = "cacheKey", strict)]

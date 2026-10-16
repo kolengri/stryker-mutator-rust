@@ -17,6 +17,10 @@
       "types": "./lib/index.d.ts",
       "import": "./lib/index.js"
     },
+    "./native": {
+      "types": "./lib/runtime.d.ts",
+      "import": "./lib/runtime.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -31,6 +35,7 @@
     "build": "napi build --release --platform --output-dir native --js binding.cjs --dts binding.d.cts",
     "test": "node --test test/*.test.js",
     "test:integration": "node scripts/integration.js",
+    "test:integration:native": "node scripts/native-runtime-integration.js",
     "test:corpus": "node scripts/corpus.js",
     "bench": "node scripts/benchmark.js",
     "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && npm test",
@@ -53,8 +58,11 @@
   },
   "dependencies": {
     "@babel/core": "~8.0.0",
+    "@stryker-mutator/api": "10.0.0",
     "@stryker-mutator/core": "10.0.0",
-    "@stryker-mutator/instrumenter": "10.0.0"
+    "@stryker-mutator/instrumenter": "10.0.0",
+    "@stryker-mutator/util": "10.0.0",
+    "typed-inject": "5.0.0"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.10.8",
