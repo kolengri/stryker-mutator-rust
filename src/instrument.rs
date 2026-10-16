@@ -267,14 +267,14 @@ struct Rule {
 }
 
 // Token attachment is not Babel leading-comment ownership. Only gaps in actual
-// Program/BlockStatement statement lists are proven here. Unowned closing/EOF
+// statement/member lists are proven here. Unowned closing/EOF
 // comments are preserved but do not create rules.
-#[derive(Default)]
-struct CommentBoundaries {
+struct CommentBoundaries<'s> {
     gaps: Vec<(Span, Option<u32>)>,
+    source: &'s str,
 }
 
-impl CommentBoundaries {
+impl<'s> CommentBoundaries<'s> {
     fn list(&mut self, start: u32, end: u32, statements: &[Statement<'_>]) {
         let mut previous = start;
         for statement in statements {
@@ -288,9 +288,12 @@ impl CommentBoundaries {
 
     fn directives(
         program: &Program<'_>,
-        source: &str,
+        source: &'s str,
     ) -> Result<HashMap<u32, Vec<Directive>>, String> {
-        let mut boundaries = Self::default();
+        let mut boundaries = Self {
+            gaps: vec![],
+            source,
+        };
         boundaries.visit_program(program);
         boundaries.gaps.sort_unstable_by_key(|(span, _)| span.start);
         let mut directives: HashMap<u32, Vec<Directive>> = HashMap::new();
@@ -326,7 +329,7 @@ impl CommentBoundaries {
     }
 }
 
-impl<'a> Visit<'a> for CommentBoundaries {
+impl<'a> Visit<'a> for CommentBoundaries<'_> {
     fn visit_program(&mut self, node: &Program<'a>) {
         self.list(node.span.start, node.span.end, &node.body);
         walk::walk_program(self, node);
@@ -335,6 +338,31 @@ impl<'a> Visit<'a> for CommentBoundaries {
     fn visit_block_statement(&mut self, node: &BlockStatement<'a>) {
         self.list(node.span.start + 1, node.span.end - 1, &node.body);
         walk::walk_block_statement(self, node);
+    }
+
+    fn visit_class_body(&mut self, node: &ClassBody<'a>) {
+        let mut previous = node.span.start + 1;
+        for element in &node.body {
+            let span = element.span();
+            self.gaps
+                .push((Span::new(previous, span.start), Some(span.start)));
+            previous = span.end;
+        }
+        self.gaps
+            .push((Span::new(previous, node.span.end - 1), None));
+        walk::walk_class_body(self, node);
+    }
+
+    fn visit_static_block(&mut self, node: &StaticBlock<'a>) {
+        // The span includes `static`. Starting after its first brace also
+        // rejects comments in the header, even if that brace is in a comment.
+        let brace = node.span.source_text(self.source).find('{').unwrap();
+        self.list(
+            node.span.start + brace as u32 + 1,
+            node.span.end - 1,
+            &node.body,
+        );
+        walk::walk_static_block(self, node);
     }
 
     fn visit_function_body(&mut self, node: &FunctionBody<'a>) {
@@ -671,6 +699,7 @@ enum ChainKind {
     Call,
     StaticMember,
     ComputedMember,
+    PrivateMember,
 }
 
 fn chain_kind(node: &Expression<'_>) -> Option<ChainKind> {
@@ -678,6 +707,7 @@ fn chain_kind(node: &Expression<'_>) -> Option<ChainKind> {
         Expression::CallExpression(_) => Some(ChainKind::Call),
         Expression::StaticMemberExpression(_) => Some(ChainKind::StaticMember),
         Expression::ComputedMemberExpression(_) => Some(ChainKind::ComputedMember),
+        Expression::PrivateFieldExpression(_) => Some(ChainKind::PrivateMember),
         // The wrapper aliases the effective ChainElement, including its kind.
         Expression::ChainExpression(chain) => match &chain.expression {
             ChainElement::CallExpression(_) => Some(ChainKind::Call),
@@ -686,6 +716,16 @@ fn chain_kind(node: &Expression<'_>) -> Option<ChainKind> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn private_chain(node: &Expression<'_>) -> bool {
+    match node {
+        Expression::PrivateFieldExpression(_) => true,
+        Expression::CallExpression(call) => private_chain(&call.callee),
+        Expression::StaticMemberExpression(member) => private_chain(&member.object),
+        Expression::ComputedMemberExpression(member) => private_chain(&member.object),
+        _ => false,
     }
 }
 
@@ -749,6 +789,7 @@ fn chain_prints(node: &Expression<'_>) -> bool {
         }
         Expression::StaticMemberExpression(member) => chain_prints(&member.object),
         Expression::ComputedMemberExpression(member) => chain_prints(&member.object),
+        Expression::PrivateFieldExpression(member) => chain_prints(&member.object),
         _ => false,
     }
 }
@@ -796,6 +837,9 @@ impl<'a> VisitMut<'a> for ReplaceExpression<'a, '_> {
                 self.visit_expression(&mut member.object);
                 self.visit_expression(&mut member.expression);
             }
+            SimpleAssignmentTarget::PrivateFieldExpression(member) => {
+                self.visit_expression(&mut member.object);
+            }
             _ => walk_mut::walk_simple_assignment_target(self, node),
         }
     }
@@ -824,6 +868,20 @@ impl<'a> Visit<'a> for InvalidatedContinue<'_> {
     fn visit_function(&mut self, _: &Function<'a>, _: oxc_syntax::scope::ScopeFlags) {}
 
     fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+}
+
+// Match upstream's syntactic descendant predicate, including nested functions
+// and classes; this intentionally is not a lexical-scope analysis.
+#[derive(Default)]
+struct DirectSuperCall {
+    found: bool,
+}
+
+impl<'a> Visit<'a> for DirectSuperCall {
+    fn visit_call_expression(&mut self, node: &CallExpression<'a>) {
+        self.found |= matches!(node.callee, Expression::Super(_));
+        walk::walk_call_expression(self, node);
+    }
 }
 
 struct Switch {
@@ -1057,6 +1115,9 @@ impl Emitter<'_, '_> {
         if let Expression::ChainExpression(chain) = node {
             let allocator = Allocator::default();
             let inner = Expression::from(chain.expression.clone_in(&allocator));
+            if private_chain(&inner) {
+                return Err("Optional private chains require upstream instrumentation".into());
+            }
             return self.expression_deferred(&inner, context, pending);
         }
         if matches!(node, Expression::TSAsExpression(_)) {
@@ -1162,8 +1223,12 @@ impl Emitter<'_, '_> {
                 SimpleAssignmentTarget::AssignmentTargetIdentifier(_) => return Ok(emitter.text(target.span()).into()),
                 SimpleAssignmentTarget::StaticMemberExpression(member) if !member.optional => (&member.object, None),
                 SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => (&member.object, Some(&member.expression)),
-                _ => return Err("Destructuring, private, optional, and typed assignment targets require upstream instrumentation".into()),
+                SimpleAssignmentTarget::PrivateFieldExpression(member) if !member.optional => (&member.object, None),
+                _ => return Err("Destructuring, optional, and typed assignment targets require upstream instrumentation".into()),
             };
+            if matches!(object, Expression::Super(_)) {
+                return Err("Super assignment targets require upstream instrumentation".into());
+            }
             let mut child_context = Context {
                 printed_ancestor: context.printed_ancestor || chain_prints(object),
                 ..Context::default()
@@ -1190,9 +1255,17 @@ impl Emitter<'_, '_> {
         context: Context<'_>,
         pending: &mut Vec<Switch>,
     ) -> Result<String, String> {
-        if context.printed_ancestor && matches!(node, Expression::ArrowFunctionExpression(_)) {
+        if context.printed_ancestor
+            && matches!(
+                node,
+                Expression::ArrowFunctionExpression(_)
+                    | Expression::FunctionExpression(_)
+                    | Expression::ClassExpression(_)
+                    | Expression::NewExpression(_)
+            )
+        {
             return Err(
-                "Arrows nested inside printed mutation replacements require upstream formatting"
+                "Function, class, and new expressions inside printed mutation replacements require upstream formatting"
                     .into(),
             );
         }
@@ -1237,6 +1310,35 @@ impl Emitter<'_, '_> {
                 "ArrayDeclaration",
                 &mut switches,
             );
+        }
+        if let Expression::NewExpression(new) = node {
+            if matches!(&new.callee, Expression::Identifier(identifier) if identifier.name == "RegExp")
+                && matches!(new.arguments.first(), Some(Argument::StringLiteral(_)))
+            {
+                return Err(
+                    "RegExp constructor pattern mutations require upstream instrumentation".into(),
+                );
+            }
+            if matches!(&new.callee, Expression::Identifier(identifier) if identifier.name == "Array")
+            {
+                self.collect(
+                    node.span(),
+                    if new.arguments.is_empty() {
+                        "new Array([])"
+                    } else {
+                        "new Array()"
+                    }
+                    .into(),
+                    "ArrayDeclaration",
+                    &mut switches,
+                );
+            }
+        }
+        if let Expression::CallExpression(call) = node
+            && let Some((Expression::Super(_), name)) = method_target(&call.callee)
+            && method_mapping(name).is_some()
+        {
+            return Err("Mapped super calls require upstream placement".into());
         }
         if let Expression::ArrowFunctionExpression(arrow) = node
             && !matches!(&arrow.body, ArrowFunctionBody::FunctionBody(_))
@@ -1427,8 +1529,11 @@ impl Emitter<'_, '_> {
         pending.extend(switches);
         let mut edits = vec![];
         match node {
-            Expression::Identifier(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) | Expression::ThisExpression(_) => {},
+            Expression::Identifier(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) | Expression::ThisExpression(_) | Expression::Super(_) => {},
             Expression::CallExpression(call) => {
+                if call.optional && matches!(method_target(&call.callee), Some((Expression::Super(_), _))) {
+                    return Err("Optional super calls require upstream instrumentation".into());
+                }
                 if let Some(arguments) = &call.type_arguments {
                     if context.printed_ancestor && !arguments.params.iter().all(simple_printed_type) {
                         return Err("Complex call type arguments inside a printed replacement require upstream formatting".into());
@@ -1442,6 +1547,28 @@ impl Emitter<'_, '_> {
                     let argument = argument.as_expression().ok_or("Spread arguments require upstream instrumentation")?;
                     edits.push((argument.span(), self.expression(argument, Context { skip_string, ..child_context })?));
                 }
+            }
+            Expression::NewExpression(new) => {
+                // NewExpression is a placement boundary: do not defer callee
+                // mutations into `new`, or treat its member callee as a call.
+                edits.push((new.callee.span(), self.expression(&new.callee, Context::default())?));
+                if let Some(arguments) = &new.type_arguments {
+                    self.skip_ts(arguments.span)?;
+                }
+                for argument in &new.arguments {
+                    let argument = argument.as_expression().ok_or("Spread constructor arguments require upstream instrumentation")?;
+                    edits.push((argument.span(), self.expression(argument, Context::default())?));
+                }
+            }
+            Expression::FunctionExpression(function) => {
+                return self.function(function);
+            }
+            Expression::ClassExpression(class) => return self.class(class),
+            Expression::PrivateFieldExpression(member) => {
+                if member.optional {
+                    return Err("Optional private members require upstream instrumentation".into());
+                }
+                edits.push((member.object.span(), self.chain_child(&member.object, Context { printed_ancestor: context.printed_ancestor, ..Context::default() }, pending)?));
             }
             Expression::StaticMemberExpression(member) => {
                 edits.push((member.object.span(), self.chain_child(&member.object, Context { printed_ancestor: context.printed_ancestor, ..Context::default() }, pending)?));
@@ -1556,7 +1683,7 @@ impl Emitter<'_, '_> {
                     }
                 }
             }
-            _ => return Err("Unsupported expression in native grammar (private members, new, import, regex, classes, and type syntax require upstream)".into()),
+            _ => return Err("Unsupported expression in native grammar (import, regex, and type syntax require upstream)".into()),
         }
         Ok(self.apply(node.span(), edits))
     }
@@ -1582,24 +1709,123 @@ impl Emitter<'_, '_> {
         Ok(())
     }
 
-    fn function(&mut self, function: &Function<'_>) -> Result<String, String> {
-        if function.declare || function.body.is_none() {
-            return self.skip_ts(function.span);
-        }
+    fn function_body(
+        &mut self,
+        function: &Function<'_>,
+        suppress_block: bool,
+    ) -> Result<String, String> {
         if function.r#async || function.generator || function.this_param.is_some() {
             return Err(
                 "Async, generator, or this-parameter functions require upstream instrumentation"
                     .into(),
             );
         }
-        self.skip_signature(
-            function.type_parameters.as_deref(),
-            function.return_type.as_deref(),
-        )?;
+        if let Some(parameters) = &function.type_parameters {
+            self.skip_ts(parameters.span)?;
+        }
         self.parameters(&function.params)?;
+        if let Some(returns) = &function.return_type {
+            self.skip_ts(returns.span)?;
+        }
         let body = function.body.as_ref().ok_or("Function without body")?;
-        let rendered = self.body(body)?;
+        if !body.directives.is_empty() {
+            return Err("Function directives require upstream instrumentation".into());
+        }
+        self.scope(body.span, false, |emitter| {
+            emitter.block_inner(body.span, &body.statements, !suppress_block)
+        })
+    }
+
+    fn function(&mut self, function: &Function<'_>) -> Result<String, String> {
+        if function.declare || function.body.is_none() {
+            return self.skip_ts(function.span);
+        }
+        let rendered = self.function_body(function, false)?;
+        let body = function.body.as_ref().ok_or("Function without body")?;
         Ok(self.apply(function.span, vec![(body.span, rendered)]))
+    }
+
+    fn class(&mut self, class: &Class<'_>) -> Result<String, String> {
+        if self.printed_statement
+            || class.r#abstract
+            || class.declare
+            || !class.decorators.is_empty()
+        {
+            return Err("Decorated, abstract, ambient, or whole-for classes require upstream instrumentation".into());
+        }
+        let mut edits = vec![];
+        if let Some(parameters) = &class.type_parameters {
+            self.skip_ts(parameters.span)?;
+        }
+        if let Some(heritage) = &class.heritage {
+            edits.push((
+                heritage.expression.span(),
+                self.expression(&heritage.expression, Context::default())?,
+            ));
+            if let Some(arguments) = &heritage.type_arguments {
+                self.skip_ts(arguments.span)?;
+            }
+        }
+        for implements in &class.implements {
+            self.skip_ts(implements.span)?;
+        }
+        let initialized_public = class.body.body.iter().any(|member| {
+            matches!(member, ClassElement::PropertyDefinition(field)
+                if !matches!(field.key, PropertyKey::PrivateIdentifier(_)) && field.value.is_some())
+        });
+        for element in &class.body.body {
+            let rendered = self.scope(element.span(), true, |emitter| {
+                let mut edits = vec![];
+                match element {
+                    ClassElement::PropertyDefinition(field) => {
+                        if !field.decorators.is_empty() || field.declare
+                            || field.r#type != PropertyDefinitionType::PropertyDefinition
+                        {
+                            return Err("Decorated, ambient, or abstract fields require upstream instrumentation".into());
+                        }
+                        if field.computed {
+                            return Err("Computed class field keys require upstream placement".into());
+                        }
+                        if !matches!(field.key, PropertyKey::StaticIdentifier(_) | PropertyKey::PrivateIdentifier(_) | PropertyKey::StringLiteral(_) | PropertyKey::NumericLiteral(_)) {
+                            return Err("Unsupported class field key".into());
+                        }
+                        // Public quoted keys are deliberately not StringLiteral
+                        // mutation sites. Erasable annotations precede values.
+                        if let Some(annotation) = &field.type_annotation {
+                            emitter.skip_ts(annotation.span)?;
+                        }
+                        if let Some(value) = &field.value {
+                            edits.push((value.span(), emitter.expression(value, Context::default())?));
+                        }
+                    }
+                    ClassElement::MethodDefinition(method) => {
+                        if !method.decorators.is_empty() || method.computed
+                            || !matches!(method.key, PropertyKey::StaticIdentifier(_))
+                            || method.r#type != MethodDefinitionType::MethodDefinition
+                            || method.value.declare || method.value.body.is_none()
+                        {
+                            return Err("Decorated, computed, quoted, private, or ambient methods require upstream instrumentation".into());
+                        }
+                        let body = method.value.body.as_ref().ok_or("Method without body")?;
+                        let mut super_call = DirectSuperCall::default();
+                        if initialized_public && method.kind == MethodDefinitionKind::Constructor {
+                            super_call.visit_function_body(body);
+                        }
+                        let rendered = emitter.function_body(&method.value, super_call.found)?;
+                        edits.push((body.span, rendered));
+                    }
+                    ClassElement::StaticBlock(block) => {
+                        for statement in &block.body {
+                            edits.push((statement.span(), emitter.statement(statement, false)?));
+                        }
+                    }
+                    _ => return Err("Auto-accessors and class index signatures require upstream instrumentation".into()),
+                }
+                Ok(emitter.apply(element.span(), edits))
+            })?;
+            edits.push((element.span(), rendered));
+        }
+        Ok(self.apply(class.span, edits))
     }
 
     fn variables(&mut self, variables: &VariableDeclaration<'_>) -> Result<String, String> {
@@ -1660,12 +1886,19 @@ impl Emitter<'_, '_> {
     }
 
     fn block(&mut self, span: Span, statements: &[Statement<'_>]) -> Result<String, String> {
-        self.scope(span, false, |emitter| emitter.block_inner(span, statements))
+        self.scope(span, false, |emitter| {
+            emitter.block_inner(span, statements, true)
+        })
     }
 
-    fn block_inner(&mut self, span: Span, statements: &[Statement<'_>]) -> Result<String, String> {
+    fn block_inner(
+        &mut self,
+        span: Span,
+        statements: &[Statement<'_>],
+        mutate_block: bool,
+    ) -> Result<String, String> {
         let mut switches = vec![];
-        if !statements.is_empty() {
+        if mutate_block && !statements.is_empty() {
             self.collect(span, "{}".into(), "BlockStatement", &mut switches);
         }
         let edits = statements
@@ -1698,6 +1931,7 @@ impl Emitter<'_, '_> {
     fn declaration_inner(&mut self, node: &Declaration<'_>) -> Result<String, String> {
         match node {
             Declaration::FunctionDeclaration(function) => self.function(function),
+            Declaration::ClassDeclaration(class) => self.class(class),
             Declaration::VariableDeclaration(variables) => self.variables(variables),
             Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {
                 self.skip_ts(node.span())
@@ -1993,6 +2227,53 @@ impl Emitter<'_, '_> {
         })
     }
 
+    fn expression_statement(
+        &mut self,
+        span: Span,
+        expression: &Expression<'_>,
+        deletion: bool,
+        skip_string: bool,
+    ) -> Result<String, String> {
+        let start = self.records.len();
+        let mut switches = vec![];
+        if deletion {
+            self.collect(span, ";".into(), "CallExpression", &mut switches);
+        }
+        let own = self.records.get(start).map(|record| record.id.clone());
+        let skip_generation = self.ts_skip_generation;
+        let original = self.expression(
+            expression,
+            Context {
+                skip_string,
+                ..Context::default()
+            },
+        )?;
+        let active = self.records[start..]
+            .iter()
+            .filter(|record| record.status.is_none())
+            .count();
+        if self.ts_skip_generation == skip_generation
+            && active != 1
+            && let Some(id) = own
+            && self.records[start].id == id
+            && self.records[start].status_reason.is_none()
+        {
+            self.records.remove(start);
+            self.placed -= switches.len();
+            switches.clear();
+        }
+        let original = Self::terminate(self.apply(span, vec![(expression.span(), original)]));
+        Ok(if let Some(switch) = switches.first() {
+            // Protect generated else from an enclosing unbraced if.
+            format!(
+                "{{ if (stryMutAct_9fa48(\"{}\")) ; else {{ stryCov_9fa48(\"{}\"); {original} }} }}",
+                switch.id, switch.id
+            )
+        } else {
+            original
+        })
+    }
+
     fn statement(&mut self, node: &Statement<'_>, top_level: bool) -> Result<String, String> {
         self.scope(node.span(), true, |emitter| {
             emitter.statement_inner(node, top_level)
@@ -2007,6 +2288,7 @@ impl Emitter<'_, '_> {
                 return self.function(function);
             }
             Statement::VariableDeclaration(variables) => return self.variables(variables),
+            Statement::ClassDeclaration(class) => return self.class(class),
             Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => return self.skip_ts(node.span()),
             Statement::TSExternalModuleDeclaration(module) if module.declare => return self.skip_ts(node.span()),
             Statement::TSNamespaceDeclaration(module) if module.declare => return self.skip_ts(node.span()),
@@ -2014,29 +2296,12 @@ impl Emitter<'_, '_> {
             Statement::BlockStatement(block) => return self.block(block.span, &block.body),
             Statement::ReturnStatement(statement) => if let Some(expression) = &statement.argument { edits.push((expression.span(), self.expression(expression, Context::default())?)); },
             Statement::ExpressionStatement(statement) => {
-                let start = self.records.len();
-                let mut switches = vec![];
-                if matches!(statement.expression, Expression::CallExpression(_)) {
-                    self.collect(statement.span, ";".into(), "CallExpression", &mut switches);
-                }
-                let own = self.records.get(start).filter(|record| record.mutator_name == "CallExpression").map(|record| record.id.clone());
-                let skip_generation = self.ts_skip_generation;
-                let original = self.expression(&statement.expression, Context { skip_string: true, ..Context::default() })?;
-                let active = self.records[start..].iter().filter(|record| record.status.is_none()).count();
-                if self.ts_skip_generation == skip_generation && active != 1 && let Some(id) = own
-                    && self.records[start].id == id && self.records[start].status_reason.is_none()
-                {
-                    self.records.remove(start);
-                    self.placed -= switches.len();
-                    switches.clear();
-                }
-                let original = Self::terminate(self.apply(statement.span, vec![(statement.expression.span(), original)]));
-                return Ok(if let Some(switch) = switches.first() {
-                    // A block protects both the original and generated else from
-                    // binding to an enclosing unbraced if.
-                    format!("{{ if (stryMutAct_9fa48(\"{}\")) ; else {{ stryCov_9fa48(\"{}\"); {original} }} }}", switch.id, switch.id)
-                } else { original });
-            },
+                let deletion = matches!(&statement.expression, Expression::CallExpression(call) if !matches!(call.callee, Expression::Super(_)));
+                return self.expression_statement(statement.span, &statement.expression, deletion, true);
+            }
+            Statement::ThrowStatement(statement) => {
+                return self.expression_statement(statement.span, &statement.argument, matches!(statement.argument, Expression::NewExpression(_)), false);
+            }
             Statement::IfStatement(statement) => {
                 edits.push((statement.test.span(), self.expression(&statement.test, Context { if_test: true, ..Context::default() })?));
                 edits.push((statement.consequent.span(), self.statement(&statement.consequent, false)?));
@@ -2140,7 +2405,7 @@ impl Emitter<'_, '_> {
                 if import.phase.is_some() || import.with_clause.is_some() { return Err("Import phases and attributes require upstream instrumentation".into()); }
             }
             Statement::EmptyStatement(_) => {},
-            _ => return Err("Unsupported statement in native grammar (try, classes, default exports, and control-flow extensions require upstream)".into()),
+            _ => return Err("Unsupported statement in native grammar (try, default exports, and control-flow extensions require upstream)".into()),
         }
         let output = self.apply(node.span(), edits);
         Ok(

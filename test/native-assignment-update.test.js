@@ -324,7 +324,7 @@ test('nested and computed assignment spines replace exactly the intended call sn
 test('unsupported targets and existing printer boundaries keep whole-batch fallback', async () => {
   for (const [content,extension='js'] of [
     ['[a] = list;'], ['({x:a} = obj);'], ['([a]=list,b++);'], ['for(let [i] of list) foo();'], ['a += 1n;'],
-    ['class C extends B{f(){super.x += 1;}}'], ['class C{#x=0;f(){this.#x++;}}'],
+    ['class C extends B{f(){super.x += 1;}}'], ['class C{#x=0;f(){this?.#x++;}}'],
     ['obj.x! += 1;','ts'], ['a += obj?.trim(...args);'], ['(obj?.x).field++;'],
     ['obj.x += ("single quoted" + a);'.replace('"single quoted"',"'single quoted'")],
     ['obj.x += ()=>1;'], ['factory().trim().field = x=>x;'], ['obj.x += {x:1};'],

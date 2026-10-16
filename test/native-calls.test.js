@@ -185,10 +185,10 @@ test('statement ranges include semicolons independently of call spans', async ()
 test('conservative call boundaries reject the whole batch and auto returns the complete upstream result', async () => {
   const sources = [
     ['const x=(obj?.trim)?.();','js'], ['const x=(obj.trim?.()).length;','js'], ['const x=(foo?.())();','js'],
-    ['const x=(obj?.trim)();','js'], ['const x=(obj?.["key"]).length;','js'], ['const x=new Array(2);','js'],
+    ['const x=(obj?.trim)();','js'], ['const x=(obj?.["key"]).length;','js'], ['const x=new Array(...args);','js'],
     ['const x=import("x");','js'], ['foo(...args);','js'], ['[obj.key]=items;','js'], ['([obj.key]=items,other++);','js'],
-    ['delete obj.key;','js'], ['const x=tag`x`;','js'], ['class C extends B { foo() { super.foo(); } }','js'],
-    ['class C { #x=1; foo() { return this.#x; } }','js'], ['const x: number=foo()!;','ts'],
+    ['delete obj.key;','js'], ['const x=tag`x`;','js'], ['class C extends B { foo() { super.foo(...args); } }','js'],
+    ['class C { #foo() { return 1; } foo() { return this.#foo(); } }','js'], ['const x: number=foo()!;','ts'],
     ['<div>{{ foo() }}</div>','html'], ['const x=obj.trim("single quoted");'.replace('"single quoted"',"'single quoted'"),'js'],
     ['const x=obj.trim(/* comment */ arg());','js'], ['const x=obj.trim(() => 1);','js'],
   ];

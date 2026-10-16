@@ -265,10 +265,10 @@ async function fallback(source, config=options, name='unsupported.ts') {
 test('deferred TS wrappers, targets and unproven printing preserve fallback and upstream errors', async () => {
   for (const source of ['const x=(a+b) satisfies number;', 'const x=<number>(a+b);', 'const x=(a+b)!;',
     'foo.trim()!;', 'obj.x! += 1;', 'const x=((a+b) as number)+1;', 'obj.startsWith<T>((a+b) as number);',
-    'fn<{x:true}>()?.trim();', 'const x=fn<{x:true}>()+1;', 'const x=fn(()=>true) as unknown; class C {}',
+    'fn<{x:true}>()?.trim();', 'const x=fn<{x:true}>()+1;', 'const x=fn(()=>true) as unknown; class C {accessor x=1;}',
     'enum E {A=1}', 'namespace N {export const x=true;}', 'class C { constructor(public x:number){} }',
     'function calc(...args:number[]){return true;}', 'function calc(x:number=1){return true;}',
-    'const {x}:T=obj;', 'const x=new Array<T>();']) await fallback(source);
+    'const {x}:T=obj;', 'const x=new Array<T>(...items);']) await fallback(source);
   for (const source of ['const x=foo satisfies true;', 'const x=<true>foo;']) {
     const failure=await fallback(source);
     assert.ok(failure,'pinned upstream type-literal placement must throw');
