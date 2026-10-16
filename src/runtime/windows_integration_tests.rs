@@ -4,6 +4,7 @@ use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt, process::Command};
 
 use serde_json::json;
 use tokio::sync::watch;
+use windows_sys::Win32::Foundation::GENERIC_READ;
 
 use super::*;
 use crate::runtime::{config, report};
@@ -140,9 +141,9 @@ fn junction_cleanup_preserves_original_dependency_and_is_idempotent() {
 fn junction_unlink_and_directory_removal_failures_block_recursive_cleanup_and_can_retry() {
     const BACKUP_SEMANTICS: u32 = 0x02000000;
     const OPEN_REPARSE_POINT: u32 = 0x00200000;
-    for (share, phase) in [
-        (0, "Cannot unlink owned sandbox junction"),
-        (3, "Cannot remove owned junction directory"),
+    for (detached, share, phase) in [
+        (false, 0, "Cannot unlink owned sandbox junction"),
+        (true, 3, "Cannot remove owned junction directory"),
     ] {
         let directory = tempfile::tempdir().unwrap();
         let (config, project) = dependency_fixture(directory.path());
@@ -153,16 +154,27 @@ fn junction_unlink_and_directory_removal_failures_block_recursive_cleanup_and_ca
             "owned-sentinel",
             "must not recurse after unlink failure",
         );
-        // Access=0 permits reparse control; denying DELETE sharing blocks the
-        // nonrecursive directory removal. Denying all sharing blocks unlink too.
+        if detached {
+            // The junction crate opens reparse points exclusively. To hold a
+            // real read handle at the later directory-removal stage, first
+            // perform the successful detach and retain its exact owned state.
+            junction::delete(&link).unwrap();
+            let owned = sandbox.junctions.last_mut().unwrap();
+            assert_eq!(owned.path, link);
+            owned.detached = true;
+        }
+        // Metadata-only access does not impose the read/write/delete sharing
+        // restrictions this test needs. Hold real read access instead.
         let held = OpenOptions::new()
-            .access_mode(0)
+            .access_mode(GENERIC_READ)
             .share_mode(share)
             .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
             .open(&link)
             .unwrap();
         let first = sandbox.cleanup().unwrap_err();
         assert!(first.contains(phase), "{first}");
+        assert_eq!(sandbox.junctions.len(), 1);
+        assert_eq!(sandbox.junctions[0].detached, detached);
         assert_eq!(sandbox.cleanup().unwrap_err(), first);
         assert!(sandbox.path.join("owned-sentinel").exists());
         assert!(config.cwd.join("node_modules/original-sentinel").exists());

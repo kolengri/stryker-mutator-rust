@@ -646,7 +646,8 @@ async fn ready_worker_runs_mutants_while_spare_initialization_is_held() {
     assert!(
         mutants(&response)
             .iter()
-            .all(|mutant| mutant["status"] == "Killed")
+            .all(|mutant| mutant["status"] == "Killed"),
+        "{response}"
     );
     assert_eq!(response["stats"]["workerStarts"], 2);
     assert_eq!(response["stats"]["maximumConcurrency"], 2);

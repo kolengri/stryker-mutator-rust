@@ -20,6 +20,24 @@ pub(super) struct Pattern {
 }
 
 impl Pattern {
+    fn literal_path(path: &str) -> Result<Self, String> {
+        let segments = path
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .split('/')
+            .map(|segment| {
+                GlobBuilder::new(&globset::escape(segment))
+                    .literal_separator(true)
+                    .case_insensitive(true)
+                    .backslash_escape(false)
+                    .build()
+                    .map(|glob| Some(glob.compile_matcher()))
+                    .map_err(|error| format!("Invalid generated output path {path}: {error}"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { segments })
+    }
+
     pub fn new(pattern: &str, case_insensitive: bool) -> Result<Self, String> {
         if pattern.contains(['\\', '\0'])
             || pattern.contains("{.")
@@ -122,6 +140,16 @@ pub(super) struct Ignore {
 }
 
 impl Ignore {
+    pub fn output_path(path: &str) -> Result<Self, String> {
+        Ok(Self {
+            pattern: Pattern::literal_path(path)?,
+            anchored: true,
+            directory: false,
+            negative: false,
+            disabled: path.is_empty(),
+        })
+    }
+
     pub fn new(value: &str) -> Result<Self, String> {
         let disabled = value.is_empty() || value.starts_with('#');
         let negations = value.bytes().take_while(|byte| *byte == b'!').count();

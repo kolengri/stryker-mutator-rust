@@ -1,11 +1,12 @@
 //! Owned Windows jobs. Dropping a handle is only an emergency kill request;
-//! normal settlement also reaps the root and observes zero active job members.
+//! normal settlement also reaps the root and waits for member process handles.
 
 use std::{
     io,
     mem::size_of,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     ptr::{null, null_mut},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -14,28 +15,53 @@ use tokio::{
     time::Instant,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{
+        ERROR_INVALID_PARAMETER, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    },
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
         },
+        IO::{CreateIoCompletionPort, GetQueuedCompletionStatus},
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectAssociateCompletionPortInformation,
             JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
+        SystemServices::JOB_OBJECT_MSG_NEW_PROCESS,
         Threading::{
-            CREATE_SUSPENDED, GetProcessIdOfThread, OpenThread, ResumeThread,
-            THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+            CREATE_SUSPENDED, GetProcessIdOfThread, OpenProcess, OpenThread, PROCESS_SYNCHRONIZE,
+            ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+            WaitForSingleObject,
         },
     },
 };
 
 const CLEANUP_DEADLINE: Duration = Duration::from_secs(2);
-const ACCOUNTING_INTERVAL: Duration = Duration::from_millis(10);
+const COMPLETION_INTERVAL: Duration = Duration::from_millis(10);
 
-pub(super) struct Job(OwnedHandle);
+pub(super) struct Job {
+    handle: OwnedHandle,
+    port: OwnedHandle,
+    completion: Mutex<Completion>,
+}
+
+#[derive(Default)]
+struct Completion {
+    reported: u64,
+    pending: Vec<(u32, OwnedHandle)>,
+}
+
+struct Progress {
+    active: u32,
+    total: u32,
+    reported: u64,
+    pending: usize,
+    full_batch: bool,
+}
 
 fn last_error(operation: &str) -> String {
     format!("Cannot {operation}: {}", io::Error::last_os_error())
@@ -50,7 +76,36 @@ impl Job {
         }
         // SAFETY: successful creation returns one owned handle. OwnedHandle is
         // its only closing owner, including on every setup error below.
-        let job = Self(unsafe { OwnedHandle::from_raw_handle(handle) });
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+        // SAFETY: INVALID_HANDLE_VALUE creates a private completion port.
+        let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 0) };
+        if port.is_null() {
+            return Err(last_error("create Windows process job completion port"));
+        }
+        let job = Self {
+            handle,
+            // SAFETY: successful creation returns one uniquely owned handle.
+            port: unsafe { OwnedHandle::from_raw_handle(port) },
+            completion: Mutex::new(Completion::default()),
+        };
+        let association = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
+            CompletionKey: null_mut(),
+            CompletionPort: job.port.as_raw_handle(),
+        };
+        // Associate while empty, before any process can execute or exit. The
+        // port and job remain owned together, including across cancelled waits.
+        // SAFETY: the live handles and correctly sized input are not transferred.
+        if unsafe {
+            SetInformationJobObject(
+                job.raw(),
+                JobObjectAssociateCompletionPortInformation,
+                (&association as *const JOBOBJECT_ASSOCIATE_COMPLETION_PORT).cast(),
+                size_of::<JOBOBJECT_ASSOCIATE_COMPLETION_PORT>() as u32,
+            )
+        } == 0
+        {
+            return Err(last_error("associate Windows process job completion port"));
+        }
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: the handle and correctly sized, initialized input remain live.
@@ -69,7 +124,7 @@ impl Job {
     }
 
     fn raw(&self) -> HANDLE {
-        self.0.as_raw_handle()
+        self.handle.as_raw_handle()
     }
 
     fn assign(&self, child: &Child) -> Result<(), String> {
@@ -91,7 +146,7 @@ impl Job {
         Ok(())
     }
 
-    fn active_processes(&self) -> Result<u32, String> {
+    fn accounting(&self) -> Result<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, String> {
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: info is writable for exactly the declared information class
         // and length; Windows does not retain the pointer.
@@ -107,22 +162,130 @@ impl Job {
         {
             return Err(last_error("query Windows process job accounting"));
         }
-        Ok(info.ActiveProcesses)
+        Ok(info)
+    }
+
+    #[cfg(test)]
+    fn active_processes(&self) -> Result<u32, String> {
+        Ok(self.accounting()?.ActiveProcesses)
+    }
+
+    fn retain_reported_process(&self, pid: u32, state: &mut Completion) -> Result<(), String> {
+        if pid == 0 {
+            return Err("Windows job reported an invalid process identifier".into());
+        }
+        // A notification contains a PID, not a retained identity. A recycled
+        // PID can make us wait for an unrelated process and fail the deadline;
+        // it cannot produce false success. Never terminate through this PID.
+        // SAFETY: request only non-inheritable synchronization access.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if raw.is_null() {
+            let error = io::Error::last_os_error();
+            // A PID that no longer exists cannot execute or own pending I/O.
+            // Access denied and other failures are NOT evidence of completion.
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Ok(());
+            }
+            return Err(format!("Cannot retain Windows job process {pid}: {error}"));
+        }
+        // SAFETY: OpenProcess returned one uniquely owned handle.
+        let process = unsafe { OwnedHandle::from_raw_handle(raw) };
+        state.pending.push((pid, process));
+        Ok(())
+    }
+
+    fn poll_completion(&self) -> Result<Progress, String> {
+        let mut state = self
+            .completion
+            .lock()
+            .map_err(|_| "Windows process job completion state poisoned")?;
+        // Bound each poll so a busy creator cannot monopolize the runtime or
+        // bypass the cleanup deadline. Later polls continue the same owned state.
+        let mut full_batch = true;
+        for _ in 0..64 {
+            let mut message = 0;
+            let mut key = 0;
+            let mut value = null_mut();
+            // SAFETY: the port is live; output pointers are writable. No kernel
+            // wait blocks the async runtime. Job values are PIDs, never dereferenced.
+            if unsafe {
+                GetQueuedCompletionStatus(
+                    self.port.as_raw_handle(),
+                    &mut message,
+                    &mut key,
+                    &mut value,
+                    0,
+                )
+            } == 0
+            {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(WAIT_TIMEOUT as i32) {
+                    full_batch = false;
+                    break;
+                }
+                return Err(format!("Cannot read Windows job completion port: {error}"));
+            }
+            if key != 0 {
+                return Err("Unexpected Windows job completion key".into());
+            }
+            if message == JOB_OBJECT_MSG_NEW_PROCESS {
+                self.retain_reported_process(value as usize as u32, &mut state)?;
+                state.reported += 1;
+            }
+        }
+        let mut index = 0;
+        while index < state.pending.len() {
+            let (pid, process) = &state.pending[index];
+            // SAFETY: the owned process handle cannot be closed during this poll.
+            match unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => {
+                    state.pending.swap_remove(index);
+                }
+                WAIT_TIMEOUT => {
+                    index += 1;
+                }
+                _ => return Err(last_error(&format!("wait for Windows job process {pid}"))),
+            }
+        }
+        let info = self.accounting()?;
+        Ok(Progress {
+            active: info.ActiveProcesses,
+            total: info.TotalProcesses,
+            reported: state.reported,
+            pending: state.pending.len(),
+            full_batch,
+        })
     }
 
     pub(super) async fn wait_empty(&self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         loop {
-            let active = self.active_processes()?;
-            if active == 0 {
+            let Progress {
+                active,
+                total,
+                reported,
+                pending,
+                full_batch,
+            } = self.poll_completion()?;
+            // Accounting/ACTIVE_PROCESS_ZERO is only a membership boundary,
+            // not proof that every process handle is signaled. NEW_PROCESS
+            // delivery is not guaranteed: reconcile the lifetime count and
+            // fail closed at the deadline if any notification was lost. This
+            // also covers descendants created concurrently with termination.
+            if active == 0 && u64::from(total) == reported && pending == 0 {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "Windows process job cleanup deadline exceeded with {active} active processes"
+                    "Windows process job cleanup deadline exceeded with {active} active processes, \
+                     {pending} unsignaled process handles, {reported}/{total} process notifications"
                 ));
             }
-            tokio::time::sleep_until(deadline.min(Instant::now() + ACCOUNTING_INTERVAL)).await;
+            if full_batch {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep_until(deadline.min(Instant::now() + COMPLETION_INTERVAL)).await;
+            }
         }
     }
 }

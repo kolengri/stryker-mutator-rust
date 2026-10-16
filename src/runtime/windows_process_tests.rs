@@ -10,7 +10,8 @@ use tokio::sync::watch;
 use windows_sys::Win32::{
     Foundation::{ERROR_INVALID_HANDLE, GetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{
-        GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        GetCurrentProcess, GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE,
+        WaitForSingleObject,
     },
 };
 
@@ -65,6 +66,18 @@ fn fixture_entry() {
         return;
     };
     let directory = PathBuf::from(std::env::var_os("STRYKER_WINDOWS_FIXTURE_DIR").unwrap());
+    let _nested = (mode == "nested").then(|| {
+        let job = Job::new().unwrap();
+        // SAFETY: this fixture is already in the outer owned job. The empty
+        // inner job has no UI limits and can become its child on Windows 8+.
+        assert_ne!(
+            unsafe { AssignProcessToJobObject(job.raw(), GetCurrentProcess()) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        job
+    });
     if mode == "leaf" {
         record_pid(&directory, "leaf");
     } else if mode == "branch" {
@@ -76,6 +89,10 @@ fn fixture_entry() {
         wait_file_sync(&directory.join("leaf.pid"));
     } else {
         record_pid(&directory, "root");
+        if mode == "deferred" {
+            fs::write(directory.join("waiting"), b"waiting").unwrap();
+            wait_file_sync(&directory.join("release"));
+        }
         let mut command = fixture_command(&directory, "branch");
         command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
         let _child = command.as_std_mut().spawn().unwrap();
@@ -111,11 +128,12 @@ fn descendant_handles(directory: &Path) -> Vec<OwnedHandle> {
 }
 
 fn assert_exited(handles: &[OwnedHandle]) {
-    for handle in handles {
+    for (index, handle) in handles.iter().enumerate() {
         // SAFETY: the process handle is retained, so PID reuse cannot fool this.
         assert_eq!(
             unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) },
-            WAIT_OBJECT_0
+            WAIT_OBJECT_0,
+            "process handle {index} was not signaled at cleanup settlement"
         );
     }
 }
@@ -207,6 +225,126 @@ async fn live_job_deadline_is_an_error_and_drop_is_only_an_emergency_kill() {
             WAIT_OBJECT_0
         );
     }
+}
+
+#[tokio::test]
+async fn zero_accounting_does_not_complete_with_an_unsignaled_retained_process() {
+    let directory = tempfile::tempdir().unwrap();
+    let job = Job::new().unwrap();
+    // A real waitable process models the interval between job accounting
+    // removal and the process object's signal. No fake wait result is involved.
+    let mut child = fixture_command(directory.path(), "leaf").spawn().unwrap();
+    let pid = child.id().unwrap();
+    job.completion
+        .lock()
+        .unwrap()
+        .pending
+        .push((pid, process_handle(pid)));
+    assert_eq!(job.active_processes().unwrap(), 0);
+    let error = job.wait_empty(Duration::from_millis(30)).await.unwrap_err();
+    assert!(
+        error.contains("0 active processes, 1 unsignaled process handles"),
+        "{error}"
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_missing_process_notification_cannot_turn_zero_accounting_into_success() {
+    let directory = tempfile::tempdir().unwrap();
+    let job = Job::new().unwrap();
+    let mut child = fixture_command(directory.path(), "leaf")
+        .creation_flags(CREATE_SUSPENDED)
+        .spawn()
+        .unwrap();
+    job.assign(&child).unwrap();
+    // Dequeue the real NEW_PROCESS notification, then erase its coverage to
+    // model documented non-delivery. The suspended root cannot create children.
+    tokio::time::timeout(READY_DEADLINE, async {
+        loop {
+            job.poll_completion().unwrap();
+            if job.completion.lock().unwrap().reported == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    job.completion.lock().unwrap().reported = 0;
+    job.terminate().unwrap();
+    child.wait().await.unwrap();
+    let error = job.wait_empty(Duration::from_millis(30)).await.unwrap_err();
+    assert!(error.contains("0 active processes"), "{error}");
+    assert!(error.contains("0/1 process notifications"), "{error}");
+}
+
+#[tokio::test]
+async fn completion_wait_covers_descendants_created_after_waiting_started() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut child, mut group) = Group::spawn(
+        &mut fixture_command(directory.path(), "deferred"),
+        "fixture",
+    )
+    .await
+    .unwrap();
+    wait_file(&directory.path().join("waiting")).await;
+    // Consume the root notification before descendants exist, then cancel
+    // this first wait. The job must retain that coverage across cancellation.
+    let mut first = Box::pin(group.wait_empty());
+    tokio::select! {
+        result = &mut first => panic!("live root completed prematurely: {result:?}"),
+        observed = tokio::time::timeout(READY_DEADLINE, async {
+            loop {
+                if group.job.completion.lock().unwrap().reported == 1 { break; }
+                tokio::task::yield_now().await;
+            }
+        }) => { observed.unwrap(); }
+    }
+    drop(first);
+    fs::write(directory.path().join("release"), b"release").unwrap();
+    wait_file(&directory.path().join("ready")).await;
+    let descendants = descendant_handles(directory.path());
+    group.terminate().unwrap();
+    let (empty, reaped) = tokio::join!(
+        group.wait_empty(),
+        tokio::time::timeout(READY_DEADLINE, child.wait())
+    );
+    empty.unwrap();
+    reaped.unwrap().unwrap();
+    assert_exited(&descendants);
+    let completion = group.job.completion.lock().unwrap();
+    assert_eq!(completion.reported, 3);
+    assert!(completion.pending.is_empty());
+    drop(completion);
+    group.armed = false;
+}
+
+#[tokio::test]
+async fn nested_job_notifications_reconcile_with_outer_accounting_and_process_signals() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut child, mut group) =
+        Group::spawn(&mut fixture_command(directory.path(), "nested"), "fixture")
+            .await
+            .unwrap();
+    wait_file(&directory.path().join("ready")).await;
+    let mut handles = descendant_handles(directory.path());
+    handles.push(process_handle(child.id().unwrap()));
+    assert_eq!(group.job.active_processes().unwrap(), 3);
+    group.terminate().unwrap();
+    let (empty, reaped) = tokio::join!(
+        group.wait_empty(),
+        tokio::time::timeout(READY_DEADLINE, child.wait())
+    );
+    empty.unwrap();
+    reaped.unwrap().unwrap();
+    assert_exited(&handles);
+    let completion = group.job.completion.lock().unwrap();
+    assert_eq!(completion.reported, 3);
+    assert!(completion.pending.is_empty());
+    drop(completion);
+    group.armed = false;
 }
 
 #[tokio::test]

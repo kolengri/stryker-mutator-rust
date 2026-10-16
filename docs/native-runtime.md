@@ -79,8 +79,12 @@ the existing legacy entry remains available independently.
 
 Windows uses a retained, owned Job Object for each command or compatibility worker.
 The root is created suspended, assigned before user code resumes, then cleanup
-terminates the job, reaps the root and waits for zero active job members before
-bounded pipe drains. Cancellation cannot hide a cleanup failure. POSIX retains
+terminates the job, reaps the root and waits for zero active job members and
+signaled retained member process handles before bounded pipe drains. A private
+completion port is associated before assignment; observed process notifications
+must reconcile with the job's lifetime process count. Missing coverage produces
+a bounded cleanup error. Accounting alone is not a process completion barrier.
+Cancellation cannot hide a cleanup failure. POSIX retains
 its existing process groups and post-reap termination retry.
 
 Project and sandbox cwd must safely normalize to ordinary absolute drive paths;
@@ -88,6 +92,10 @@ paths still requiring verbatim, device or UNC cwd identities fail explicitly.
 TSConfig preprocessing supports native Windows separators and safely simplified
 absolute drives; ambiguous case aliases and drive-relative forms are rejected.
 Different-drive external paths remain absolute. Report source/test keys use `/`.
+Generated output filesystem paths become literal, root-anchored project-name rules;
+internal absolute outputs are excluded without treating drive separators as glob
+syntax. External outputs do not match project inputs, and explicit ordered
+ignore reinclusion remains effective.
 
 Dependency junctions are owned individually. Cleanup detaches each reparse point
 and removes only its owned empty directory before recursive sandbox removal.

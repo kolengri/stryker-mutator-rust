@@ -33,6 +33,112 @@ fn names(project: &Project) -> Vec<String> {
 }
 
 #[test]
+fn generated_output_paths_match_project_names_and_preserve_ordered_reinclusion() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = config(directory.path());
+    config.options["tempDirName"] = json!(Path::new("build").join("cache/sandboxes"));
+    config.options["jsonReporter"]["fileName"] =
+        json!(config.cwd.join("reports/nested/mutation.json"));
+    config.options["htmlReporter"]["fileName"] = json!(
+        directory
+            .path()
+            .parent()
+            .unwrap()
+            .join("external-report.html")
+    );
+    write(&config.cwd, "build/cache/sandboxes/old.ts", "unchanged");
+    write(&config.cwd, "reports/nested/mutation.json", "{}");
+    write(&config.cwd, "src/value.js", "export const value = 1;");
+    assert_eq!(names(&prepare(&config).unwrap()), ["src/value.js"]);
+
+    config.options["ignorePatterns"] = json!(["!/reports/nested/mutation.json"]);
+    assert_eq!(
+        names(&prepare(&config).unwrap()),
+        ["reports/nested/mutation.json", "src/value.js"]
+    );
+    // Only generated filesystem paths are normalized, not user glob syntax.
+    config.options["ignorePatterns"] = json!([r"src\**"]);
+    assert!(
+        prepare(&config)
+            .err()
+            .unwrap()
+            .contains("Unsupported native glob syntax")
+    );
+    assert_eq!(
+        fs::read_to_string(config.cwd.join("reports/nested/mutation.json")).unwrap(),
+        "{}"
+    );
+    assert!(!config.cwd.join(".stryker-tmp").exists());
+}
+
+#[test]
+fn generated_outputs_keep_literal_names_and_ignore_only_their_owned_location() {
+    for folder in ["#cache", "!cache", "cache[1]", "cache{", "cache}"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config(directory.path());
+        config.options["tempDirName"] = folder.into();
+        config.options["jsonReporter"]["fileName"] =
+            json!(config.cwd.join("reports/[mutation]{raw}!.json"));
+        write(&config.cwd, &format!("{folder}/old.js"), "owned output");
+        write(&config.cwd, "reports/[mutation]{raw}!.json", "{}");
+        write(&config.cwd, "cache1/keep.js", "real input");
+        write(
+            &config.cwd,
+            &format!("src/{folder}/keep.js"),
+            "nested real input",
+        );
+        assert_eq!(
+            names(&prepare(&config).unwrap()),
+            ["cache1/keep.js".to_owned(), format!("src/{folder}/keep.js")],
+            "{folder}"
+        );
+        // User rules still apply in their original order after owned outputs.
+        if folder == "#cache" || folder == "!cache" {
+            config.options["ignorePatterns"] = json!([format!("!/{folder}/old.js")]);
+            assert!(
+                names(&prepare(&config).unwrap()).contains(&format!("{folder}/old.js")),
+                "{folder}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(config.cwd.join(format!("{folder}/old.js"))).unwrap(),
+            "owned output"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_output_paths_keep_posix_backslashes_literal() {
+    for folder in [r"cache\x", "cache\\"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = config(directory.path());
+        config.options["tempDirName"] = folder.into();
+        write(&config.cwd, &format!("{folder}/old.js"), "owned output");
+        write(&config.cwd, "cache/keep.js", "real input");
+        write(&config.cwd, "cachex/keep.js", "real input");
+        write(
+            &config.cwd,
+            &format!("src/{folder}/keep.js"),
+            "nested real input",
+        );
+        assert_eq!(
+            names(&prepare(&config).unwrap()),
+            [
+                "cache/keep.js".to_owned(),
+                "cachex/keep.js".to_owned(),
+                format!("src/{folder}/keep.js"),
+            ],
+            "{folder}"
+        );
+        assert_eq!(
+            fs::read_to_string(config.cwd.join(format!("{folder}/old.js"))).unwrap(),
+            "owned output"
+        );
+    }
+}
+
+#[test]
 fn default_mutation_excludes_repeated_extglob_test_prefixes() {
     // Expected selections come from core 10.0.0's default patterns evaluated
     // by its pinned Minimatch 10.2.6 through ProjectReader.

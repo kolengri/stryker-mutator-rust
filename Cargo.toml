@@ -36,7 +36,7 @@ nix = { version = "0.31", features = ["signal", "process"] }
 [target.'cfg(windows)'.dependencies]
 dunce = "1.0.5"
 junction = { version = "2.1", default-features = false }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_IO", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 
 [build-dependencies]
 napi-build = "2.6"

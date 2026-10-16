@@ -89,11 +89,12 @@ async fn process_handles(directory: &Path, root: u32) -> Vec<OwnedHandle> {
 }
 
 fn assert_exited(handles: &[OwnedHandle]) {
-    for handle in handles {
+    for (index, handle) in handles.iter().enumerate() {
         // SAFETY: the retained handle prevents PID reuse from affecting proof.
         assert_eq!(
             unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) },
-            WAIT_OBJECT_0
+            WAIT_OBJECT_0,
+            "process handle {index} was not signaled at bridge settlement"
         );
     }
 }

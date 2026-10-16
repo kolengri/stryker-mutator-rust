@@ -86,6 +86,22 @@ pub(super) fn name(path: &Path) -> Result<String, String> {
         .ok_or_else(|| "Non-UTF8 project path requires compatibility handling".into())
 }
 
+fn output_ignore(cwd: &Path, value: &str) -> Result<Option<Ignore>, String> {
+    let path = Path::new(value);
+    #[cfg(windows)]
+    let (cwd, path) = (dunce::simplified(cwd), dunce::simplified(path));
+    let relative = if path.is_absolute() {
+        let Ok(relative) = path.strip_prefix(cwd) else {
+            // An output outside the project cannot match an enumerated file.
+            return Ok(None);
+        };
+        relative
+    } else {
+        path
+    };
+    Ignore::output_path(&name(relative)?).map(Some)
+}
+
 fn default_match(path: &str) -> bool {
     let mut parts = path.split('/');
     if !matches!(parts.next(), Some("src" | "lib"))
@@ -209,35 +225,34 @@ pub(super) fn prepare(config: &Config) -> Result<Project, String> {
         ".svelte-kit",
     ]
     .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
+    .map(Ignore::new)
+    .collect::<Result<Vec<_>, _>>()?;
     for key in ["tempDirName", "incrementalFile"] {
-        ignored.push(
-            config.options[key]
-                .as_str()
-                .expect("validated path")
-                .to_owned(),
-        );
+        if let Some(rule) = output_ignore(
+            &config.cwd,
+            config.options[key].as_str().expect("validated path"),
+        )? {
+            ignored.push(rule);
+        }
     }
     for key in ["htmlReporter", "jsonReporter"] {
-        ignored.push(
+        if let Some(rule) = output_ignore(
+            &config.cwd,
             config.options[key]["fileName"]
                 .as_str()
-                .expect("validated path")
-                .to_owned(),
-        );
+                .expect("validated path"),
+        )? {
+            ignored.push(rule);
+        }
     }
     ignored.extend(
         config.options["ignorePatterns"]
             .as_array()
             .expect("validated ignored patterns")
             .iter()
-            .map(|value| value.as_str().expect("string").to_owned()),
+            .map(|value| Ignore::new(value.as_str().expect("string")))
+            .collect::<Result<Vec<_>, _>>()?,
     );
-    let ignored = ignored
-        .iter()
-        .map(|value| Ignore::new(value))
-        .collect::<Result<Vec<_>, _>>()?;
     let defaults = super::config::defaults();
     let use_default = config.options["mutate"] == defaults["mutate"];
     let patterns = if use_default {
