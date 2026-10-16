@@ -12,7 +12,7 @@ use std::{
 
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, watch},
+    sync::{Mutex, Semaphore, watch},
     task::JoinSet,
     time::Instant,
 };
@@ -574,18 +574,24 @@ pub(super) async fn run(
             if *cancellation.borrow() { return Err(CANCELLED.into()); }
             sandboxes.push(Sandbox::create(&config, &project)?);
             workers.push(Worker::new(config.clone(), sandboxes.last().expect("new sandbox").path.clone(), descriptions.clone(), test_files.clone(), cancellation.clone()));
-            workers.last_mut().expect("new worker").start().await?;
         }
         let queue = Arc::new(Mutex::new(queue));
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
+        // Match the pinned pool's bound without blocking a ready worker on
+        // unrelated cold initialization. Restarts retain their own lifecycle.
+        let initializations = Arc::new(Semaphore::new(2));
         let mut tasks = JoinSet::new();
         for mut worker in workers.drain(..) {
             let queue = queue.clone(); let cancellation = cancellation.clone();
             let active = active.clone(); let maximum = maximum.clone();
+            let initializations = initializations.clone();
             tasks.spawn(async move {
                 let outcome = async {
-                    if worker.session.is_none() { worker.start().await?; }
+                    if worker.session.is_none() {
+                        let _permit = initializations.acquire().await.map_err(|error| error.to_string())?;
+                        worker.start().await?;
+                    }
                     let mut results = Vec::new();
                     loop {
                         if *cancellation.borrow() { return Err(CANCELLED.to_owned()); }
