@@ -111,6 +111,7 @@ This slice makes no speed claim. Full Rust core replacement remains unfinished.
 ## Native boundary and compatibility
 
 The accepted native grammar includes ordinary JS named function declarations,
+synchronous function expressions,
 simple parameters/bindings, variable declarations, concise/block arrows,
 return/if/block/expression statements, plain imports/named exports and pure
 arithmetic, comparisons, equality, boolean, logical, unary and conditional
@@ -122,7 +123,7 @@ static/computed members, `this`, direct `Array(...)` mutations and method
 mutations are supported. Chain
 placement preserves receivers and argument evaluation. Call-statement filtering
 can leave gaps in otherwise ordered global mutant IDs, matching upstream.
-Assignments and prefix/postfix updates support identifier and public-member
+Assignments and prefix/postfix updates support identifier, public-member and private-field
 targets. Getter/setter order, logical assignment and update return values follow
 JavaScript semantics. Active mutations on an update target's object spine use
 upstream fallback to preserve its existing placement errors.
@@ -150,11 +151,23 @@ parsing policy as the reference instrumenter. Non-null assertions, `satisfies`,
 angle-bracket assertions, typed assignment targets, runtime enums/namespaces,
 TSX and unproven typed replacement printing still require fallback.
 
+Bounded class declarations and expressions support public instance/static fields,
+private fields, ordinary identifier-keyed methods, getters/setters, constructors,
+heritage and static blocks. Field initialization and method execution retain their
+original timing. Constructor-body deletion follows upstream's public-field and
+direct-super-call predicate; static blocks have no own block deletion. Ordinary
+`new` expressions and syntactic `new Array(...)` mutations are supported, as are
+direct `super(...)` and unmapped super property calls. Throw-new deletion preserves
+the statement-call filter and its ID gaps. Class/member directive ownership is
+accepted only in proven statement/member gaps.
+
 Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
-Private members, `super`, `new`, dynamic imports, regex,
+Private methods/accessors, optional private members, decorators, auto-accessors,
+parameter properties, computed/quoted method keys, computed fields,
+mapped super calls, dynamic imports, regex (including literal-first `new RegExp`),
 argument spread, array holes/spread, object methods,
-accessors/spread, complex computed keys, destructuring targets, classes,
+accessors/spread, complex computed keys, destructuring targets,
 async/generators, `for-await`, directive prologues and hashbangs trigger whole-batch fallback.
 Noncanonical number spellings and incompatible raw string/template spellings
 inside printed mutation replacements also fall back, as do objects and arrays
@@ -201,6 +214,7 @@ npm run test:integration
 node scripts/integration.js native
 node scripts/integration.js vitest
 node scripts/integration.js typescript
+node scripts/integration.js classes
 npm run test:corpus
 npm run bench
 ```

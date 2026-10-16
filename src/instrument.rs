@@ -1767,14 +1767,21 @@ impl Emitter<'_, '_> {
             }
         }
         for implements in &class.implements {
-            self.skip_ts(implements.span)?;
+            self.scope(implements.span, false, |emitter| {
+                if let Some(arguments) = &implements.type_arguments {
+                    emitter.skip_ts(arguments.span)?;
+                }
+                Ok(())
+            })?;
         }
         let initialized_public = class.body.body.iter().any(|member| {
             matches!(member, ClassElement::PropertyDefinition(field)
                 if !matches!(field.key, PropertyKey::PrivateIdentifier(_)) && field.value.is_some())
         });
-        for element in &class.body.body {
-            let rendered = self.scope(element.span(), true, |emitter| {
+        let body = self.scope(class.body.span, false, |emitter| {
+            let mut edits = vec![];
+            for element in &class.body.body {
+            let rendered = emitter.scope(element.span(), true, |emitter| {
                 let mut edits = vec![];
                 match element {
                     ClassElement::PropertyDefinition(field) => {
@@ -1824,7 +1831,10 @@ impl Emitter<'_, '_> {
                 Ok(emitter.apply(element.span(), edits))
             })?;
             edits.push((element.span(), rendered));
-        }
+            }
+            Ok(emitter.apply(class.body.span, edits))
+        })?;
+        edits.push((class.body.span, body));
         Ok(self.apply(class.span, edits))
     }
 

@@ -309,6 +309,30 @@ test('class directives, empty reasons, ranges, UTF16, CRLF and cross-file IDs ma
   assert.doesNotMatch(noHeader.actual.files[0].content, /function stryNS_/);
 });
 
+test('implements clauses skip only actual type argument subtrees', async () => {
+  for (const [clause, ids] of [['I', ['1']], ['I<T>', ['0', '1']], ['I, J', ['1']], ['I, J<T>', ['0', '1']]]) {
+    const pair = await compare([file(`foo(class C implements ${clause} { x=1+2; });`, 'implements.ts')]);
+    assert.deepEqual(pair.actual.mutants.map(m => m.id), ids);
+    await runtime(pair, 'function foo(C){events.push(new C().x);}', 'events');
+  }
+});
+
+test('pruned class bodies do not apply directives to later selected statements', async () => {
+  for (const source of [
+    'class C{\n// Stryker disable all: hidden\nx=true;\n}\nconst flag=true;',
+    'const C=class{\n// Stryker disable all: hidden\nstatic{ const hidden=true; }\n};\nconst flag=true;',
+  ]) {
+    const ranges = [
+      { start: { line: 0, column: 0 }, end: { line: 0, column: 5 } },
+      { start: { line: 4, column: 0 }, end: { line: 4, column: 16 } },
+    ];
+    const pair = await compare([file(source, 'pruned.js', ranges)]);
+    assert.equal(pair.actual.mutants.length, 1);
+    assert.equal(pair.actual.mutants[0].status, undefined);
+    await runtime(pair, '', 'flag');
+  }
+});
+
 test('unproven new nodes in cloned replacements reject whole batches', async () => {
   for (const source of [
     'const value=(new C())+1;','const value=(function(){return 1;})+1;',
