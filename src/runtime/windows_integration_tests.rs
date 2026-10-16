@@ -71,6 +71,7 @@ fn drive_report_paths_and_canonical_project_and_sandbox_paths_match_node_cwd() {
         .tempdir()
         .unwrap();
     let ordinary = config::canonicalize(directory.path()).unwrap();
+    write(&ordinary, "src/cwd.js", SOURCE);
     let verbatim = fs::canonicalize(directory.path()).unwrap();
     assert!(
         matches!(verbatim.components().next(), Some(std::path::Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_)))
@@ -82,6 +83,7 @@ fn drive_report_paths_and_canonical_project_and_sandbox_paths_match_node_cwd() {
     );
     assert_eq!(config.cwd, ordinary);
     let project = prepare(&config).unwrap();
+    assert_eq!(project.files, [PathBuf::from("src/cwd.js")]);
     let mut sandbox = Sandbox::create(&config, &project).unwrap();
     for cwd in [&config.cwd, &sandbox.path] {
         let output = Command::new(node())
@@ -99,6 +101,10 @@ fn drive_report_paths_and_canonical_project_and_sandbox_paths_match_node_cwd() {
     assert_eq!(saved, assembled);
     assert_eq!(saved["projectRoot"], json!(ordinary));
     sandbox.cleanup().unwrap();
+    assert_eq!(
+        fs::read_to_string(ordinary.join("src/cwd.js")).unwrap(),
+        SOURCE
+    );
 }
 
 #[test]
