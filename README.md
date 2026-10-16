@@ -165,6 +165,12 @@ Stryker contract. Cloned replacement records preserve each string literal's
 original quotes and escape spelling, including mixed spellings of the same
 value. Physical multiline string tokens inside whole-for replacements still
 require fallback, as do unproven generated literal ranges.
+Printed replacement ancestors also accept synchronous concise arrows with
+untyped identifier parameters, including nested callback chains. Their
+parameter parentheses follow upstream formatting. Block bodies, async arrows,
+defaults, rest, destructuring and typed arrow signatures inside these printed
+ancestors still require fallback; ordinary arrow traversal remains supported
+outside that boundary.
 Ordinary calls, continuous optional chains, public
 static/computed members, `this`, direct `Array(...)` mutations and method
 mutations are supported. Chain
