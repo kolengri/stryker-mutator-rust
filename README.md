@@ -171,6 +171,12 @@ parameter parentheses follow upstream formatting. Block bodies, async arrows,
 defaults, rest, destructuring and typed arrow signatures inside these printed
 ancestors still require fallback; ordinary arrow traversal remains supported
 outside that boundary.
+Variable declarations also accept recursive object/array binding patterns with
+static keys, aliases, holes and identifier rest bindings. Their original syntax
+preserves JavaScript property access, iteration and binding semantics. Binding
+defaults, computed keys, non-identifier rest, whole-for clone serialization and
+unproven grouped/conditional initializer formatting still require fallback.
+Destructured parameters, catches and assignment targets remain unsupported.
 Ordinary calls, continuous optional chains, public
 static/computed members, `this`, direct `Array(...)` mutations and method
 mutations are supported. Chain
