@@ -87,6 +87,10 @@ static/computed members, `this`, direct `Array(...)` mutations and method
 mutations are supported. Chain
 placement preserves receivers and argument evaluation. Call-statement filtering
 can leave gaps in otherwise ordered global mutant IDs, matching upstream.
+Assignments and prefix/postfix updates support identifier and public-member
+targets. Getter/setter order, logical assignment and update return values follow
+JavaScript semantics. Active mutations on an update target's object spine use
+upstream fallback to preserve its existing placement errors.
 Mutation ranges select candidates using upstream UTF-16
 locations. Ordinary comments and Stryker disable/restore directives are accepted
 in unambiguous gaps between statements, including `next-line` and ignore reasons.
@@ -97,7 +101,7 @@ Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
 Private members, `super`, `new`, dynamic imports, regex,
 argument spread, array holes/spread, object methods,
-accessors/spread, complex computed keys, assignments/updates, loops, classes,
+accessors/spread, complex computed keys, destructuring targets, sequences, loops, classes,
 async/generators, directive prologues and hashbangs trigger whole-batch fallback.
 Noncanonical number spellings and incompatible raw string/template spellings
 inside printed mutation replacements also fall back, as do objects and arrays
