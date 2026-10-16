@@ -635,6 +635,11 @@ impl Emitter<'_, '_> {
                 }
             }
             Expression::ArrayExpression(array) => {
+                // Oxc expands arrays with more than two elements over multiple
+                // lines; Babel keeps them inline in cloned operator mutants.
+                if context.printed_ancestor && array.elements.len() > 2 {
+                    return Err("Multiline array printing requires upstream replacement formatting".into());
+                }
                 for element in &array.elements {
                     let child = element.as_expression().ok_or("Array holes and spread require upstream instrumentation")?;
                     edits.push((child.span(), self.expression(child, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));

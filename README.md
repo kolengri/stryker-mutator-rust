@@ -79,11 +79,16 @@ The accepted native grammar includes ordinary JS named function declarations,
 simple parameters/bindings, variable declarations, concise/block arrows,
 return/if/block/expression statements, plain imports/named exports and pure
 arithmetic, comparisons, equality, boolean, logical, unary and conditional
-expressions. Mutation records, IDs, locations, exclusions and runtime coverage
-follow the pinned Stryker contract. Calls, members, strings/templates, regex,
-collections, assignments/updates, loops, classes, async/generators, comments,
-directives, mutation ranges, noncanonical number spellings and other unsupported
-constructs trigger whole-batch fallback. See `src/instrument.rs` for the definitive
+expressions. Strings, untagged templates, dense array literals and plain object
+literals are supported in compatible placement and printing contexts. Mutation
+records, IDs, locations, exclusions and runtime coverage follow the pinned
+Stryker contract. Calls, members, regex, array holes/spread, object methods,
+accessors/spread, complex computed keys, assignments/updates, loops, classes,
+async/generators, comments, directives and mutation ranges trigger whole-batch
+fallback. Noncanonical number spellings, incompatible raw string/template
+spellings inside printed mutation replacements, and objects or arrays with more
+than two elements inside those replacements also fall back. See
+`src/instrument.rs` for the definitive
 acceptance checks. The native engine does not claim the broader preview's scope.
 
 Node stays responsible for running existing JavaScript tests and plugins. Custom

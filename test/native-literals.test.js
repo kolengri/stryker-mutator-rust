@@ -96,6 +96,46 @@ test('literal exclusions, selected-off files and global IDs preserve complete re
   }
 });
 
+test('array printing threshold preserves exact records or rejects the entire batch', async () => {
+  const contexts = [
+    [(array) => array, false],
+    [(array) => `a ? ${array} : false`, false],
+    [(array) => `a + ${array}`, true],
+    [(array) => `a === ${array}`, true],
+    [(array) => `a && ${array}`, true],
+    [(array) => `${array} ?? a`, true],
+    [(array) => `!${array}`, true],
+    [(array) => `a + (a ? ${array} : false)`, true],
+  ];
+  for (let size = 0; size <= 8; size++) {
+    const array = `[${Array.from({ length: size }, (_, index) => index + 1).join(', ')}]`;
+    for (const literal of [array, `[${array}]`]) {
+      for (const [wrap, printed] of contexts) {
+        const content = `function calc(a) { return ${wrap(literal)}; }`;
+        const files = [
+          { name: 'first.js', content: 'const first = true;', mutate: true },
+          { name: 'array.js', content, mutate: true },
+        ];
+        const response = JSON.parse(loadNative().instrumentBatch(JSON.stringify({ files, options })));
+        const supported = !printed || size <= 2;
+        assert.equal(response.supported, supported, content);
+        const expected = await new Instrumenter(logger).instrument(files, options);
+        const actual = createInstrumenter(logger, { cache: false, engine: 'auto' });
+        const result = await actual.instrument(files, options);
+        assert.deepEqual(result.mutants, expected.mutants, content);
+        assert.equal(actual.stats.nativeBatches, Number(supported), content);
+        assert.equal(actual.stats.fallbackBatches, Number(!supported), content);
+        if (supported) {
+          assert.deepEqual(execute(result.files[1].content, 'calc(2)'), execute(expected.files[1].content, 'calc(2)'), content);
+        } else {
+          assert.equal(response.result, undefined, content);
+          assert.deepEqual(result, expected, content);
+        }
+      }
+    }
+  }
+});
+
 test('unsupported literal contexts reject the complete batch atomically', async () => {
   const sources = [
     'const a = [,];', 'const a = [1,,2];', 'const a = [...[]];',
