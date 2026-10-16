@@ -22,6 +22,7 @@ use crate::mutations::{
     Utf16Offsets, assignment_operator_replacement, method_replacement as method_mapping,
 };
 
+mod html;
 mod parallel;
 mod printed_arrows;
 mod regex_mutation;
@@ -516,12 +517,48 @@ fn instrument_file_inner(
     next_id: &mut usize,
     relocation_proven: Option<&mut bool>,
 ) -> Result<String, String> {
-    #[cfg(test)]
-    let parse_timer = parallel::diagnostic::Timer::start(0);
-    if file.content.len() > u32::MAX as usize {
-        return Err("Source exceeds 32-bit span limits".into());
+    if std::path::Path::new(&file.name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm"))
+    {
+        // The parallel relocation scanner accepts standalone JS/TS only. Keep
+        // HTML on its existing atomic serial-recovery path until it has a
+        // separately proven segment-aware relocation contract.
+        if let Some(proven) = relocation_proven {
+            *proven = false;
+        }
+        return html::instrument(file, options, records, next_id);
     }
     let source_type = SourceType::from_path(&file.name).map_err(|error| error.to_string())?;
+    instrument_program(
+        file,
+        &file.content,
+        source_type,
+        Position { line: 0, column: 0 },
+        options,
+        records,
+        next_id,
+        relocation_proven,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn instrument_program(
+    file: &File,
+    source: &str,
+    source_type: SourceType,
+    offset: Position,
+    options: &Options,
+    records: &mut Vec<ApiMutant>,
+    next_id: &mut usize,
+    relocation_proven: Option<&mut bool>,
+) -> Result<String, String> {
+    #[cfg(test)]
+    let parse_timer = parallel::diagnostic::Timer::start(0);
+    if source.len() > u32::MAX as usize {
+        return Err("Source exceeds 32-bit span limits".into());
+    }
     if source_type.is_jsx() {
         return Err("JSX and TSX require upstream instrumentation".into());
     }
@@ -529,7 +566,7 @@ fn instrument_file_inner(
     // ambient-definition restrictions on otherwise ordinary runtime statements.
     let source_type = source_type.with_typescript(source_type.is_typescript());
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, &file.content, source_type.with_module(true))
+    let parsed = Parser::new(&allocator, source, source_type.with_module(true))
         .with_options(ParseOptions {
             preserve_parens: false,
             parse_regular_expression: true,
@@ -548,7 +585,7 @@ fn instrument_file_inner(
             "Directive prologues and Flow preprocessing require upstream instrumentation".into(),
         );
     }
-    let directives = CommentBoundaries::directives(&parsed.program, &file.content)?;
+    let directives = CommentBoundaries::directives(&parsed.program, source)?;
     let semantics = SemanticBuilder::new()
         .with_check_syntax_error(true)
         .build(&parsed.program);
@@ -558,7 +595,7 @@ fn instrument_file_inner(
     // Parser compatibility is independent of mutation traversal: opaque TS
     // expressions and unselected ranges can still contain parameter defaults.
     let mut assignments = ParameterAssignments {
-        source: &file.content,
+        source,
         parameter_expression: false,
         unproven: false,
         in_function: false,
@@ -587,9 +624,10 @@ fn instrument_file_inner(
     #[cfg(test)]
     let _emitter_timer = parallel::diagnostic::Timer::start(2);
     let mut emitter = Emitter {
-        source: &file.content,
+        source,
         file_name: &file.name,
-        positions: Positions::new(&file.content),
+        positions: Positions::new(source),
+        offset,
         options,
         selection: &file.mutate,
         pruned: false,
@@ -619,7 +657,7 @@ fn instrument_file_inner(
                 .map(|output| (statement.span(), output))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut output = emitter.apply(Span::new(0, file.content.len() as u32), edits);
+    let mut output = emitter.apply(Span::new(0, source.len() as u32), edits);
     if emitter.placed != 0 && !options.no_header {
         // Leave the parsed hashbang and first statement's comment preamble ahead
         // of the helpers. A statement after a hashbang necessarily follows a line
@@ -1176,6 +1214,9 @@ struct Emitter<'s, 'r> {
     source: &'s str,
     file_name: &'s str,
     positions: Positions,
+    // Selection and comment ownership stay script-relative. Only the public
+    // record uses pinned HTML's absolute UTF-16 first-line column offset.
+    offset: Position,
     options: &'s Options,
     selection: &'s Selection,
     pruned: bool,
@@ -1319,10 +1360,17 @@ impl Emitter<'_, '_> {
         *self.next_id += 1;
         let reason = self.ignore_reason(self.positions.at(span.start).line, name);
         let ignored = reason.as_ref().is_some_and(|reason| !reason.is_empty());
+        let mut location = self.location(span);
+        for position in [&mut location.start, &mut location.end] {
+            if position.line == 0 {
+                position.column += self.offset.column;
+            }
+            position.line += self.offset.line;
+        }
         self.records.push(ApiMutant {
             file_name: self.file_name.into(),
             id: id.clone(),
-            location: self.location(span),
+            location,
             mutator_name: name,
             replacement: replacement.clone(),
             status_reason: reason,

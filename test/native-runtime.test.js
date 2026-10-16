@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { runNativeMutationTest } from '../lib/runtime.js';
+import { assertProcessStopped } from './helpers.js';
 
 async function project(t, script = '') {
   const suffix = process.platform === 'win32' ? ' Windows spaces & paths' : '';
@@ -94,13 +95,7 @@ setInterval(() => {}, 1000);
     }
     assert.equal(result.error, reason, 'AbortSignal reason is preserved after native cleanup');
     assert.ok(!(await readdir(cwd)).includes('.stryker-tmp'), 'Promise settled before sandbox cleanup');
-    for (const pid of pids) {
-      const status = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
-      assert.ok(status.status === 0 || status.status === 1, status.stderr);
-      // POSIX may retain an already terminated orphan as a zombie until init
-      // reaps it; it cannot execute code or retain our command's output streams.
-      assert.ok(!status.stdout.trim() || status.stdout.trim().startsWith('Z'), `Child ${pid} remains active: ${status.stdout}`);
-    }
+    for (const pid of pids) assertProcessStopped(pid);
     const recovered = await runNativeMutationTest({ cwd, overrides: { commandRunner: { command: ':' } } });
     assert.equal(recovered.supported, true);
     assert.equal(recovered.stats.coordinator, 'rust');

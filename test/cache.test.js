@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { deserialize } from 'node:v8';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
 import { createInstrumenter } from '../lib/index.js';
-import { serializePlain } from '../lib/cache.js';
+import { cacheEligibility, nativeEligibility, serializePlain } from '../lib/cache.js';
 import { logger, options } from './helpers.js';
 
 const files = [{ name: '/fixture/values.ts', content: 'export function add(a: number,b: number) { return (a + b)! satisfies number; }', mutate: true }];
@@ -16,6 +16,77 @@ async function context(t) {
   t.after(() => rm(directory, { recursive: true, force: true }));
   return { directory, sut: createInstrumenter(logger, { cacheDir: directory, engine: 'upstream' }) };
 }
+
+test('HTML native eligibility shares per-call parser checks while result caching stays ineligible', async (t) => {
+  const { directory } = await context(t);
+  const batch = [{ name: join(directory, 'source.html'), content: '<script>const flag=true;</script>', mutate: true }];
+  assert.equal(await cacheEligibility(batch, options), false);
+  assert.equal(await nativeEligibility(batch, options), true);
+  for (const extension of ['vue', 'svelte', 'astro']) {
+    const framework = [{ ...batch[0], name: join(directory, `source.${extension}`) }];
+    assert.equal(await nativeEligibility(framework, options), false);
+    assert.equal(await cacheEligibility(framework, options), false);
+  }
+  assert.equal(await nativeEligibility(batch, { ...options, ignorers: [{}] }), false);
+  assert.equal(await nativeEligibility(batch, { ...options, excludedMutations: null }), false);
+  const config = join(directory, '.babelrc');
+  await writeFile(config, '{}');
+  assert.equal(await nativeEligibility(batch, options), false, 'observe newly created Babel configuration');
+  await rm(config);
+  assert.equal(await nativeEligibility(batch, options), true, 'observe removed Babel configuration without memoization');
+  await writeFile(join(directory, 'package.json'), '{"babel":{}}');
+  assert.equal(await nativeEligibility(batch, options), false);
+  await writeFile(join(directory, 'package.json'), '{broken');
+  await assert.rejects(nativeEligibility(batch, options), SyntaxError, 'preserve filesystem/configuration errors');
+  assert.equal(await cacheEligibility(batch, options), false, 'HTML result-cache gate still exits before filesystem checks');
+});
+
+test('repeated HTML native calls bypass result caching with exact bytes counters and events', async (t) => {
+  const { directory } = await context(t);
+  for (const extension of ['html', 'htm']) {
+    const batch = [{ name: `cache-source.${extension}`, content: '<script>function calc(){return 1+2;}</script>', mutate: true }];
+    const events = [];
+    const sut = createInstrumenter(logger, { cacheDir: directory, engine: 'native', onEvent: event => events.push(event) });
+    const first = await sut.instrument(batch, options);
+    assert.deepEqual(first.mutants, (await new Instrumenter(logger).instrument(batch, options)).mutants);
+    assert.deepEqual(await sut.instrument(batch, options), first);
+    assert.deepEqual(sut.stats, { hits: 0, misses: 0, bypasses: 2, errors: 0, nativeBatches: 2, fallbackBatches: 0, nativeErrors: 0 });
+    assert.deepEqual(events, Array.from({ length: 2 }, () => ({ type: 'bypasses', reason: 'external parser configuration or ignorer' })));
+  }
+  assert.deepEqual(await readdir(directory), [], 'HTML output never enters the result cache');
+});
+
+test('HTML auto fallback preserves dynamic Babel effects and custom ignorer invocations', async (t) => {
+  const { directory } = await context(t);
+  const countFile = join(directory, 'count.txt');
+  const configFile = join(directory, 'babel.config.cjs');
+  await writeFile(join(directory, 'package.json'), '{"private":true}');
+  await writeFile(configFile, `const fs=require('node:fs');module.exports=api=>{api.cache(false);fs.appendFileSync(${JSON.stringify(countFile)},'x');return {};};`);
+  const batch = [{ name: join(directory, 'source.html'), content: '<script>const flag=true;</script>', mutate: true }];
+  const sut = createInstrumenter(logger, { cacheDir: join(directory, 'cache'), engine: 'auto' });
+  const previousCwd = process.cwd();
+  try {
+    process.chdir(directory);
+    await sut.instrument(batch, options);
+    await sut.instrument(batch, options);
+  } finally { process.chdir(previousCwd); }
+  assert.equal(await readFile(countFile, 'utf8'), 'xx');
+  assert.equal(sut.stats.nativeBatches, 0);
+  assert.equal(sut.stats.fallbackBatches, 2);
+  assert.equal(sut.stats.bypasses, 2);
+  await rm(configFile);
+  let calls = 0;
+  const config = { ...options, ignorers: [{ shouldIgnore() { calls++; } }] };
+  const ignored = createInstrumenter(logger, { cacheDir: join(directory, 'cache'), engine: 'auto' });
+  await ignored.instrument(batch, config);
+  const first = calls;
+  await ignored.instrument(batch, config);
+  assert.ok(first > 0);
+  assert.equal(calls, first * 2);
+  assert.equal(ignored.stats.nativeBatches, 0);
+  assert.equal(ignored.stats.fallbackBatches, 2);
+  assert.equal(ignored.stats.bypasses, 2);
+});
 
 test('cache preserves exact files, metadata, global IDs and results on miss and hit', async (t) => {
   const { sut } = await context(t);

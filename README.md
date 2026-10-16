@@ -218,6 +218,13 @@ This slice makes no speed claim. Full Rust core replacement remains unfinished.
 
 ## Native boundary and compatibility
 
+Native `.html`/`.htm` containers support inline JS/TS in a conservative
+SWC-validated subset with lowercase tags/attributes and explicit boundaries,
+preserving outer bytes and pinned embedded locations. Ambiguous markup,
+entities/interpolation, JSX/TSX, and unsupported script grammar trigger atomic
+fallback; HTML bypasses result caching and uses native serial recovery for
+parallel requests. Vue and Svelte remain outside native support.
+
 The accepted native grammar includes ordinary JS named function declarations,
 synchronous function expressions,
 identifier parameters/bindings, identifier defaults and final identifier rest
