@@ -476,12 +476,16 @@ async fn crashed_mocha_workers_are_retried_twice_and_reaped_before_runtime_error
         "export function value(){return true;}",
         "import {value} from '../src/math.js';it('crashes for mutants',()=>{if(!value())process.exit(7);});",
     );
-    let response = execute(directory.path(), json!({"concurrency":1}))
+    // Retried workers must load Mocha's ESM test files before reaching process.exit.
+    // Allow cold imports under CI load; separate tests cover mutation timeouts.
+    let response = execute(directory.path(), json!({"concurrency":1,"timeoutMS":5000}))
         .await
         .unwrap();
     assert_eq!(response["supported"], true, "{response}");
+    let records = mutants(&response);
+    assert_eq!(records.len(), 2, "{response}");
     assert!(
-        mutants(&response)
+        records
             .iter()
             .all(|mutant| mutant["status"] == "RuntimeError"
                 && mutant["statusReason"]
@@ -492,6 +496,17 @@ async fn crashed_mocha_workers_are_retried_twice_and_reaped_before_runtime_error
         "{response}"
     );
     assert!(response["stats"]["workerRestarts"].as_u64().unwrap() >= 6);
+    assert_eq!(response["stats"]["timeouts"], 0, "{response}");
+    for pid in response["stats"]["workerPids"].as_array().unwrap() {
+        let pid = i32::try_from(pid.as_u64().unwrap()).unwrap();
+        assert!(
+            matches!(
+                nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH)
+            ),
+            "worker {pid} must be reaped"
+        );
+    }
     assert!(!directory.path().join(".stryker-tmp").exists());
 }
 

@@ -132,6 +132,7 @@ jobs:
             artifacts/native-runtime/integration-vitest/receipt.json
             artifacts/native-runtime/bun-primary/integration-*/*.log
             artifacts/native-runtime/bun-primary/integration-*/*.json
+            artifacts/native-runtime/bun-primary/integration-*/upstream-chunks/*.json
           if-no-files-found: warn
 
   bundle:

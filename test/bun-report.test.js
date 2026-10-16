@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import { join, relative, resolve } from 'node:path';
 import { EOL } from 'node:os';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
+import { observeUpstreamBunCommand } from '../scripts/bun-command-capture.js';
 import { normalizeBunDiagnostic, normalizeBunReport, reassembleUpstreamBunReport } from '../scripts/bun-report.js';
 
 const projectRoot = resolve('artifacts/bun-report-test/project');
@@ -143,9 +150,12 @@ function capturedReport() {
     future: { complete: true },
   };
   const capture = (id, exitCode, data = []) => ({
-    version: 1, command: report.config.commandRunner.command,
+    version: 2, command: report.config.commandRunner.command,
     cwd: join(projectRoot, '.stryker-tmp', 'sandbox-abc123'),
-    activeMutantVariable, activeMutantId: id, chunks: data, exit: { code: exitCode, signal: null },
+    activeMutantVariable, activeMutantId: id, chunks: data, exitChunkCount: data.length,
+    exit: { code: exitCode, signal: null }, stdioClose: { code: exitCode, signal: null }, childClose: null,
+    streams: { stdout: { ended: true, closed: true, error: null }, stderr: { ended: true, closed: true, error: null } },
+    errors: [], complete: true,
   });
   return { report, captures: [capture(null, 0), capture('0', 1, chunks), capture('1', 0)], chunks };
 }
@@ -175,6 +185,18 @@ test('Upstream chunk evidence rejects missing, duplicate, unrelated and mismatch
     ({ captures }) => { captures[1].activeMutantVariable = 'ANOTHER_VARIABLE'; },
     ({ captures }) => { captures[1].chunks[1].text = 'different assertion'; },
     ({ captures }) => { captures[1].exit.code = 0; },
+    ({ captures }) => { captures[1].stdioClose.code = 0; },
+    ({ captures }) => { captures[1].stdioClose.signal = 'SIGTERM'; },
+    ({ captures }) => { captures[1].childClose = { code: 0, signal: null }; },
+    ({ captures }) => { captures[1].exit.signal = 'SIGTERM'; },
+    ({ captures }) => { captures[1].complete = false; },
+    ({ captures }) => { captures[1].streams.stdout.ended = false; },
+    ({ captures }) => { captures[1].streams.stderr.closed = false; },
+    ({ captures }) => { captures[1].streams.stderr.error = 'truncated pipe'; },
+    ({ captures }) => { captures[1].errors.push('child error'); },
+    ({ captures }) => { captures[1].exitChunkCount = -1; },
+    ({ captures }) => { captures[1].exitChunkCount = 100; },
+    ({ captures }) => { captures[1].exitChunkCount -= 1; },
     ({ captures }) => { captures[2].activeMutantId = 'unreported'; },
     ({ report }) => { report.files.source.mutants[0].statusReason += '\n'; },
     ({ report }) => { delete report.files.source.mutants[0].statusReason; },
@@ -184,4 +206,146 @@ test('Upstream chunk evidence rejects missing, duplicate, unrelated and mismatch
     change(candidate);
     assert.throws(() => reassembleUpstreamBunReport(candidate.report, candidate.captures, { activeMutantVariable }), /upstream Bun|Upstream Bun/);
   }
+});
+
+test('Evidence survives upstream exit cleanup and recovers only that command through stream EOF/close', () => {
+  for (const late of [false, true]) {
+    const { report, captures } = capturedReport();
+    const child = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null });
+    const emitters = [child, child.stdout, child.stderr];
+    const originalEmits = emitters.map((emitter) => emitter.emit);
+    let completed;
+    const capture = observeUpstreamBunCommand(child, captures[1], (value) => { completed = value; });
+    const output = [];
+    let rawResult;
+    // The pinned runner resolves at exit and removes ALL three emitters' listeners.
+    child.on('exit', () => {
+      rawResult = output.map((chunk) => chunk.toString()).join(EOL);
+      for (const emitter of emitters) emitter.removeAllListeners();
+    });
+    for (const name of ['stdout', 'stderr']) child[name].on('data', (chunk) => output.push(chunk));
+    const before = 'Original blank lines:\n\nExpected: 5\n';
+    const after = 'Received: -1\n';
+    if (!late) {
+      child.stdout.emit('data', Buffer.from(before));
+      child.stderr.emit('data', Buffer.from(after));
+    }
+    child.exitCode = 1;
+    assert.equal(child.emit('exit', 1, null), true);
+    assert.equal(completed, undefined, 'Exit alone is not complete evidence');
+    assert.equal(rawResult, late ? '' : `${before}${EOL}${after}`);
+    assert.ok(emitters.every((emitter) => emitter.eventNames().length === 0), 'The observer must add no listeners');
+    if (late) {
+      assert.equal(child.stdout.emit('data', Buffer.from(before)), false, 'emit return values remain unchanged after cleanup');
+      child.stderr.emit('data', Buffer.from(after));
+    }
+    for (const name of ['stdout', 'stderr']) {
+      child[name].emit('end');
+      assert.equal(completed, undefined);
+      child[name].emit('close');
+    }
+    assert.equal(completed, capture);
+    assert.equal(capture.complete, true);
+    assert.equal(capture.childClose, null, 'No child close event is invented');
+    assert.equal(capture.exitChunkCount, late ? 0 : 2);
+    assert.deepEqual(emitters.map((emitter) => emitter.emit), originalEmits);
+    captures[1] = capture;
+    report.files.source.mutants[0].statusReason = rawResult;
+    const corrected = reassembleUpstreamBunReport(report, captures, { activeMutantVariable });
+    assert.equal(corrected.files.source.mutants[0].statusReason, 'Original blank lines:\n\nExpected: 5\nReceived: -1\n');
+    assert.equal(report.files.source.mutants[0].statusReason, rawResult, 'Original upstream result remains intact');
+  }
+});
+
+test('Evidence records incomplete EOF, process status and errors without accepting a correction', () => {
+  for (const failure of ['eof', 'status', 'stream-error', 'child-error']) {
+    const { report, captures } = capturedReport();
+    const child = Object.assign(new EventEmitter(), { stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: 1, signalCode: null });
+    let completed;
+    observeUpstreamBunCommand(child, captures[1], (value) => { completed = value; });
+    child.stdout.emit('data', Buffer.from('raw'));
+    child.emit('exit', 1, null);
+    if (failure === 'status') child.exitCode = 0;
+    if (failure === 'stream-error') {
+      child.stdout.on('error', () => {});
+      child.stdout.emit('error', new Error('broken stream'));
+    }
+    if (failure === 'child-error') {
+      child.on('error', () => {});
+      child.emit('error', new Error('broken child'));
+    }
+    if (failure !== 'eof') child.stdout.emit('end');
+    child.stdout.emit('close');
+    child.stderr.emit('end');
+    child.stderr.emit('close');
+    assert.equal(completed.complete, false, failure);
+    captures[1] = completed;
+    report.files.source.mutants[0].statusReason = 'raw';
+    assert.throws(() => reassembleUpstreamBunReport(report, captures, { activeMutantVariable }), /Invalid or unrelated/);
+  }
+});
+
+test('Pinned upstream runner resolves before an inherited pipe drains and its source stays unchanged', { timeout: 10000 }, async (t) => {
+  const require = createRequire(import.meta.url);
+  const source = resolve(require.resolve('@stryker-mutator/core/package.json'), '../dist/src/test-runner/command-test-runner.js');
+  const sourceHash = async () => createHash('sha256').update(await readFile(source)).digest('hex');
+  const beforeHash = await sourceHash();
+  const { CommandTestRunner } = await import(pathToFileURL(source).href);
+  const diagnostic = 'Late inherited-pipe diagnostic\nExpected: 5\nReceived: -1\n';
+  const { report, captures } = capturedReport();
+  const releasePath = join(captures[1].cwd, 'release-late-output');
+  await mkdir(captures[1].cwd, { recursive: true });
+  await rm(releasePath, { force: true });
+  let released = false;
+  const release = async () => {
+    if (!released) {
+      await writeFile(releasePath, 'release');
+      released = true;
+    }
+  };
+  t.after(release);
+  // The timeout only bounds failure cleanup; the owned file establishes order.
+  const descendant = `const { existsSync, writeSync } = require('node:fs'); const poll = setInterval(() => { if (existsSync(${JSON.stringify(releasePath)})) { clearInterval(poll); clearTimeout(bound); writeSync(2, ${JSON.stringify(diagnostic)}); } }, 5); const bound = setTimeout(() => process.exit(2), 10000);`;
+  const script = `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: ['ignore', 'inherit', 'inherit'] }).unref(); process.exit(1);`;
+  const executable = process.platform === 'win32' ? `"${process.execPath}"` : `'${process.execPath.replaceAll("'", "'\\''")}'`;
+  const command = `${executable} -e "eval(Buffer.from('${Buffer.from(script).toString('base64')}', 'base64').toString())"`;
+  report.config.commandRunner.command = command;
+  for (const capture of captures) capture.command = command;
+  const originalExec = childProcess.exec;
+  let completed;
+  let observedChild;
+  const drained = new Promise((done) => {
+    childProcess.exec = function (...args) {
+      assert.equal(args[0], command);
+      const child = Reflect.apply(originalExec, this, args);
+      observedChild = child;
+      observeUpstreamBunCommand(child, captures[1], (capture) => { completed = capture; done(); });
+      return child;
+    };
+    syncBuiltinESMExports();
+  });
+  try {
+    const runner = new CommandTestRunner(captures[1].cwd, { commandRunner: { command } });
+    const result = await runner.run({ activeMutantId: '0' });
+    assert.equal(result.tests[0].failureMessage, '');
+    assert.equal(completed, undefined, 'The upstream result is not delayed until EOF');
+    assert.ok([observedChild, observedChild.stdout, observedChild.stderr].every((emitter) => emitter.eventNames().length === 0));
+    await release();
+    await drained;
+    assert.equal(completed.complete, true);
+    assert.equal(completed.exitChunkCount, 0);
+    assert.deepEqual(completed.stdioClose, { code: 1, signal: null });
+    assert.ok(Object.values(completed.streams).every((stream) => stream.ended && stream.closed));
+    assert.equal(completed.chunks.map((chunk) => chunk.text).join(''), diagnostic);
+    captures[1] = completed;
+    report.files.source.mutants[0].statusReason = result.tests[0].failureMessage;
+    assert.equal(reassembleUpstreamBunReport(report, captures, { activeMutantVariable }).files.source.mutants[0].statusReason, diagnostic);
+  } finally {
+    childProcess.exec = originalExec;
+    syncBuiltinESMExports();
+    await release();
+    if (observedChild) await drained;
+    await rm(captures[0].cwd, { recursive: true, force: true });
+  }
+  assert.equal(await sourceHash(), beforeHash);
 });

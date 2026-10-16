@@ -19,20 +19,26 @@ function temporaryDirectory(projectRoot, tempDirName) {
   return temporary;
 }
 
-/** Undo only separators proven to have been inserted by upstream's chunk join. */
+/** Correct only proven upstream exit truncation and inserted chunk separators. */
 export function reassembleUpstreamBunReport(report, captures, { activeMutantVariable, eol = EOL }) {
   const temporary = temporaryDirectory(report.projectRoot, report.config.tempDirName);
   const byId = new Map();
   for (const capture of captures) {
-    const { activeMutantId: id } = capture;
-    if (capture.version !== 1 || capture.command !== report.config.commandRunner.command
+    const id = capture?.activeMutantId;
+    if (capture?.version !== 2 || capture.command !== report.config.commandRunner.command
       || typeof capture.cwd !== 'string' || !isAbsolute(capture.cwd)
       || !/^sandbox-[A-Za-z0-9]+$/.test(relative(temporary, capture.cwd))
       || capture.activeMutantVariable !== activeMutantVariable
       || (id !== null && typeof id !== 'string')
       || !Array.isArray(capture.chunks)
-      || capture.chunks.some((chunk) => !['stdout', 'stderr'].includes(chunk.stream) || typeof chunk.text !== 'string')
-      || !Number.isInteger(capture.exit?.code) || capture.exit.signal !== null) {
+      || capture.chunks.some((chunk) => !chunk || !['stdout', 'stderr'].includes(chunk.stream) || typeof chunk.text !== 'string')
+      || !Number.isInteger(capture.exitChunkCount) || capture.exitChunkCount < 0 || capture.exitChunkCount > capture.chunks.length
+      || !Number.isInteger(capture.exit?.code) || capture.exit.code < 0 || capture.exit.signal !== null
+      || capture.stdioClose?.code !== capture.exit.code || capture.stdioClose.signal !== null
+      || (capture.childClose !== null && (capture.childClose?.code !== capture.exit.code || capture.childClose.signal !== null))
+      || capture.complete !== true || !Array.isArray(capture.errors) || capture.errors.length !== 0
+      || !['stdout', 'stderr'].every((name) => capture.streams?.[name]?.ended === true
+        && capture.streams[name].closed === true && capture.streams[name].error === null)) {
       throw new Error('Invalid or unrelated upstream Bun chunk capture');
     }
     if (byId.has(id)) throw new Error(`Duplicate upstream Bun capture for ${id ?? 'baseline'}`);
@@ -54,7 +60,7 @@ export function reassembleUpstreamBunReport(report, captures, { activeMutantVari
           throw new Error(`Unexpected upstream Bun outcome for mutant ${mutant.id}`);
         }
         const chunks = capture.chunks.map((chunk) => chunk.text);
-        if (mutant.statusReason !== chunks.join(eol)) {
+        if (mutant.statusReason !== chunks.slice(0, capture.exitChunkCount).join(eol)) {
           throw new Error(`Upstream Bun statusReason does not match captured chunks for mutant ${mutant.id}`);
         }
         return { ...mutant, statusReason: chunks.join('') };

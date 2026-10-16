@@ -4,15 +4,37 @@
 //! occurrences, then prove their generated parameter ranges in the parsed AST.
 //! Never find arrow syntax by searching text (templates can contain the same text).
 
-use oxc_ast::ast::{ArrowFunctionBody, ArrowFunctionExpression, BindingPattern, Expression};
+use oxc_ast::ast::{
+    ArrowFunctionBody, ArrowFunctionExpression, BindingPattern, Expression, Statement,
+};
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
 
-pub(super) const UNSUPPORTED: &str = "Only concise arrows with untyped identifier parameters inside printed mutation replacements have native formatting";
+pub(super) const UNSUPPORTED: &str = "Only concise or simple block arrows with untyped identifier parameters inside printed mutation replacements have native formatting";
 const UNPROVEN: &str = "Arrow parameter spelling requires upstream replacement formatting: unproven generated arrow ranges";
 
 pub(super) fn supported(node: &ArrowFunctionExpression<'_>) -> bool {
-    !matches!(node.body, ArrowFunctionBody::FunctionBody(_))
+    let body_supported = match &node.body {
+        ArrowFunctionBody::FunctionBody(body) => {
+            !node.r#async
+                && body.directives.is_empty()
+                && body.statements.iter().all(|statement| match statement {
+                    Statement::ReturnStatement(_) | Statement::ExpressionStatement(_) => true,
+                    Statement::VariableDeclaration(declaration) => {
+                        !declaration.declare
+                            && declaration.declarations.len() == 1
+                            && declaration.declarations.iter().all(|declaration| {
+                                matches!(declaration.id, BindingPattern::BindingIdentifier(_))
+                                    && declaration.type_annotation.is_none()
+                                    && !declaration.definite
+                            })
+                    }
+                    _ => false,
+                })
+        }
+        _ => true,
+    };
+    body_supported
         && node.type_parameters.is_none()
         && node.return_type.is_none()
         && node.params.rest.is_none()
@@ -37,6 +59,7 @@ pub(super) struct Proof {
 struct Signature {
     r#async: bool,
     names: Vec<String>,
+    block: bool,
 }
 
 impl Proof {
@@ -44,6 +67,7 @@ impl Proof {
         if supported(node) {
             self.signatures.push(Signature {
                 r#async: node.r#async,
+                block: matches!(node.body, ArrowFunctionBody::FunctionBody(_)),
                 names: node
                     .params
                     .items
@@ -106,6 +130,7 @@ impl<'a> Visit<'a> for Ranges<'_> {
         if !supported(node)
             || !expected.is_some_and(|signature| {
                 signature.r#async == node.r#async
+                    && signature.block == matches!(node.body, ArrowFunctionBody::FunctionBody(_))
                     && signature.names.len() == node.params.items.len()
                     && node.params.items.iter().zip(&signature.names).all(|(param, name)| {
                         matches!(&param.pattern, BindingPattern::BindingIdentifier(id) if id.name == name.as_str())

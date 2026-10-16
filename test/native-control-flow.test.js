@@ -277,7 +277,7 @@ test('unsupported bindings, async iteration, expression targets and formatter bo
     ['for(;;){ /* ordinary comment */ break;}'], ['for(;;){note({x:1});break;}'],
     ['// Stryker disable ConditionalExpression: reason\nfor(;;)break;'],
     ['for(;;)break;\n// trailing clone comment'],
-    ['for(;;){note(0x10);break;}'], ['for(;;){note(()=>{return 1;});break;}'],
+    ['for(;;){note(0x10n);break;}'], ['for(;;){note((...args)=>{return 1;});break;}'],
     ['for(;;){const x=`first\nsecond`;break;}'],
     ['for((a,b)=value;;)break;'],
   ]) await fallback(content, options, extension);

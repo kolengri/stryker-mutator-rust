@@ -267,7 +267,7 @@ test('field keys exclude quoted strings while unproven method keys and modifiers
     'const f=function({x}=obj){return true;};','const f=function(...[args]){return true;};',
     'const f=function({x}){return true;};','const x=new C(...args);',
   ]) await fallback(source);
-  for (const source of ['abstract class C{x=true;}','declare class C{x:true;}','class C{constructor(public x:number=1<<2){}}',
+  for (const source of ['abstract class C{x=true;}','declare class C{x:true;}','class C{constructor(public x:number=1**2){}}',
     'class C{declare x:true;}','class C{abstract x:true;}','class C{method():true;}']) await fallback(source, options, 'unsupported.ts');
 });
 
@@ -334,7 +334,7 @@ test('pruned class bodies do not apply directives to later selected statements',
 
 test('unproven new nodes in cloned replacements reject whole batches', async () => {
   for (const source of [
-    'const value=(new C())+1;','const value=(function(){return 1;})+1;',
+    'const value=(new C(1))+1;','const value=(function(){return 1;})+1;',
     'const value=(class{x=true;})+1;','for(;;){const C=class{x=true;};break;}',
     'for(;;){class C{x=true;}break;}','for(;;){const f=function(){return true;};break;}',
     'for(;;){new C();break;}','for(;;){throw new C();}',

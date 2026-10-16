@@ -336,7 +336,7 @@ test('runtime enum and parameter property bindings retain reserved name validati
 
 test('unsupported parameter properties typed targets and serialized ancestors reject atomically', async () => {
   for (const source of [
-    'class C{constructor(public x:number=1<<2){record(x);}}',
+    'class C{constructor(public x:number=1**2){record(x);}}',
     'class C{constructor(public ...x:number[]){}}', 'class C{constructor(public {x}:T){}}',
     'class C{constructor(@dec public x:number){}}', 'function f(public x:number){return x;}',
     'class C{method(public x:number){return x;}}', 'const f=(public x:number)=>x;',

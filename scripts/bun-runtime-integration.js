@@ -92,6 +92,7 @@ if (!process.versions.bun) {
   const { isAbsolute, join, relative, resolve } = await import('node:path');
   const { createHash } = await import('node:crypto');
   const { INSTRUMENTER_CONSTANTS } = await import(${JSON.stringify(apiUrl)});
+  const { observeUpstreamBunCommand } = await import(${JSON.stringify(new URL('./bun-command-capture.js', import.meta.url).href)});
   const command = ${JSON.stringify(config.commandRunner.command)};
   const temporary = ${JSON.stringify(resolve(project, config.tempDirName ?? '.stryker-tmp'))};
   const directory = ${JSON.stringify(captureDirectory)};
@@ -107,25 +108,17 @@ if (!process.versions.bun) {
     if (!observed) return child;
     const environment = options.env ?? process.env;
     const variable = INSTRUMENTER_CONSTANTS.ACTIVE_MUTANT_ENV_VARIABLE;
-    const chunks = [];
-    const stdout = (chunk) => chunks.push({ stream: 'stdout', text: chunk.toString() });
-    const stderr = (chunk) => chunks.push({ stream: 'stderr', text: chunk.toString() });
-    child.stdout.on('data', stdout);
-    child.stderr.on('data', stderr);
-    // CommandTestRunner removes data listeners on exit, not close. Observe that same window.
-    child.once('exit', (code, signal) => {
-      child.stdout.off('data', stdout);
-      child.stderr.off('data', stderr);
-      writeFileSync(join(directory, process.pid + '-' + child.pid + '-' + sequence++ + '.json'), JSON.stringify({
-        version: 1, command: actualCommand, cwd,
-        activeMutantVariable: variable, activeMutantId: environment[variable] ?? null,
-        node: { executable: process.execPath, entry: process.argv[1], argvSha256: digest(process.argv) },
-        // Record environment identity without storing any unrelated environment values.
-        environmentKeysSha256: digest(Object.keys(environment).sort()),
-        spawnargs: child.spawnargs, parentPid: process.pid, pid: child.pid,
-        chunks, exit: { code, signal },
-      }), { flag: 'wx' });
-    });
+    const filename = join(directory, process.pid + '-' + child.pid + '-' + sequence++ + '.json');
+    const capture = observeUpstreamBunCommand(child, {
+      command: actualCommand, cwd,
+      activeMutantVariable: variable, activeMutantId: environment[variable] ?? null,
+      node: { executable: process.execPath, entry: process.argv[1], argvSha256: digest(process.argv) },
+      // Record environment identity without storing any unrelated environment values.
+      environmentKeysSha256: digest(Object.keys(environment).sort()),
+      spawnargs: child.spawnargs, parentPid: process.pid, pid: child.pid,
+    }, (complete) => writeFileSync(filename, JSON.stringify(complete)));
+    // A command that never reaches both stream closes leaves explicit incomplete evidence.
+    writeFileSync(filename, JSON.stringify(capture), { flag: 'wx' });
     return child;
   };
   syncBuiltinESMExports();
@@ -196,7 +189,7 @@ for (const [name, entry, native] of [
     nativeProof = JSON.parse(match[1]);
   }
 }
-assert.deepEqual(reports[1], reports[0], 'Complete Bun reports must match after only declared diagnostic formatting normalization and outer mutant sorting');
+assert.deepEqual(reports[1], reports[0], 'Complete Bun reports must match after proven upstream capture corrections, declared diagnostic formatting normalization and outer mutant sorting');
 const mutants = Object.values(reports[1].files).flatMap((file) => file.mutants);
 assert.ok(mutants.some((mutant) => mutant.status === 'Killed'));
 assert.ok(mutants.some((mutant) => mutant.status === 'Survived'));
@@ -217,13 +210,16 @@ const receipt = {
   diagnosticNormalizations: ['SGR color sequences', 'known fixture pass/fail elapsed suffixes without separator whitespace', 'Bun Ran summary elapsed suffix', 'random sandbox leaf only in owned stack and GitHub annotation paths'],
   upstreamChunkCorrection: {
     rawReasonsExactlyMatched: true,
+    completeStdioDrains: true,
     captures: upstreamCaptureSnapshot,
     commands: upstreamCaptures.length,
     correctedKilledReasons: mutants.filter((mutant) => mutant.status === 'Killed').length,
     nativeCaptureChanges: 0,
     activeMutantVariable: INSTRUMENTER_CONSTANTS.ACTIVE_MUTANT_ENV_VARIABLE,
     commandRunnerSource: { path: commandRunnerSource, sha256: commandRunnerHash, unchanged: true },
-    method: 'For every Killed reason verify chunks.join(os.EOL) exactly, then compare chunks.join(\'\') without changing any original chunk characters',
+    lateOutputCommands: upstreamCaptures.filter((capture) => capture.exitChunkCount < capture.chunks.length).map((capture) => capture.activeMutantId),
+    completion: 'Actual stdout and stderr EOF/close; child process status sampled at stdio close must equal exit status; child close event recorded when available',
+    method: 'For every Killed reason verify exit-prefix chunks.join(os.EOL) exactly, then compare complete drained chunks.join(\'\') from the same upstream command without changing original chunk characters or upstream results',
   },
   rawReportsAndStreamsRetained: true,
   mutants: mutants.length,

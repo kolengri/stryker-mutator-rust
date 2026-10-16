@@ -1,29 +1,32 @@
 //! Preserve parser-owned raw literals when printing cloned replacement ASTs.
 //!
-//! Oxc 0.154 prints decoded strings, whereas Babel retains each clone's raw
-//! spelling. Give every literal occurrence a distinct AST marker, then parse
+//! Oxc 0.154 normalizes strings and numbers, whereas Babel retains raw tokens.
+//! Give every literal occurrence a distinct AST marker, then parse
 //! the generated expression to obtain its exact output byte range. This never
 //! searches output text or identifies literals by their decoded value/source
 //! span (replacement subtrees can have overlapping, reparsed source spans).
 //! An immutable visit first compares parser-owned raw tokens with this pinned
 //! generator's literal spelling. If none differ, print the original AST directly.
-//! Concise arrows reuse that visit and the conditional output parse for their
+//! Arrows reuse that visit and the conditional output parse for their
 //! parameter ranges. Await operands use Babel's extra grouping at generated AST
 //! ranges. Existing synchronous paths gain no cloning or parsing.
 
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::{
-    ArrowFunctionExpression, AssignmentTarget, AwaitExpression, Expression, StringLiteral,
+    ArrowFunctionExpression, AssignmentTarget, AwaitExpression, Expression, NumericLiteral,
+    StaticMemberExpression, StringLiteral,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk};
-use oxc_codegen::{Codegen, Gen};
+use oxc_codegen::{Codegen, CodegenOptions, Gen, GenExpr, IndentChar};
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
 
 use super::printed_arrows;
 
 const PREFIX: &str = "__stryker_raw_string_";
-const UNPROVEN: &str = "String literal spelling requires upstream replacement formatting: unproven generated literal ranges";
+const NUMBER_MARKER: f64 = 8_000_000_000_000_000.0;
+const UNPROVEN: &str =
+    "Literal spelling requires upstream replacement formatting: unproven generated literal ranges";
 
 fn literal_spelling(node: &StringLiteral<'_>) -> String {
     let mut generator = Codegen::new();
@@ -32,9 +35,28 @@ fn literal_spelling(node: &StringLiteral<'_>) -> String {
     generator.into_source_text()
 }
 
+fn generator<'a>() -> Codegen<'a> {
+    Codegen::new().with_options(CodegenOptions {
+        indent_char: IndentChar::Space,
+        indent_width: 2,
+        ..CodegenOptions::default()
+    })
+}
+
+fn number_spelling(node: &NumericLiteral<'_>) -> String {
+    let mut generator = generator();
+    node.print_expr(
+        &mut generator,
+        oxc_syntax::precedence::Precedence::Lowest,
+        oxc_codegen::Context::empty(),
+    );
+    generator.into_source_text()
+}
+
 #[derive(Default)]
 struct NeedsProtection {
     strings: bool,
+    numbers: bool,
     awaits: usize,
     arrows: printed_arrows::Proof,
 }
@@ -57,14 +79,33 @@ impl<'a> Visit<'a> for NeedsProtection {
             self.strings = literal_spelling(node) != raw.as_str();
         }
     }
+
+    fn visit_numeric_literal(&mut self, node: &NumericLiteral<'a>) {
+        if !self.numbers
+            && let Some(raw) = &node.raw
+        {
+            self.numbers = number_spelling(node) != raw.as_str();
+        }
+    }
 }
 
 struct Protect<'a> {
     allocator: &'a Allocator,
     spellings: Vec<String>,
+    numbers: Vec<String>,
 }
 
 impl<'a> VisitMut<'a> for Protect<'a> {
+    fn visit_numeric_literal(&mut self, node: &mut NumericLiteral<'a>) {
+        let spelling = node
+            .raw
+            .as_ref()
+            .map_or_else(|| number_spelling(node), ToString::to_string);
+        node.value = NUMBER_MARKER + self.numbers.len() as f64;
+        node.raw = None;
+        self.numbers.push(spelling);
+    }
+
     fn visit_string_literal(&mut self, node: &mut StringLiteral<'a>) {
         let spelling = node
             .raw
@@ -80,6 +121,8 @@ impl<'a> VisitMut<'a> for Protect<'a> {
 
 struct Ranges {
     spans: Vec<Option<Span>>,
+    numbers: Vec<Option<Span>>,
+    number_members: Vec<(usize, Span, bool)>,
     proven: bool,
 }
 
@@ -126,6 +169,34 @@ impl<'a> Visit<'a> for AwaitGroups {
 }
 
 impl<'a> Visit<'a> for Ranges {
+    fn visit_static_member_expression(&mut self, node: &StaticMemberExpression<'a>) {
+        if let Expression::NumericLiteral(number) = &node.object {
+            let index = number.value - NUMBER_MARKER;
+            if index >= 0.0 && index.fract() == 0.0 && (index as usize) < self.numbers.len() {
+                self.number_members.push((
+                    index as usize,
+                    Span::new(number.span.end, node.property.span.start),
+                    node.optional,
+                ));
+            } else {
+                self.proven = false;
+            }
+        }
+        walk::walk_static_member_expression(self, node);
+    }
+
+    fn visit_numeric_literal(&mut self, node: &NumericLiteral<'a>) {
+        let index = node.value - NUMBER_MARKER;
+        if index >= 0.0
+            && index.fract() == 0.0
+            && let Some(slot @ None) = self.numbers.get_mut(index as usize)
+        {
+            *slot = Some(node.span);
+        } else {
+            self.proven = false;
+        }
+    }
+
     fn visit_string_literal(&mut self, node: &StringLiteral<'a>) {
         let index = node
             .value
@@ -147,11 +218,12 @@ impl<'a> Visit<'a> for Ranges {
 fn restore(
     code: String,
     spellings: Vec<String>,
+    numbers: Vec<String>,
     arrows: printed_arrows::Proof,
     awaits: usize,
 ) -> Result<String, String> {
     arrows.check()?;
-    if spellings.is_empty() && arrows.is_empty() && awaits == 0 {
+    if spellings.is_empty() && numbers.is_empty() && arrows.is_empty() && awaits == 0 {
         return Ok(code);
     }
     let allocator = Allocator::default();
@@ -160,13 +232,46 @@ fn restore(
         .map_err(|_| UNPROVEN.to_string())?;
     let mut ranges = Ranges {
         spans: vec![None; spellings.len()],
+        numbers: vec![None; numbers.len()],
+        number_members: vec![],
         proven: true,
     };
-    if !spellings.is_empty() {
+    if !spellings.is_empty() || !numbers.is_empty() {
         ranges.visit_expression(&expression);
     }
-    if !ranges.proven || ranges.spans.iter().any(Option::is_none) {
+    if !ranges.proven
+        || ranges
+            .spans
+            .iter()
+            .chain(&ranges.numbers)
+            .any(Option::is_none)
+    {
         return Err(UNPROVEN.into());
+    }
+    let mut member_edits = vec![];
+    for (index, span, optional) in ranges.number_members {
+        let punctuation = code
+            .get(span.start as usize..span.end as usize)
+            .ok_or(UNPROVEN)?;
+        if !matches!(punctuation, "." | " ." | "?.") || optional != (punctuation == "?.") {
+            return Err(UNPROVEN.into());
+        }
+        // Babel separates decimal integer tokens from a following member dot.
+        // Radix, fractional and exponent tokens already disambiguate the dot.
+        let decimal_integer = numbers[index]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'_');
+        member_edits.push((
+            span,
+            if optional {
+                "?."
+            } else if decimal_integer {
+                " ."
+            } else {
+                "."
+            }
+            .into(),
+        ));
     }
     let mut edits = ranges
         .spans
@@ -174,6 +279,14 @@ fn restore(
         .zip(spellings)
         .map(|(span, spelling)| (span.unwrap(), spelling))
         .collect::<Vec<_>>();
+    edits.extend(
+        ranges
+            .numbers
+            .into_iter()
+            .zip(numbers)
+            .map(|(span, spelling)| (span.unwrap(), spelling)),
+    );
+    edits.extend(member_edits);
     if !arrows.is_empty() {
         edits.extend(arrows.edits(&expression, &code)?);
     }
@@ -205,11 +318,12 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
     let mut needs_protection = NeedsProtection::default();
     needs_protection.visit_expression(node);
     needs_protection.arrows.check()?;
-    if !needs_protection.strings {
-        let mut generator = Codegen::new().with_source_text(source);
+    if !needs_protection.strings && !needs_protection.numbers {
+        let mut generator = generator().with_source_text(source);
         generator.print_expression(node);
         return restore(
             generator.into_source_text(),
+            vec![],
             vec![],
             needs_protection.arrows,
             needs_protection.awaits,
@@ -220,13 +334,15 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
     let mut protect = Protect {
         allocator: &allocator,
         spellings: vec![],
+        numbers: vec![],
     };
     protect.visit_expression(&mut cloned);
-    let mut generator = Codegen::new().with_source_text(source);
+    let mut generator = generator().with_source_text(source);
     generator.print_expression(&cloned);
     restore(
         generator.into_source_text(),
         protect.spellings,
+        protect.numbers,
         needs_protection.arrows,
         needs_protection.awaits,
     )
@@ -239,11 +355,12 @@ pub(super) fn assignment_target(
     let mut needs_protection = NeedsProtection::default();
     needs_protection.visit_assignment_target(node);
     needs_protection.arrows.check()?;
-    if !needs_protection.strings {
-        let mut generator = Codegen::new().with_source_text(source);
+    if !needs_protection.strings && !needs_protection.numbers {
+        let mut generator = generator().with_source_text(source);
         node.print(&mut generator, oxc_codegen::Context::empty());
         return restore(
             generator.into_source_text(),
+            vec![],
             vec![],
             needs_protection.arrows,
             needs_protection.awaits,
@@ -254,13 +371,15 @@ pub(super) fn assignment_target(
     let mut protect = Protect {
         allocator: &allocator,
         spellings: vec![],
+        numbers: vec![],
     };
     protect.visit_assignment_target(&mut cloned);
-    let mut generator = Codegen::new().with_source_text(source);
+    let mut generator = generator().with_source_text(source);
     cloned.print(&mut generator, oxc_codegen::Context::empty());
     restore(
         generator.into_source_text(),
         protect.spellings,
+        protect.numbers,
         needs_protection.arrows,
         needs_protection.awaits,
     )
@@ -270,6 +389,44 @@ pub(super) fn assignment_target(
 mod tests {
     use super::*;
     use oxc_ast::builder::AstBuilder;
+
+    #[test]
+    fn raw_numbers_and_numeric_member_punctuation_survive_protected_clones() {
+        for (source, expected) in [
+            (
+                "f(0xffffffff, 1_000, 1e2, 0x10)",
+                "f(0xffffffff, 1_000, 1e2, 0x10)",
+            ),
+            (
+                "f('raw', (1_000).toString(), (0x10).toString(), (1).x)",
+                "f('raw', 1_000 .toString(), 0x10.toString(), 1 .x)",
+            ),
+            (
+                "f(x => { const n = 1_000 + 0xff; return x + n; })",
+                "f(x => {\n  const n = 1_000 + 0xff;\n  return x + n;\n})",
+            ),
+            ("f(x => { return x; })", "f(x => {\n  return x;\n})"),
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::mjs())
+                .parse_expression()
+                .unwrap();
+            assert_eq!(expression(&node, source).unwrap(), expected, "{source}");
+        }
+        for code in ["0", "8e15 + 8e15", "8e15 + 1", "8e15.x + 8e15.x"] {
+            assert!(
+                restore(
+                    code.into(),
+                    vec![],
+                    vec!["0xff".into()],
+                    Default::default(),
+                    0
+                )
+                .is_err(),
+                "{code}"
+            );
+        }
+    }
 
     #[test]
     fn await_grouping_uses_generated_parent_ranges_without_double_parentheses() {
@@ -298,8 +455,8 @@ mod tests {
                 "{source}"
             );
         }
-        assert!(restore("await x".into(), vec![], Default::default(), 2).is_err());
-        assert!(restore("x".into(), vec![], Default::default(), 1).is_err());
+        assert!(restore("await x".into(), vec![], vec![], Default::default(), 2).is_err());
+        assert!(restore("x".into(), vec![], vec![], Default::default(), 1).is_err());
     }
 
     fn arrow_proof(source: &str) -> printed_arrows::Proof {
@@ -327,7 +484,7 @@ mod tests {
             ("é(`😀(x) => x`, (x) => x)", "é(`😀(x) => x`, x => x)"),
         ] {
             assert_eq!(
-                restore(source.into(), vec![], arrow_proof(source), 0).unwrap(),
+                restore(source.into(), vec![], vec![], arrow_proof(source), 0).unwrap(),
                 expected
             );
         }
@@ -348,13 +505,14 @@ mod tests {
             "f(`(x) => x`)",
         ] {
             assert!(
-                restore(code.into(), vec![], arrow_proof("f((x) => x)"), 0).is_err(),
+                restore(code.into(), vec![], vec![], arrow_proof("f((x) => x)"), 0).is_err(),
                 "{code}"
             );
         }
         assert!(
             restore(
                 "f((x) => x)".into(),
+                vec![],
                 vec![],
                 arrow_proof("f(async (x) => x)"),
                 0
@@ -373,7 +531,7 @@ mod tests {
             "f(<T>(x: T) => x)",
             "f((x): number => x)",
             "f((x?) => x)",
-            "f(x => { return x; })",
+            "f(x => { if (x) return x; })",
         ] {
             let allocator = Allocator::default();
             let node = Parser::new(&allocator, source, SourceType::mjs().with_typescript(true))
@@ -527,6 +685,7 @@ mod tests {
                 restore(
                     code.into(),
                     vec!["'original'".into()],
+                    vec![],
                     Default::default(),
                     0
                 ),
@@ -542,6 +701,7 @@ mod tests {
             restore(
                 code.into(),
                 vec!["'\\x61'".into(), "\"a\"".into()],
+                vec![],
                 Default::default(),
                 0
             )

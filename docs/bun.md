@@ -86,8 +86,14 @@ checks; they do not establish Bun runtime acceptance.
 
 Bun diagnostics contain elapsed times and independently named sandbox paths.
 Comparisons retain every report field, including failure reasons, with narrowly
-declared normalization of those volatile details and the pinned upstream command
-runner's extra stream-chunk newlines. Assertion values, test names and test-source
+declared normalization of those volatile details. An upstream-only evidence tap
+also corrects the pinned command runner's extra stream-chunk newlines and output
+lost when it resolves at process exit before stdio drains. Each raw failure reason
+must exactly match the captured exit prefix; the replacement comes from that same
+upstream command's complete stdout/stderr chunks, with matching process status and
+observed EOF and close on both streams. Incomplete evidence fails the comparison.
+The tap preserves upstream results, callbacks and installed source. Raw reports
+and captures remain available. Assertion values, test names and test-source
 frames remain significant. A normalized comparison is not byte-identical output.
 
 Functional fixture runs establish compatibility, not speed. Whole-run comparisons

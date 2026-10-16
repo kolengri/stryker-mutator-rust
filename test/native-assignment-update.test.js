@@ -326,8 +326,8 @@ test('unsupported targets and existing printer boundaries keep whole-batch fallb
     ['[a] = list;'], ['({x:a} = obj);'], ['([a]=list,b++);'], ['for(let [i=1] of list) foo();'], ['a += 1n;'],
     ['class C extends B{f(){super.x += 1;}}'], ['class C{#x=0;f(){this?.#x++;}}'],
     ['obj.x! += 1;','ts'], ['a += obj?.trim(...args);'], ['(obj?.x).field++;'],
-    ['obj.x += ()=>{return 1;};'], ['factory().trim().field = x=>{return x;};'], ['obj.x += {x:1};'],
-    ['obj.x += [1,2,3];'], ['obj.x += 0x10;'], ['obj.x /* comment */ += 1;'],
+    ['obj.x += (x=1)=>{return 1;};'], ['factory().trim().field = (x=1)=>{return x;};'], ['obj.x += {x:1};'],
+    ['obj.x += [1,2,3];'], ['obj.x += 0x10n;'], ['obj.x /* comment */ += 1;'],
   ]) await fallback(content,options,extension);
 });
 

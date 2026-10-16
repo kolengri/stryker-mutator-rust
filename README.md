@@ -217,20 +217,22 @@ synchronous function expressions,
 identifier parameters/bindings, identifier defaults and final identifier rest
 parameters, variable declarations, concise/block arrows,
 return/if/block/expression statements, plain imports/named exports and pure
-arithmetic, comparisons, equality, boolean, logical, unary and conditional
+arithmetic, bitwise/shift traversal, comparisons, equality, boolean, logical, unary and conditional
 expressions. Strings, untagged templates, dense array literals and plain object
 literals are supported in compatible placement and printing contexts. Mutation
 records, IDs, locations, exclusions and runtime coverage follow the pinned
-Stryker contract. Cloned replacement records preserve each string literal's
-original quotes and escape spelling, including mixed spellings of the same
-value. Physical multiline string tokens inside whole-for replacements still
+Stryker contract. Bitwise operators visit their operands without inventing arithmetic
+mutants. Cloned replacement records preserve each string literal's original quotes
+and escapes and each numeric token's radix, separators and exponent spelling. Physical multiline string tokens inside whole-for replacements still
 require fallback, as do unproven generated literal ranges.
-Printed replacement ancestors also accept synchronous concise arrows with
-untyped identifier parameters, including nested callback chains. Their
-parameter parentheses follow upstream formatting. Block bodies, async arrows,
-defaults, rest, destructuring and typed arrow signatures inside these printed
-ancestors still require fallback; ordinary arrow traversal remains supported
-outside that boundary.
+Printed replacement ancestors also accept concise arrows and synchronous simple
+block arrows with untyped identifier parameters, including nested callback chains.
+Simple blocks contain return/expression statements and single identifier variable
+declarations. Their indentation and parameter parentheses follow upstream formatting.
+Async block bodies, control-flow block bodies, defaults, rest, destructuring and
+typed arrow signatures inside these printed ancestors still require fallback.
+Nongeneric zero-argument identifier construction, including `value ?? new Logger()`,
+is supported in expression clones; other constructor clone forms remain fallback.
 Variable declarations also accept recursive object/array binding patterns with
 static keys, aliases, holes and identifier rest bindings. Their original syntax
 preserves JavaScript property access, iteration and binding semantics. Binding
@@ -277,8 +279,14 @@ arguments in original code and drop them only in the replacements reconstructed
 by upstream. Statement-call filtering preserves the pinned TS skip behavior.
 `.ts`, `.mts`, `.cts` and their declaration extensions use the same runtime
 parsing policy as the reference instrumenter. `satisfies`,
-angle-bracket assertions, typed updates/iteration targets, runtime namespaces,
+angle-bracket assertions, typed updates/iteration targets,
 TSX and unproven typed replacement printing still require fallback.
+Runtime TypeScript namespaces preserve executable exports and initialization in
+source order, including merged and nested namespaces. Their module bodies are
+statement lists without a BlockStatement removal mutant. Ambient declarations and
+type-only descendants stay opaque. Namespace statement-list comments and ordinary
+comments between unbraced branches are preserved; unproven directive ownership
+still requires fallback.
 Plain `=` targets wrapped in `as` remain opaque; compound cast assignments and
 unproven printed ancestors still require fallback.
 Non-null assertions participate in ordinary public call/member chains without

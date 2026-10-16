@@ -230,7 +230,7 @@ test('unproven parenthesized spines and prior unsupported grammar reject batches
     'obj?.trim(...args);', 'obj?.x++;', '[obj.x]=items;', 'delete obj?.x();',
     'new obj?.x();', 'obj?.x`tag`;', 'class C{#x;f(){return this?.#x;}}',
     'class C extends B{f(){return super.x?.();}}', 'const x: number=(obj?.x)!;',
-    'obj?.trim(/* comment */ arg());', 'obj?.trim(()=>{return 1;});', 'obj?.run({key:1});',
+    'obj?.trim(/* comment */ arg());', 'obj?.trim((x=1)=>{return 1;});', 'obj?.run({key:1});',
   ]) {
     const files=[file('const first=true;','first.js'),file(content,content.includes(': number')?'unsupported.ts':'unsupported.js')];
     const raw=JSON.parse(loadNative().instrumentBatch(JSON.stringify({files,options})));

@@ -279,6 +279,7 @@ struct Rule {
 // comments are preserved but do not create rules.
 struct CommentBoundaries<'s> {
     gaps: Vec<(Span, Option<u32>)>,
+    ordinary_only: Vec<Span>,
     source: &'s str,
 }
 
@@ -300,6 +301,7 @@ impl<'s> CommentBoundaries<'s> {
     ) -> Result<HashMap<u32, Vec<Directive>>, String> {
         let mut boundaries = Self {
             gaps: vec![],
+            ordinary_only: vec![],
             source,
         };
         boundaries.visit_program(program);
@@ -311,6 +313,18 @@ impl<'s> CommentBoundaries<'s> {
                 CommentKind::Line | CommentKind::SingleLineBlock | CommentKind::MultiLineBlock
             ) {
                 return Err("HTML comments require upstream instrumentation".into());
+            }
+            if boundaries
+                .ordinary_only
+                .iter()
+                .any(|gap| gap.contains_inclusive(comment.span))
+            {
+                if Directive::parse(comment.content_span().source_text(source)).is_some() {
+                    return Err(
+                        "Unbraced branch directive ownership requires upstream attachment".into(),
+                    );
+                }
+                continue;
             }
             let index = boundaries
                 .gaps
@@ -338,6 +352,45 @@ impl<'s> CommentBoundaries<'s> {
 }
 
 impl<'a> Visit<'a> for CommentBoundaries<'_> {
+    fn visit_ts_interface_declaration(&mut self, node: &TSInterfaceDeclaration<'a>) {
+        self.gaps.push((node.span, None));
+    }
+
+    fn visit_ts_type_alias_declaration(&mut self, node: &TSTypeAliasDeclaration<'a>) {
+        self.gaps.push((node.span, None));
+    }
+
+    fn visit_ts_type_annotation(&mut self, node: &TSTypeAnnotation<'a>) {
+        self.gaps.push((node.span, None));
+    }
+
+    fn visit_ts_enum_declaration(&mut self, node: &TSEnumDeclaration<'a>) {
+        self.gaps.push((node.span, None));
+    }
+
+    fn visit_ts_namespace_declaration(&mut self, node: &TSNamespaceDeclaration<'a>) {
+        if node.declare {
+            self.gaps.push((node.span, None));
+        } else {
+            walk::walk_ts_namespace_declaration(self, node);
+        }
+    }
+
+    fn visit_ts_module_block(&mut self, node: &TSModuleBlock<'a>) {
+        self.list(node.span.start + 1, node.span.end - 1, &node.body);
+        walk::walk_ts_module_block(self, node);
+    }
+
+    fn visit_if_statement(&mut self, node: &IfStatement<'a>) {
+        if let Some(alternate) = &node.alternate {
+            self.ordinary_only.push(Span::new(
+                node.consequent.span().end,
+                alternate.span().start,
+            ));
+        }
+        walk::walk_if_statement(self, node);
+    }
+
     fn visit_decorator(&mut self, node: &Decorator<'a>) {
         // Babel never enters descendants of a Decorator, so their comments
         // cannot attach mutation directives to the surrounding class body.
@@ -1492,15 +1545,22 @@ impl Emitter<'_, '_> {
         if context.printed_ancestor
             && matches!(
                 node,
-                Expression::FunctionExpression(_)
-                    | Expression::ClassExpression(_)
-                    | Expression::NewExpression(_)
+                Expression::FunctionExpression(_) | Expression::ClassExpression(_)
             )
         {
             return Err(
                 "Function, class, and new expressions inside printed mutation replacements require upstream formatting"
                     .into(),
             );
+        }
+        if context.printed_ancestor
+            && let Expression::NewExpression(new) = node
+            && (self.printed_statement
+                || new.type_arguments.is_some()
+                || !new.arguments.is_empty()
+                || !matches!(new.callee, Expression::Identifier(_)))
+        {
+            return Err("Only nongeneric zero-argument identifier construction inside printed expressions has native formatting".into());
         }
         if context.printed_ancestor
             && let Expression::ArrowFunctionExpression(arrow) = node
@@ -1843,11 +1903,7 @@ impl Emitter<'_, '_> {
             Expression::UpdateExpression(update) => {
                 edits.push((update.argument.span(), self.lvalue(&update.argument, Context { printed_ancestor: true, ..Context::default() }, pending, TargetPlacement::Update)?));
             }
-            Expression::NumericLiteral(_) => {
-                // Oxc normalizes some number spellings while Babel preserves raw
-                // literals in cloned mutations. Reject incompatible record text.
-                if self.print(node)? != self.text(node.span()) { return Err("Numeric literal spelling requires upstream replacement formatting".into()); }
-            }
+            Expression::NumericLiteral(_) => {},
             Expression::StringLiteral(string) => {
                 // The whole-statement formatter indents physical lines. Keep
                 // continuations out of that path until their ranges survive it.
@@ -1898,7 +1954,7 @@ impl Emitter<'_, '_> {
                 }
             }
             Expression::BinaryExpression(binary) => {
-                if !matches!(binary.operator, B::Addition | B::Subtraction | B::Multiplication | B::Division | B::Remainder | B::Equality | B::Inequality | B::StrictEquality | B::StrictInequality | B::LessThan | B::LessEqualThan | B::GreaterThan | B::GreaterEqualThan) { return Err("Unsupported binary operator in native grammar".into()); }
+                if !binary.operator.is_bitwise() && !matches!(binary.operator, B::Addition | B::Subtraction | B::Multiplication | B::Division | B::Remainder | B::Equality | B::Inequality | B::StrictEquality | B::StrictInequality | B::LessThan | B::LessEqualThan | B::GreaterThan | B::GreaterEqualThan) { return Err("Unsupported binary operator in native grammar".into()); }
                 let printed = context.printed_ancestor || arithmetic_replacement(binary).is_some() || binary.operator.is_equality() || binary.operator.is_compare();
                 let child_context = Context { printed_ancestor: printed, ..Context::default() };
                 edits.push((binary.left.span(), self.expression(&binary.left, child_context)?));
@@ -1942,7 +1998,13 @@ impl Emitter<'_, '_> {
                     self.skip_ts(returns.span)?;
                 }
                 match &arrow.body {
-                    ArrowFunctionBody::FunctionBody(body) => edits.push((body.span, self.body(body)?)),
+                    ArrowFunctionBody::FunctionBody(body) => {
+                        let previous = self.printed_statement;
+                        self.printed_statement |= context.printed_ancestor;
+                        let rendered = self.body(body);
+                        self.printed_statement = previous;
+                        edits.push((body.span, rendered?));
+                    },
                     _ => {
                         let body = arrow.body.as_expression().ok_or("Unsupported arrow body")?;
                         // Reset evaluation context, but keep the printer boundary:
@@ -2331,12 +2393,46 @@ impl Emitter<'_, '_> {
             Declaration::TSExternalModuleDeclaration(module) if module.declare => {
                 self.skip_ts(node.span())
             }
-            Declaration::TSNamespaceDeclaration(module) if module.declare => {
-                self.skip_ts(node.span())
-            }
+            Declaration::TSNamespaceDeclaration(module) => self.namespace(module),
             Declaration::TSGlobalDeclaration(module) if module.declare => self.skip_ts(node.span()),
             _ => Err("Unsupported exported declaration in native grammar".into()),
         }
+    }
+
+    fn namespace(&mut self, node: &TSNamespaceDeclaration<'_>) -> Result<String, String> {
+        if node.declare {
+            return self.skip_ts(node.span);
+        }
+        if node.kind == TSNamespaceDeclarationKind::Module {
+            return Err(
+                "Legacy identifier module declarations require upstream parser errors".into(),
+            );
+        }
+        if self.printed_statement {
+            return Err("Namespaces in printed replacements require upstream formatting".into());
+        }
+        let span = node.body.span();
+        let body = self.scope(span, false, |emitter| match &node.body {
+            TSNamespaceDeclarationBody::TSNamespaceDeclaration(nested) => emitter.namespace(nested),
+            TSNamespaceDeclarationBody::TSModuleBlock(block) => {
+                if !block.directives.is_empty() {
+                    return Err("Namespace directive prologues require upstream formatting".into());
+                }
+                // TSModuleBlock is a statement list, never a BlockStatement
+                // mutation site. Preserve exports and initialization order.
+                let edits = block
+                    .body
+                    .iter()
+                    .map(|statement| {
+                        emitter
+                            .statement(statement, true)
+                            .map(|output| (statement.span(), output))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(emitter.apply(block.span, edits))
+            }
+        })?;
+        Ok(self.apply(node.span, vec![(span, body)]))
     }
 
     fn for_left(&mut self, node: &ForStatementLeft<'_>) -> Result<String, String> {
@@ -2688,7 +2784,7 @@ impl Emitter<'_, '_> {
             Statement::ClassDeclaration(class) => return self.class(class),
             Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) | Statement::TSEnumDeclaration(_) => return self.skip_ts(node.span()),
             Statement::TSExternalModuleDeclaration(module) if module.declare => return self.skip_ts(node.span()),
-            Statement::TSNamespaceDeclaration(module) if module.declare => return self.skip_ts(node.span()),
+            Statement::TSNamespaceDeclaration(module) => return self.namespace(module),
             Statement::TSGlobalDeclaration(module) if module.declare => return self.skip_ts(node.span()),
             Statement::BlockStatement(block) => return self.block(block.span, &block.body),
             Statement::TryStatement(statement) => {
@@ -2883,10 +2979,10 @@ mod tests {
             "function f({x} = obj) { return x; }",
             "const x = (a?.value).next;",
             "const stryCov_9fa48 = 1;",
-            "const x = a + 0x10;",
-            "const x = a + 1_000;",
-            "const x = a + 1e2;",
-            "const x = a + (b => { return b; });",
+            "const x = a + 0x10n;",
+            "const x = a + 1_000n;",
+            "const x = a + 1e2**2;",
+            "const x = a + ((b=1) => { return b; });",
             "export { 'source' as value } from 'module';",
             "export * from 'module' with { type: 'json' };",
         ] {
@@ -3135,7 +3231,7 @@ mod tests {
             assert!(response.supported, "{source}: {:?}", response.reason);
         }
         for source in [
-            "factory().trim().field = x => { return x; };",
+            "factory().trim().field = (x=1) => { return x; };",
             "a += {key: 1};",
             "[a] = b;",
             "([a] = b, c++);",
