@@ -852,6 +852,10 @@ enum TargetPlacement {
     Iteration,
 }
 
+fn is_parameter_property(parameter: &FormalParameter<'_>) -> bool {
+    parameter.accessibility.is_some() || parameter.readonly || parameter.r#override
+}
+
 struct InvalidatedContinue<'a> {
     labels: Vec<&'a str>,
     found: bool,
@@ -1216,6 +1220,12 @@ impl Emitter<'_, '_> {
         pending: &mut Vec<Switch>,
         placement: TargetPlacement,
     ) -> Result<String, String> {
+        if matches!(target, SimpleAssignmentTarget::TSAsExpression(_)) {
+            if context.printed_ancestor || placement != TargetPlacement::Assignment {
+                return Err("Opaque as targets in updates, iteration, or printed replacements require upstream instrumentation".into());
+            }
+            return self.skip_ts(target.span());
+        }
         self.scope(target.span(), false, |emitter| {
             let start = pending.len();
             let mut edits = vec![];
@@ -1580,6 +1590,9 @@ impl Emitter<'_, '_> {
             }
             Expression::AssignmentExpression(assignment) => {
                 let target = assignment.left.as_simple_assignment_target().ok_or("Destructuring assignment targets require upstream instrumentation")?;
+                if matches!(target, SimpleAssignmentTarget::TSAsExpression(_)) && !assignment.operator.is_assign() {
+                    return Err("Compound as assignment targets require upstream replacement formatting".into());
+                }
                 let start = pending.len();
                 let mut child_context = Context { printed_ancestor: context.printed_ancestor || assignment_replacement(assignment).is_some(), ..Context::default() };
                 edits.push((target.span(), self.lvalue(target, child_context, pending, TargetPlacement::Assignment)?));
@@ -1674,7 +1687,7 @@ impl Emitter<'_, '_> {
             Expression::ArrowFunctionExpression(arrow) => {
                 if arrow.r#async { return Err("Async arrows require upstream instrumentation".into()); }
                 self.skip_signature(arrow.type_parameters.as_deref(), arrow.return_type.as_deref())?;
-                self.parameters(&arrow.params)?;
+                self.parameters(&arrow.params, false)?;
                 match &arrow.body {
                     ArrowFunctionBody::FunctionBody(body) => edits.push((body.span, self.body(body)?)),
                     _ => {
@@ -1688,14 +1701,22 @@ impl Emitter<'_, '_> {
         Ok(self.apply(node.span(), edits))
     }
 
-    fn parameters(&mut self, params: &FormalParameters<'_>) -> Result<(), String> {
+    fn parameters(
+        &mut self,
+        params: &FormalParameters<'_>,
+        constructor: bool,
+    ) -> Result<(), String> {
         if params.rest.is_some()
             || params.items.iter().any(|parameter| {
                 !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
                     || parameter.initializer.is_some()
-                    || parameter.accessibility.is_some()
-                    || parameter.readonly
-                    || parameter.r#override
+                    || (!constructor && is_parameter_property(parameter))
+                    // Pinned Babel drops standalone override when printing a
+                    // parameter property. Preserving it would add a runtime
+                    // assignment after output-only TS transformation.
+                    || (parameter.r#override
+                        && parameter.accessibility.is_none()
+                        && !parameter.readonly)
                     || !parameter.decorators.is_empty()
             })
         {
@@ -1713,6 +1734,7 @@ impl Emitter<'_, '_> {
         &mut self,
         function: &Function<'_>,
         suppress_block: bool,
+        constructor: bool,
     ) -> Result<String, String> {
         if function.r#async || function.generator || function.this_param.is_some() {
             return Err(
@@ -1723,7 +1745,7 @@ impl Emitter<'_, '_> {
         if let Some(parameters) = &function.type_parameters {
             self.skip_ts(parameters.span)?;
         }
-        self.parameters(&function.params)?;
+        self.parameters(&function.params, constructor)?;
         if let Some(returns) = &function.return_type {
             self.skip_ts(returns.span)?;
         }
@@ -1740,7 +1762,7 @@ impl Emitter<'_, '_> {
         if function.declare || function.body.is_none() {
             return self.skip_ts(function.span);
         }
-        let rendered = self.function_body(function, false)?;
+        let rendered = self.function_body(function, false, false)?;
         let body = function.body.as_ref().ok_or("Function without body")?;
         Ok(self.apply(function.span, vec![(body.span, rendered)]))
     }
@@ -1814,11 +1836,12 @@ impl Emitter<'_, '_> {
                             return Err("Decorated, computed, quoted, private, or ambient methods require upstream instrumentation".into());
                         }
                         let body = method.value.body.as_ref().ok_or("Method without body")?;
+                        let constructor = method.kind == MethodDefinitionKind::Constructor;
                         let mut super_call = DirectSuperCall::default();
-                        if initialized_public && method.kind == MethodDefinitionKind::Constructor {
+                        if constructor && (initialized_public || method.value.params.items.iter().any(is_parameter_property)) {
                             super_call.visit_function_body(body);
                         }
-                        let rendered = emitter.function_body(&method.value, super_call.found)?;
+                        let rendered = emitter.function_body(&method.value, super_call.found, constructor)?;
                         edits.push((body.span, rendered));
                     }
                     ClassElement::StaticBlock(block) => {
@@ -1943,9 +1966,9 @@ impl Emitter<'_, '_> {
             Declaration::FunctionDeclaration(function) => self.function(function),
             Declaration::ClassDeclaration(class) => self.class(class),
             Declaration::VariableDeclaration(variables) => self.variables(variables),
-            Declaration::TSTypeAliasDeclaration(_) | Declaration::TSInterfaceDeclaration(_) => {
-                self.skip_ts(node.span())
-            }
+            Declaration::TSTypeAliasDeclaration(_)
+            | Declaration::TSInterfaceDeclaration(_)
+            | Declaration::TSEnumDeclaration(_) => self.skip_ts(node.span()),
             Declaration::TSExternalModuleDeclaration(module) if module.declare => {
                 self.skip_ts(node.span())
             }
@@ -2299,7 +2322,7 @@ impl Emitter<'_, '_> {
             }
             Statement::VariableDeclaration(variables) => return self.variables(variables),
             Statement::ClassDeclaration(class) => return self.class(class),
-            Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => return self.skip_ts(node.span()),
+            Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) | Statement::TSEnumDeclaration(_) => return self.skip_ts(node.span()),
             Statement::TSExternalModuleDeclaration(module) if module.declare => return self.skip_ts(node.span()),
             Statement::TSNamespaceDeclaration(module) if module.declare => return self.skip_ts(node.span()),
             Statement::TSGlobalDeclaration(module) if module.declare => return self.skip_ts(node.span()),
