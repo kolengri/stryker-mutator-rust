@@ -227,7 +227,6 @@ const unsupported = [
   '<script lang="js">let name="world";</script>',
   '<script lang="ts">let name:string="world";</script>',
   '<script>let name="world";</script><script>let other=true;</script>',
-  '<script>let name="world";</script><div><script>let other=true;</script></div>',
   '<script>let name="world";</script><style>p{color:red}</style>',
   '<script>let name="world";</script><Component/>',
   '<script>let name="world";</script><p class="x">{name}</p>',
@@ -265,7 +264,7 @@ const unsupported = [
   '<script>function calc(){return receiver.tag`x`;}</script>',
 ];
 
-// Exact other five upstream resources remain independently unproved.
+// Exact remaining resource bytes are preserved across the native/fallback boundary.
 const retainedFixtures = {
   "svelte-multiple-script-tags.svelte": "<script context=\"module\">\n\tlet name = 'test';\n</script>\n\n<script>\n\tlet name = 'world';\n</script>\n\n<div>\n\t<script>\n\t\tlet name = 'teun'\n\t</script>\n\t<h1>\n\t\t{name}\n\t</h1>\n</div>",
   "svelte-only-template-script-tags.svelte": "<div>\n\t<script>\n\t\tlet name = 'teun'\n\t</script>\n\t<script>\n\t\tlet test = 'test'\n\t</script>\n</div>",
@@ -274,10 +273,10 @@ const retainedFixtures = {
   "svelte-ts.svelte": "<script lang=\"ts\" context=\"module\">\n    function add(a: number, b: number) {\n        return a + b;\n    }\n</script>\n\n<script lang=\"ts\">\n    import type { Athlete } from './athlete.js';\n\n    const athletes: Athlete[] = [\n      { sport: \"Athletics\", name: \"Alice\", age: 16 },\n      { sport: \"Swimming\", name: \"Bob\", age: 18 },\n      { sport: \"Tennis\", name: \"Charlie\", age: 20 },\n    ];\n  \n    let a = 0;\n    let b = 0;\n    $: count = a + b;\n</script>\n\n<main>\n   <script lang=\"ts\">\n    function subtract(a: number, b: number) {\n        return a - b;\n    }\n   </script>\n</main>\n  "
 };
 
-test('other five pinned Svelte fixtures and unsupported mixed batches retain atomic fallback and exact upstream errors', async () => {
+test('three broader pinned Svelte fixtures and unsupported mixed batches retain atomic fallback and exact upstream errors', async () => {
   assert.equal(Object.keys(retainedFixtures).length, 5);
   const ledger = [];
-  for (const [name, content] of [...Object.entries(retainedFixtures), ...unsupported.map((source, index) => [`unsupported-${index}.svelte`, source])]) {
+  for (const [name, content] of [...Object.entries(retainedFixtures).filter(([name]) => !name.includes('multiple-script-tags') && !name.includes('only-template-script-tags')), ...unsupported.map((source, index) => [`unsupported-${index}.svelte`, source])]) {
     const files = [file('const before=true;', 'before.js'), file(sample, 'positive.svelte'), file(content, name)];
     const direct = raw(files);
     assert.equal(direct.supported, false, content);

@@ -265,9 +265,9 @@ const unsupported = [
   '<script context="module">let $name="world";</script><p>{$name}</p>',
   '<script context="module">let name="world";$:name="reactive";</script>',
 ];
-test('nested scripts and compiler-rejected or unproved module boundaries retain whole-batch fallback', async () => {
+test('compiler-rejected or unproved module boundaries retain whole-batch fallback', async () => {
   const ledger = [];
-  for (const [name, content] of [...Object.entries(nestedFixtures), ...unsupported.map((source, index) => [`boundary-${index}.svelte`, source])]) {
+  for (const [name, content] of unsupported.map((source, index) => [`boundary-${index}.svelte`, source])) {
     if (name in nestedFixtures) await resource(name, content);
     let compilerError;
     try { compile(content, compilerOptions); } catch (error) { compilerError = { code: error.code, message: error.message }; }
@@ -323,7 +323,7 @@ test('nested runtime evidence distinguishes emitted HTML from JS execution and m
     const nestedIds = expected.mutants.slice(name.includes('multiple') ? 2 : 0).map(value => value.id);
     for (const id of nestedIds) assert.deepEqual(execute(output, id).rendered, rendered.rendered, 'SSR never activates nested text');
     ledger.push({ name, source, sha256: hash(source), upstream: expected, original, rendered, client, nestedScripts, nestedIds,
-      limitation: 'Document-scope VM model plus installed compiler/runtime source, not a browser receipt. Nested scripts remain unsupported; no SSR text normalization is used as parity evidence.' });
+      limitation: 'Document-scope VM model plus installed compiler/runtime source, not a browser receipt. This diagnoses the upstream helper defect, not native behavior. Native document headers are covered separately; no SSR text normalization is used as parity evidence.' });
   }
   await receipt('nested-execution-gap', ledger);
 });
@@ -340,7 +340,7 @@ test('module-first global IDs and file metadata are stable in serial four auto a
     assert.deepEqual(direct.result, baseline.result);
     const sut = createInstrumenter(logger, { cache: false, engine: 'native', instrumentationThreads: threads === 'auto' ? undefined : threads });
     for (const input of [files, []]) assert.deepEqual(plain(await sut.instrument(input, options)), raw(input).result);
-    const rejected = [...files, file(Object.values(nestedFixtures)[1], 'nested.svelte')];
+    const rejected = [...files, file('<div><script lang="ts">let name:string="nested";</script></div>', 'nested.svelte')];
     await assert.rejects(sut.instrument(rejected, options), /unsupported/i);
     assert.equal(raw(rejected, threads).result, undefined);
     assert.deepEqual(plain(await sut.instrument(files, options)), baseline.result);

@@ -38,7 +38,9 @@ fn fixture(source: &str, test: &str) -> tempfile::TempDir {
 
 fn request(cwd: &Path, overrides: Value) -> String {
     let runner = overrides["testRunner"].as_str().unwrap_or("mocha");
-    let mut options = json!({"testRunner":runner,"plugins":[format!("@stryker-mutator/{runner}-runner")],"mutate":["src/**/*.js"],"reporters":[],"coverageAnalysis":"perTest","concurrency":2,"timeoutMS":300,"timeoutFactor":2,"cleanTempDir":"always","logLevel":"off"});
+    // Semantic fixtures allow Vitest pool startup; deadline tests override this budget.
+    let timeout_ms = if runner == "vitest" { 5000 } else { 300 };
+    let mut options = json!({"testRunner":runner,"plugins":[format!("@stryker-mutator/{runner}-runner")],"mutate":["src/**/*.js"],"reporters":[],"coverageAnalysis":"perTest","concurrency":2,"timeoutMS":timeout_ms,"timeoutFactor":2,"cleanTempDir":"always","logLevel":"off"});
     if runner == "mocha" {
         options["mochaOptions"] =
             json!({"spec":["test/**/*.test.js"],"no-config":true,"no-package":true});
@@ -289,10 +291,11 @@ async fn vitest_related_selection_uses_mutation_inputs_including_files_without_m
     assert_eq!(test_files.len(), 2, "{response}");
     assert!(test_files.contains_key("test/math.test.js"));
     assert!(test_files.contains_key("test/constant.test.js"));
+    let records = mutants(&response);
+    assert_eq!(records.len(), 2, "{response}");
+    assert_eq!(response["stats"]["timeouts"], 0, "{response}");
     assert!(
-        mutants(&response)
-            .iter()
-            .all(|mutant| mutant["status"] == "Killed"),
+        records.iter().all(|mutant| mutant["status"] == "Killed"),
         "{response}"
     );
     assert!(!directory.path().join(".stryker-tmp").exists());

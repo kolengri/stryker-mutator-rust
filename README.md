@@ -235,27 +235,40 @@ grammar trigger atomic fallback. HTML and Vue bypass
 result caching and use native serial recovery for parallel requests.
 
 Native `.svelte` accepts an optional canonical `<script context="module">`
-JavaScript module script and an optional attribute-free top-level JavaScript
-instance script (at least one is required), explicitly balanced ordinary
-elements from a bounded lowercase set, static text and bare identifier
-mustaches (including Unicode). Empty scripts/static templates are supported.
-The exact Git-pinned `rsvelte_core` parser validates typed nodes and original
-byte boundaries; deferred template expressions must resolve. Scripts are
-parsed once by the existing Oxc 0.154 engine, without transferring the parser's
-Oxc 0.149 AST. Module mutations precede instance mutations regardless of source
-order. One shared header goes inside the existing module script, or a new
-module script, only when mutants are placed, including with `noHeader: true`.
-Module constants cannot be written through unresolved instance references;
-local shadowing and property writes retain their existing semantics.
-Duplicate/nested scripts, other attributes/module spellings, styles,
+JavaScript module script, an optional attribute-free top-level JavaScript
+instance script, and attribute-free plain JavaScript `<script>` elements nested
+inside explicitly balanced ordinary elements from a bounded lowercase set.
+At least one script is required. Static text and bare identifier mustaches
+(including Unicode), empty scripts and static templates are supported.
+The exact Git-pinned `rsvelte_core` parser validates typed nodes, complete
+original byte boundaries and resolved deferred template expressions. Scripts
+are parsed once by the existing Oxc 0.154 engine, without transferring the
+parser's Oxc 0.149 AST. Module mutations come first; other script mutations
+follow source order. Component scripts share one lexical header in an existing
+or new module script only when mutants are placed, including with `noHeader:
+true`. Module constants cannot be written through unresolved instance
+references; document scripts have independent scope.
+
+Nested scripts remain classic document scripts: global lexical/var bindings,
+execution order and natural redeclaration errors on repeated mounts are
+preserved. Each nested script with actual mutation placements receives the
+existing self-contained helper header and shares `globalThis.__stryker__` with
+component scripts. This specifically fixes Stryker 10.0.0's missing-helper
+browser defect: its component-module helpers are inaccessible to document
+scripts. The bounded correction adds document-visible helper functions only
+for mutated nested scripts; ordinary component scripts keep lexical helpers.
+Ignored, unselected and otherwise inert nested scripts add no helpers. SSR
+emits nested script text without executing it; document execution and hydration
+are verified separately from server rendering. The unchanged hello-world,
+module-script and two nested-script upstream fixtures are native; the three
+broader template/TypeScript resources remain fallback.
+
+Duplicate top-level scripts, script attributes/other module spellings, styles,
 components, directives, blocks, entities, broader expressions, imports/exports,
-reactive labels, stores, runes, embedded hashbangs, BOMs and recovery require atomic upstream
-fallback. The unchanged hello-world and module-script upstream fixtures are
-native; the other five pinned Svelte resources remain fallback. Nested scripts
-are HTML script text in SSR and execute in document scope on the client, where
-component-module mutation helpers are unavailable; their runtime equivalence
-is not established. Svelte bypasses result caching, observes live Babel/ignorer
-configuration, and uses serial recovery for parallel requests.
+reactive labels, stores, runes, embedded hashbangs, helper collisions, BOMs and
+recovery require atomic upstream fallback. Svelte bypasses result caching,
+observes live Babel/ignorer configuration, and uses serial recovery for parallel
+requests.
 The parser dependency has an unconditional compiler graph, duplicate Oxc
 versions and MPL-2.0 dependencies; see NOTICE. Parser qualification alone is not
 compiler or runtime proof. This adapter makes no performance claim.

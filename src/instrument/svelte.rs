@@ -22,31 +22,49 @@ pub(super) fn instrument(
     let scripts = script_ranges(&file.content)?;
     // Transform the module FIRST, independently of source order, without
     // resetting global IDs. Printing below restores original source order.
-    let child_options = Options {
-        no_header: true,
-        excluded: options.excluded.clone(),
-    };
     let mut state = ScriptState::default();
     let mut replacements = Vec::new();
+    let mut additional_scripts: Vec<_> = scripts
+        .instance
+        .iter()
+        .chain(scripts.nested.iter())
+        .collect();
+    additional_scripts.sort_unstable_by_key(|range| range.start);
     for (range, module) in scripts
         .module
         .iter()
         .map(|range| (range, true))
-        .chain(scripts.instance.iter().map(|range| (range, false)))
+        .chain(additional_scripts.into_iter().map(|range| (range, false)))
     {
-        state.module = module;
+        let nested = scripts.nested.contains(range);
+        // Document scripts cannot see component lexical helpers or constants.
+        // A separate state reuses the same parse/guards without merging scopes.
+        let mut document_state = ScriptState::default();
+        let script_state = if nested {
+            &mut document_state
+        } else {
+            &mut state
+        };
+        script_state.module = module;
+        // Classic document scripts need their own header, emitted only for
+        // actual placements. Its function declarations stay document-visible;
+        // user declarations are never wrapped or moved into component scope.
+        let script_options = Options {
+            no_header: !nested,
+            excluded: options.excluded.clone(),
+        };
         let printed = instrument_program_inner(
             file,
             &file.content[range.clone()],
             SourceType::mjs(),
             // Svelte projects ORIGINAL text into line-relative UTF-16 columns.
             Positions::new(&file.content).at(range.start as u32),
-            &child_options,
+            &script_options,
             records,
             next_id,
             None,
             true,
-            Some(&mut state),
+            Some(script_state),
         )?;
         replacements.push((range, printed));
     }
@@ -85,6 +103,7 @@ pub(super) struct ScriptState {
 struct Scripts {
     module: Option<Range<usize>>,
     instance: Option<Range<usize>>,
+    nested: Vec<Range<usize>>,
 }
 
 fn script_ranges(source: &str) -> Result<Scripts, String> {
@@ -125,9 +144,8 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
         .as_ref()
         .map(|script| prove_script(source, script, false))
         .transpose()?;
-    if module.is_none() && instance.is_none() {
-        return Err(UNSUPPORTED.into());
-    }
+    let mut nested = Vec::new();
+    let mut expressions = Vec::new();
     let mut items: Vec<_> = root
         .fragment
         .nodes
@@ -152,7 +170,7 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
             return Err(UNSUPPORTED.into());
         }
         if let Some(node) = node {
-            prove_node(source, node, 0, module.is_some() && instance.is_some())?;
+            prove_node(source, node, 0, &mut nested, &mut expressions)?;
         }
         cursor = end;
     }
@@ -162,7 +180,20 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
     {
         return Err(UNSUPPORTED.into());
     }
-    Ok(Scripts { module, instance })
+    let script_count =
+        usize::from(module.is_some()) + usize::from(instance.is_some()) + nested.len();
+    if script_count == 0
+        || expressions
+            .iter()
+            .any(|name| (0..script_count).any(|index| name == &format!("script{index}")))
+    {
+        return Err(UNSUPPORTED.into());
+    }
+    Ok(Scripts {
+        module,
+        instance,
+        nested,
+    })
 }
 
 fn prove_script(source: &str, script: &Script<'_>, module: bool) -> Result<Range<usize>, String> {
@@ -195,7 +226,8 @@ fn prove_node(
     source: &str,
     node: &TemplateNode<'_>,
     depth: usize,
-    second_script: bool,
+    nested: &mut Vec<Range<usize>>,
+    expressions: &mut Vec<String>,
 ) -> Result<(), String> {
     if depth > 128 {
         return Err(UNSUPPORTED.into());
@@ -215,10 +247,8 @@ fn prove_node(
             let start = tag.expression.start().ok_or(UNSUPPORTED)? as usize;
             let end = tag.expression.end().ok_or(UNSUPPORTED)? as usize;
             // Upstream remaps actual scriptN placeholders even inside bare
-            // identifier mustaches. This bounded adapter has at most two scripts.
-            if name == "script0"
-                || (second_script && name == "script1")
-                || forbidden_identifier(name)
+            // identifier mustaches. Validate against the final script count.
+            if forbidden_identifier(name)
                 || source.get(start..end) != Some(name)
                 || source
                     .get(tag.start as usize..start)
@@ -231,6 +261,33 @@ fn prove_node(
             {
                 return Err(UNSUPPORTED.into());
             }
+            expressions.push(name.to_owned());
+            Ok(())
+        }
+        TemplateNode::RegularElement(element) if element.name == "script" && depth > 0 => {
+            let start = element.start as usize + "<script>".len();
+            let end = (element.end as usize)
+                .checked_sub("</script>".len())
+                .ok_or(UNSUPPORTED)?;
+            if !element.attributes.is_empty()
+                || source.get(element.start as usize..start) != Some("<script>")
+                || source.get(end..element.end as usize) != Some("</script>")
+                || start > end
+            {
+                return Err(UNSUPPORTED.into());
+            }
+            // Raw-text must occupy the ENTIRE content span, with no recovered
+            // children or HTML decoding. Empty scripts have no text child.
+            match element.fragment.nodes.as_slice() {
+                [] if start == end => {}
+                [TemplateNode::Text(text)]
+                    if text.start as usize == start
+                        && text.end as usize == end
+                        && source.get(start..end) == Some(&*text.raw)
+                        && text.raw == text.data => {}
+                _ => return Err(UNSUPPORTED.into()),
+            }
+            nested.push(start..end);
             Ok(())
         }
         TemplateNode::RegularElement(element) => {
@@ -282,7 +339,7 @@ fn prove_node(
                 if start as usize != cursor || end < start {
                     return Err(UNSUPPORTED.into());
                 }
-                prove_node(source, child, depth + 1, second_script)?;
+                prove_node(source, child, depth + 1, nested, expressions)?;
                 cursor = end as usize;
             }
             if cursor != element.end as usize - close.len() {
@@ -343,6 +400,8 @@ mod tests {
         for source in [
             "<script>let name='world';</script><h1>Hello {name}</h1>",
             "<script></script>",
+            "<div><script>let name='nested';</script><script></script></div>",
+            "<script>let n=1;</script><div><script></script></div>",
             "<script context=\"module\">const name='world';</script>",
             "<script>let n=1;</script><div>{n}</div><script context=\"module\">let n=2;</script>",
             " <script>const café=1;</script>\r\n<div>😀 { café }</div> ",
@@ -369,7 +428,6 @@ mod tests {
             "<script>let n=1;</script><style></style>",
             "<script>let n=1;</script><!-- comment -->",
             "<script>let n=1;</script><script></script>",
-            "<script>let n=1;</script><div><script></script></div>",
         ] {
             assert!(script_ranges(source).is_err(), "{source}");
         }
