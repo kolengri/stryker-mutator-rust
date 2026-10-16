@@ -908,6 +908,32 @@ fn is_parameter_property(parameter: &FormalParameter<'_>) -> bool {
     parameter.accessibility.is_some() || parameter.readonly || parameter.r#override
 }
 
+// Babel's parameter expression scope rejects some assignment targets that Oxc
+// accepts. Extra grouping can change that decision, but those source-dependent
+// forms remain conservative fallback here. Nested functions/classes establish
+// their own scopes; their parameters are validated by their respective owners.
+struct ParameterAssignments<'s> {
+    source: &'s str,
+    unproven: bool,
+}
+
+impl<'a> Visit<'a> for ParameterAssignments<'_> {
+    fn visit_assignment_expression(&mut self, node: &AssignmentExpression<'a>) {
+        self.unproven |= match &node.left {
+            AssignmentTarget::TSAsExpression(_) => true,
+            AssignmentTarget::AssignmentTargetIdentifier(identifier) => {
+                self.source[node.span.start as usize..identifier.span.start as usize].contains('(')
+            }
+            _ => false,
+        };
+        walk::walk_assignment_expression(self, node);
+    }
+
+    fn visit_function(&mut self, _: &Function<'a>, _: oxc_syntax::scope::ScopeFlags) {}
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
+    fn visit_class(&mut self, _: &Class<'a>) {}
+}
+
 struct InvalidatedContinue<'a> {
     labels: Vec<&'a str>,
     found: bool,
@@ -975,20 +1001,6 @@ impl Emitter<'_, '_> {
             self.ts_skip_generation += 1;
         }
         self.scope(span, false, |emitter| Ok(emitter.text(span).into()))
-    }
-
-    fn skip_signature(
-        &mut self,
-        parameters: Option<&TSTypeParameterDeclaration<'_>>,
-        returns: Option<&TSTypeAnnotation<'_>>,
-    ) -> Result<(), String> {
-        if let Some(parameters) = parameters {
-            self.skip_ts(parameters.span)?;
-        }
-        if let Some(returns) = returns {
-            self.skip_ts(returns.span)?;
-        }
-        Ok(())
     }
 
     fn location(&self, span: Span) -> Location {
@@ -1800,8 +1812,13 @@ impl Emitter<'_, '_> {
             }
             Expression::ArrowFunctionExpression(arrow) => {
                 if arrow.r#async { return Err("Async arrows require upstream instrumentation".into()); }
-                self.skip_signature(arrow.type_parameters.as_deref(), arrow.return_type.as_deref())?;
-                self.parameters(&arrow.params, false)?;
+                if let Some(parameters) = &arrow.type_parameters {
+                    self.skip_ts(parameters.span)?;
+                }
+                edits.extend(self.parameters(&arrow.params, false)?);
+                if let Some(returns) = &arrow.return_type {
+                    self.skip_ts(returns.span)?;
+                }
                 match &arrow.body {
                     ArrowFunctionBody::FunctionBody(body) => edits.push((body.span, self.body(body)?)),
                     _ => {
@@ -1819,37 +1836,97 @@ impl Emitter<'_, '_> {
         &mut self,
         params: &FormalParameters<'_>,
         constructor: bool,
-    ) -> Result<(), String> {
-        if params.rest.is_some()
-            || params.items.iter().any(|parameter| {
-                !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
-                    || parameter.initializer.is_some()
-                    || (!constructor && is_parameter_property(parameter))
-                    // Pinned Babel drops standalone override when printing a
-                    // parameter property. Preserving it would add a runtime
-                    // assignment after output-only TS transformation.
-                    || (parameter.r#override
-                        && parameter.accessibility.is_none()
-                        && !parameter.readonly)
-                    || !parameter.decorators.is_empty()
-            })
-        {
-            return Err("Only simple identifier function parameters are supported natively".into());
+    ) -> Result<Vec<(Span, String)>, String> {
+        if params.items.iter().any(|parameter| {
+            !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_))
+                || (!constructor && is_parameter_property(parameter))
+                // Pinned Babel drops standalone override when printing a
+                // parameter property. Preserving it would add a runtime
+                // assignment after output-only TS transformation.
+                || (parameter.r#override
+                    && parameter.accessibility.is_none()
+                    && !parameter.readonly)
+                || !parameter.decorators.is_empty()
+        }) || params.rest.as_ref().is_some_and(|rest| {
+            !matches!(rest.rest.argument, BindingPattern::BindingIdentifier(_))
+                || !rest.decorators.is_empty()
+        }) {
+            return Err(
+                "Only identifier parameters, defaults, and rest are supported natively".into(),
+            );
         }
+        let mut edits = vec![];
         for parameter in &params.items {
-            if let Some(annotation) = &parameter.type_annotation {
-                self.skip_ts(annotation.span)?;
+            if let Some(initializer) = &parameter.initializer {
+                let mut assignments = ParameterAssignments {
+                    source: self.source,
+                    unproven: false,
+                };
+                assignments.visit_expression(initializer);
+                if assignments.unproven {
+                    return Err("Typed or parenthesized identifier assignment targets in defaults require upstream parameter parsing".into());
+                }
+            }
+            // Oxc combines Babel's TSParameterProperty, AssignmentPattern and
+            // typed Identifier. Enter only those actual Babel node boundaries;
+            // FormalParameters itself is not a Babel node.
+            let inner = Span::new(parameter.pattern.span().start, parameter.span.end);
+            let emit = |emitter: &mut Self| {
+                emitter.scope(inner, false, |emitter| {
+                    if let Some(annotation) = &parameter.type_annotation {
+                        let skip =
+                            |emitter: &mut Self| emitter.skip_ts(annotation.span).map(|_| ());
+                        if parameter.initializer.is_some() {
+                            // Babel's left Identifier includes its annotation;
+                            // Oxc's BindingIdentifier span contains only the name.
+                            emitter.scope(
+                                Span::new(inner.start, annotation.span.end),
+                                false,
+                                skip,
+                            )?;
+                        } else {
+                            skip(emitter)?;
+                        }
+                    }
+                    parameter
+                        .initializer
+                        .as_ref()
+                        .map(|initializer| {
+                            // AssignmentPattern does not preserve inferred names
+                            // with the variable-binding wrapper used by arrows.
+                            emitter
+                                .expression(initializer, Context::default())
+                                .map(|output| (initializer.span(), output))
+                        })
+                        .transpose()
+                })
+            };
+            let edit = if is_parameter_property(parameter) {
+                self.scope(parameter.span, false, emit)?
+            } else {
+                emit(self)?
+            };
+            if let Some(edit) = edit {
+                edits.push(edit);
             }
         }
-        Ok(())
+        if let Some(rest) = &params.rest {
+            self.scope(rest.span, false, |emitter| {
+                if let Some(annotation) = &rest.type_annotation {
+                    emitter.skip_ts(annotation.span)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(edits)
     }
 
-    fn function_body(
+    fn function_edits(
         &mut self,
         function: &Function<'_>,
         suppress_block: bool,
         constructor: bool,
-    ) -> Result<String, String> {
+    ) -> Result<Vec<(Span, String)>, String> {
         if function.r#async || function.generator || function.this_param.is_some() {
             return Err(
                 "Async, generator, or this-parameter functions require upstream instrumentation"
@@ -1859,7 +1936,7 @@ impl Emitter<'_, '_> {
         if let Some(parameters) = &function.type_parameters {
             self.skip_ts(parameters.span)?;
         }
-        self.parameters(&function.params, constructor)?;
+        let mut edits = self.parameters(&function.params, constructor)?;
         if let Some(returns) = &function.return_type {
             self.skip_ts(returns.span)?;
         }
@@ -1867,18 +1944,19 @@ impl Emitter<'_, '_> {
         if !body.directives.is_empty() {
             return Err("Function directives require upstream instrumentation".into());
         }
-        self.scope(body.span, false, |emitter| {
+        let rendered = self.scope(body.span, false, |emitter| {
             emitter.block_inner(body.span, &body.statements, !suppress_block)
-        })
+        })?;
+        edits.push((body.span, rendered));
+        Ok(edits)
     }
 
     fn function(&mut self, function: &Function<'_>) -> Result<String, String> {
         if function.declare || function.body.is_none() {
             return self.skip_ts(function.span);
         }
-        let rendered = self.function_body(function, false, false)?;
-        let body = function.body.as_ref().ok_or("Function without body")?;
-        Ok(self.apply(function.span, vec![(body.span, rendered)]))
+        let edits = self.function_edits(function, false, false)?;
+        Ok(self.apply(function.span, edits))
     }
 
     fn class(&mut self, class: &Class<'_>) -> Result<String, String> {
@@ -1955,8 +2033,7 @@ impl Emitter<'_, '_> {
                         if constructor && (initialized_public || method.value.params.items.iter().any(is_parameter_property)) {
                             super_call.visit_function_body(body);
                         }
-                        let rendered = emitter.function_body(&method.value, super_call.found, constructor)?;
-                        edits.push((body.span, rendered));
+                        edits.extend(emitter.function_edits(&method.value, super_call.found, constructor)?);
                     }
                     ClassElement::StaticBlock(block) => {
                         for statement in &block.body {
@@ -2622,7 +2699,7 @@ mod tests {
             "const o = {method(){ return 1; }};",
             "const x = a === 'string';",
             "const x = 1 /* Stryker disable all */ + 2;",
-            "function f(x = 1) { return x; }",
+            "function f({x} = obj) { return x; }",
             "const x = (a?.value).next;",
             "const stryCov_9fa48 = 1;",
             "const x = a + 0x10;",
