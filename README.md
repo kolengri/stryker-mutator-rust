@@ -91,6 +91,13 @@ Assignments and prefix/postfix updates support identifier and public-member
 targets. Getter/setter order, logical assignment and update return values follow
 JavaScript semantics. Active mutations on an update target's object spine use
 upstream fallback to preserve its existing placement errors.
+Ordinary loops, synchronous `for-in`/`for-of`, switch cases, labels,
+break/continue and sequence expressions are supported. Loop-test mutations,
+omitted-test `for` clones and switch fallthrough follow upstream placement.
+Active mutations on an iteration target's object spine, and omitted-test
+labelled loops whose mutation invalidates a labelled continue, use fallback.
+Comments attached to whole-for clones and incompatible clone formatting also
+require fallback.
 Mutation ranges select candidates using upstream UTF-16
 locations. Ordinary comments and Stryker disable/restore directives are accepted
 in unambiguous gaps between statements, including `next-line` and ignore reasons.
@@ -101,8 +108,8 @@ Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
 Private members, `super`, `new`, dynamic imports, regex,
 argument spread, array holes/spread, object methods,
-accessors/spread, complex computed keys, destructuring targets, sequences, loops, classes,
-async/generators, directive prologues and hashbangs trigger whole-batch fallback.
+accessors/spread, complex computed keys, destructuring targets, classes,
+async/generators, `for-await`, directive prologues and hashbangs trigger whole-batch fallback.
 Noncanonical number spellings and incompatible raw string/template spellings
 inside printed mutation replacements also fall back, as do objects and arrays
 with more than two elements inside those replacements. See `src/instrument.rs`
