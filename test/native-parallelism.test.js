@@ -75,6 +75,31 @@ test('native execution validation and empty/single/auto serial fast paths', () =
   execution(raw(files, 8), 2);
 });
 
+test('auto stays serial above the former byte threshold with an explicit policy reason', () => {
+  for (const count of [2, 8, 32]) {
+    const source = Array.from({ length: 2048 / count }, (_, i) => `function f${i}(a,b){return a+b;}`).join('\n');
+    const files = Array.from({ length: count }, (_, i) => file(source, `auto-${i}.js`));
+    assert.ok(files.reduce((bytes, f) => bytes + Buffer.byteLength(f.content), 0) > 32 * 1024);
+    // Source-byte count alone does not establish a beneficial crossover.
+    const response = raw(files);
+    assert.equal(response.supported, true, response.reason);
+    execution(response, count, { auto: true });
+    assert.equal(response.execution.reason, 'auto-serial-unproven-speedup');
+    assert.deepEqual(response.result, raw(files, 1).result);
+  }
+});
+
+test('zero-offset dominant first file preserves exact output and subsequent global IDs', async () => {
+  const first = file('// helper-looking text is source, not an ID slot\n' +
+    `const text='stryMutAct_9fa48("0") stryCov_9fa48("99")';\n` +
+    Array.from({ length: 128 }, (_, i) => `function f${i}(a,b){return a+b;}`).join('\n'), 'dominant.js');
+  for (const noHeader of [false, true]) {
+    const result = await pair([first, file('const later=true;', 'later.js')], { ...options, noHeader });
+    assert.ok(Number(result.actual.mutants.find(m => m.fileName === 'later.js').id) > 100);
+    assert.ok(result.actual.files[0].content.includes('stryMutAct_9fa48("0") stryCov_9fa48("99")'));
+  }
+});
+
 test('prefix sums cross 9/10 and 99/100 and include filtered and ignored IDs', async () => {
   const files = [
     file('consume(true);\n' + Array.from({ length: 60 }, (_, i) => `const a${i}=true;`).join('\n'), 'first.js'),
@@ -134,6 +159,7 @@ test('complete original AST scan forces whole-batch recovery for opaque helper i
     'declare namespace Hidden { const stryCov_9fa48:unknown; } const later=true;',
   ]) {
     await pair([file('const first=true;', 'first.js'), file(source, 'opaque.ts'), file('const last=false;', 'last.js')], options, { recovery: true });
+    await pair([file(source, 'opaque.ts'), file('const last=false;', 'last.js')], options, { recovery: true });
   }
   await pair([file('// Stryker disable BooleanLiteral:   \nconst first=true;', 'empty-reason.js'),
     file('const last=false;', 'last.js')], options, { recovery: true });

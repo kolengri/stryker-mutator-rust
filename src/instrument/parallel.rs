@@ -9,8 +9,11 @@ use std::{
 
 use super::*;
 
-// Provisional policy for auto mode. Explicit requests bypass this byte gate.
-const AUTO_MIN_BYTES: usize = 32 * 1024;
+#[cfg(test)]
+pub(super) mod diagnostic;
+
+// No beneficial automatic class has been established at the JSON boundary.
+// Keep parallel execution opt-in until a measured policy justifies enabling it.
 static PARALLEL_BATCH: AtomicBool = AtomicBool::new(false);
 
 #[derive(Default, Deserialize)]
@@ -105,7 +108,7 @@ pub(super) fn execute(
     options: &Options,
     request: Request,
 ) -> Result<(InstrumentResult, Execution), String> {
-    let available = if files.len() <= 1 || request.threads == Some(1) {
+    let available = if files.len() <= 1 || request.threads.is_none_or(|threads| threads == 1) {
         1
     } else {
         thread::available_parallelism().map_or(1, usize::from)
@@ -129,12 +132,10 @@ fn execute_with(
         Some("empty-batch")
     } else if files.len() == 1 {
         Some("single-file")
+    } else if request.threads.is_none() {
+        Some("auto-serial-unproven-speedup")
     } else if effective <= 1 {
         Some("serial")
-    } else if request.threads.is_none()
-        && files.iter().map(|file| file.content.len()).sum::<usize>() < AUTO_MIN_BYTES
-    {
-        Some("small-batch")
     } else {
         None
     };
@@ -224,6 +225,8 @@ fn execute_with(
         return serial(files, options, spawned, true, Some("unproven-relocation"));
     }
 
+    #[cfg(test)]
+    let _merge_timer = diagnostic::Timer::start(5);
     // Check the entire prefix sum before changing any record or output byte.
     let mut offsets = Vec::with_capacity(outcomes.len());
     let mut consumed = 0usize;
@@ -346,7 +349,18 @@ fn work(
             )
             .map_err(Failure::Unsupported)?;
             let slots = if proven && !faults.unproven(index) {
-                slots(&content, &file.name, &records, consumed_ids)
+                if index == 0 {
+                    // Input 0 always has global offset 0: merge preserves its
+                    // exact emitter bytes and IDs, so no output spans are used.
+                    // Retain the original helper and empty-ignore recovery
+                    // policy even though this file needs no relocation proof.
+                    (!records
+                        .iter()
+                        .any(|record| record.status_reason.as_deref() == Some("")))
+                    .then(Vec::new)
+                } else {
+                    slots(&content, &file.name, &records, consumed_ids)
+                }
             } else {
                 None
             };
@@ -464,6 +478,8 @@ fn canonical_id(value: &str, consumed: usize) -> Option<usize> {
 }
 
 fn slots(content: &str, name: &str, records: &[ApiMutant], consumed: usize) -> Option<Vec<Slot>> {
+    #[cfg(test)]
+    let parse_timer = diagnostic::Timer::start(3);
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(name).ok()?.with_module(true);
     let source_type = source_type.with_typescript(source_type.is_typescript());
@@ -474,6 +490,10 @@ fn slots(content: &str, name: &str, records: &[ApiMutant], consumed: usize) -> O
             ..ParseOptions::default()
         })
         .parse();
+    #[cfg(test)]
+    drop(parse_timer);
+    #[cfg(test)]
+    let _scan_timer = diagnostic::Timer::start(4);
     if parsed.fatal_error || !parsed.diagnostics.is_empty() {
         return None;
     }
@@ -585,6 +605,14 @@ mod tests {
             ),
             (
                 Faults {
+                    unproven_index: Some(0),
+                    ..Faults::default()
+                },
+                3,
+                "unproven-relocation",
+            ),
+            (
+                Faults {
                     unproven_index: Some(3),
                     ..Faults::default()
                 },
@@ -663,7 +691,7 @@ mod tests {
             ),
             (files(), Some(1), 8, 1, "serial"),
             (files(), Some(4), 1, 1, "serial"),
-            (files(), None, 8, 1, "small-batch"),
+            (files(), None, 8, 1, "auto-serial-unproven-speedup"),
             (files(), Some(4), 8, 1, "busy"),
         ] {
             let (_, execution) = execute_with(

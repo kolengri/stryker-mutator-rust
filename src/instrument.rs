@@ -455,6 +455,8 @@ fn instrument_file_inner(
     next_id: &mut usize,
     relocation_proven: Option<&mut bool>,
 ) -> Result<String, String> {
+    #[cfg(test)]
+    let parse_timer = parallel::diagnostic::Timer::start(0);
     if file.content.len() > u32::MAX as usize {
         return Err("Source exceeds 32-bit span limits".into());
     }
@@ -473,6 +475,10 @@ fn instrument_file_inner(
             ..ParseOptions::default()
         })
         .parse();
+    #[cfg(test)]
+    drop(parse_timer);
+    #[cfg(test)]
+    let guards_timer = parallel::diagnostic::Timer::start(1);
     if parsed.fatal_error || !parsed.diagnostics.is_empty() {
         return Err(format!("Syntax error: {:?}", parsed.diagnostics));
     }
@@ -511,6 +517,10 @@ fn instrument_file_inner(
         // attributing every helper call in completed output to the emitter.
         *proven = !parallel::has_helper_identifiers(&parsed.program);
     }
+    #[cfg(test)]
+    drop(guards_timer);
+    #[cfg(test)]
+    let _emitter_timer = parallel::diagnostic::Timer::start(2);
     let mut emitter = Emitter {
         source: &file.content,
         file_name: &file.name,
