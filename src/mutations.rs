@@ -620,7 +620,9 @@ impl<'a> Visit<'a> for MutationVisitor<'_, 'a> {
     }
 }
 
-fn method_replacement(method: &str) -> Option<Option<&'static str>> {
+// Shared upstream mapping, including reverse entries. setUTCDate deliberately
+// does not overwrite the reverse setTime -> setDate entry.
+pub(crate) fn method_replacement(method: &str) -> Option<Option<&'static str>> {
     Some(match method {
         "charAt" | "filter" | "reverse" | "slice" | "sort" | "substr" | "substring" | "trim" => {
             None

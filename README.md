@@ -82,13 +82,18 @@ arithmetic, comparisons, equality, boolean, logical, unary and conditional
 expressions. Strings, untagged templates, dense array literals and plain object
 literals are supported in compatible placement and printing contexts. Mutation
 records, IDs, locations, exclusions and runtime coverage follow the pinned
-Stryker contract. Mutation ranges select candidates using upstream UTF-16
+Stryker contract. Ordinary calls, public static/computed members, `this`, direct
+`Array(...)` mutations and nonoptional method mutations are supported. Chain
+placement preserves receivers and argument evaluation. Call-statement filtering
+can leave gaps in otherwise ordered global mutant IDs, matching upstream.
+Mutation ranges select candidates using upstream UTF-16
 locations. Ordinary comments and Stryker disable/restore directives are accepted
 in unambiguous gaps between statements, including `next-line` and ignore reasons.
 Comments inside expressions, ambiguous attachments and directives requiring
 upstream warnings still trigger whole-batch fallback.
 
-Calls, members, regex, array holes/spread, object methods,
+Optional chains/calls, private members, `super`, `new`, dynamic imports, regex,
+argument spread, array holes/spread, object methods,
 accessors/spread, complex computed keys, assignments/updates, loops, classes,
 async/generators, directive prologues and hashbangs trigger whole-batch fallback.
 Noncanonical number spellings and incompatible raw string/template spellings

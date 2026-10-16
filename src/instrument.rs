@@ -17,7 +17,7 @@ use oxc_syntax::operator::{BinaryOperator as B, LogicalOperator as L, UnaryOpera
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::mutations::Utf16Offsets;
+use crate::mutations::{Utf16Offsets, method_replacement as method_mapping};
 
 // Keep the protocol and caching behavior in sync with Stryker 10 syntax-helpers.
 // This includes truthy currentTestId selection, dynamic activeMutant checks, and
@@ -588,43 +588,6 @@ fn arithmetic_replacement(binary: &BinaryExpression<'_>) -> Option<B> {
         B::Division | B::Remainder => Some(B::Multiplication),
         _ => None,
     }
-}
-
-// Literal upstream mapping plus its generated reverse entries. setUTCDate
-// deliberately does not overwrite the reverse setTime -> setDate entry.
-fn method_mapping(name: &str) -> Option<Option<&'static str>> {
-    Some(match name {
-        "charAt" | "filter" | "reverse" | "slice" | "sort" | "substr" | "substring" | "trim" => {
-            None
-        }
-        "endsWith" => Some("startsWith"),
-        "startsWith" => Some("endsWith"),
-        "every" => Some("some"),
-        "some" => Some("every"),
-        "toLocaleLowerCase" => Some("toLocaleUpperCase"),
-        "toLocaleUpperCase" => Some("toLocaleLowerCase"),
-        "toLowerCase" => Some("toUpperCase"),
-        "toUpperCase" => Some("toLowerCase"),
-        "trimEnd" => Some("trimStart"),
-        "trimStart" => Some("trimEnd"),
-        "min" => Some("max"),
-        "max" => Some("min"),
-        "setDate" | "setUTCDate" => Some("setTime"),
-        "setTime" => Some("setDate"),
-        "setFullYear" => Some("setMonth"),
-        "setMonth" => Some("setFullYear"),
-        "setHours" => Some("setMinutes"),
-        "setMinutes" => Some("setHours"),
-        "setSeconds" => Some("setMilliseconds"),
-        "setMilliseconds" => Some("setSeconds"),
-        "setUTCFullYear" => Some("setUTCMonth"),
-        "setUTCMonth" => Some("setUTCFullYear"),
-        "setUTCHours" => Some("setUTCMinutes"),
-        "setUTCMinutes" => Some("setUTCHours"),
-        "setUTCSeconds" => Some("setUTCMilliseconds"),
-        "setUTCMilliseconds" => Some("setUTCSeconds"),
-        _ => return None,
-    })
 }
 
 fn method_target<'b, 'a>(callee: &'b Expression<'a>) -> Option<(&'b Expression<'a>, &'b str)> {
