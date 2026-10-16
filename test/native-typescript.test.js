@@ -268,7 +268,7 @@ test('deferred TS wrappers, targets and unproven printing preserve fallback and 
     'fn<{x:true}>()?.trim();', 'const x=fn<{x:true}>()+1;', 'const x=fn(()=>true) as unknown; class C {accessor x=1;}',
     'for(;;){enum E {A=1}break;}', 'namespace N {export const x=true;}', 'class C { constructor(public x:number=1<<2){} }',
     'function calc(...[args]:number[]){return true;}', 'function calc({x}:T=obj){return true;}',
-    'const {x}:T=obj;', 'const x=new Array<T>(...items);']) await fallback(source);
+    'const {x=1}:T=obj;', 'const x=new Array<T>(...items);']) await fallback(source);
   for (const source of ['const x=foo satisfies true;', 'const x=<true>foo;']) {
     const failure=await fallback(source);
     assert.ok(failure,'pinned upstream type-literal placement must throw');

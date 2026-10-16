@@ -929,6 +929,37 @@ enum TargetPlacement {
     Iteration,
 }
 
+// These variable patterns contain no mutation sites. Keep their source intact
+// so JavaScript still performs property access, iteration and binding creation.
+// Defaults and computed keys need their own upstream traversal/placement proof.
+fn inert_variable_binding(pattern: &BindingPattern<'_>) -> bool {
+    match pattern {
+        BindingPattern::BindingIdentifier(_) => true,
+        BindingPattern::ObjectPattern(object) => {
+            object.properties.iter().all(|property| {
+                !property.computed
+                    && matches!(
+                        property.key,
+                        PropertyKey::StaticIdentifier(_)
+                            | PropertyKey::StringLiteral(_)
+                            | PropertyKey::NumericLiteral(_)
+                    )
+                    && inert_variable_binding(&property.value)
+            }) && object
+                .rest
+                .as_ref()
+                .is_none_or(|rest| matches!(rest.argument, BindingPattern::BindingIdentifier(_)))
+        }
+        BindingPattern::ArrayPattern(array) => {
+            array.elements.iter().flatten().all(inert_variable_binding)
+                && array.rest.as_ref().is_none_or(|rest| {
+                    matches!(rest.argument, BindingPattern::BindingIdentifier(_))
+                })
+        }
+        BindingPattern::AssignmentPattern(_) => false,
+    }
+}
+
 fn is_parameter_property(parameter: &FormalParameter<'_>) -> bool {
     parameter.accessibility.is_some() || parameter.readonly || parameter.r#override
 }
@@ -1205,7 +1236,16 @@ impl Emitter<'_, '_> {
     fn expression(
         &mut self,
         node: &Expression<'_>,
+        context: Context<'_>,
+    ) -> Result<String, String> {
+        self.placed_expression(node, context, true)
+    }
+
+    fn placed_expression(
+        &mut self,
+        node: &Expression<'_>,
         mut context: Context<'_>,
+        parenthesized: bool,
     ) -> Result<String, String> {
         // Only call/member/non-null nodes on a callee/object spine defer placement. Keys
         // and arguments keep independent placements in the original branch.
@@ -1227,6 +1267,10 @@ impl Emitter<'_, '_> {
             .collect::<Vec<_>>()
             .join(", ");
         let mut output = format!("(stryCov_9fa48({ids}), ({original}))");
+        // At a destructuring initializer Babel leaves the conditional chain
+        // unparenthesized. V8 uses that syntax in non-iterable/null binding
+        // TypeError messages, including every nested alternative in the chain.
+        let (open, close) = if parenthesized { ("(", ")") } else { ("", "") };
         for switch in switches {
             let replacement = if switch.target == node.span() && switch.kind == chain_kind(node) {
                 switch.replacement
@@ -1234,7 +1278,7 @@ impl Emitter<'_, '_> {
                 self.replace_in_chain(node, switch.target, switch.kind, &switch.replacement)?
             };
             output = format!(
-                "(stryMutAct_9fa48(\"{}\") ? ({replacement}) : {output})",
+                "{open}stryMutAct_9fa48(\"{}\") ? ({replacement}) : {output}{close}",
                 switch.id
             );
         }
@@ -2095,8 +2139,12 @@ impl Emitter<'_, '_> {
         }
         let mut edits = vec![];
         for variable in &variables.declarations {
-            let BindingPattern::BindingIdentifier(binding) = &variable.id else {
-                return Err("Destructuring bindings require upstream instrumentation".into());
+            let binding_name = match &variable.id {
+                BindingPattern::BindingIdentifier(binding) => Some(binding.name.as_str()),
+                pattern if inert_variable_binding(pattern) => None,
+                _ => {
+                    return Err("Variable binding defaults, computed keys, and non-identifier rest require upstream instrumentation".into());
+                }
             };
             if variable.definite {
                 return Err("Definite assignment bindings require upstream instrumentation".into());
@@ -2105,15 +2153,36 @@ impl Emitter<'_, '_> {
                 self.skip_ts(annotation.span)?;
             }
             if let Some(initializer) = &variable.init {
+                if binding_name.is_none() {
+                    if matches!(initializer, Expression::ConditionalExpression(_)) {
+                        return Err("Conditional destructuring initializers require upstream diagnostic formatting".into());
+                    }
+                    let binding_end = variable
+                        .type_annotation
+                        .as_ref()
+                        .map_or(variable.id.span().end, |annotation| annotation.span.end);
+                    if self
+                        .text(Span::new(binding_end, initializer.span().start))
+                        .trim()
+                        != "="
+                        || !self
+                            .text(Span::new(initializer.span().end, variable.span.end))
+                            .trim()
+                            .is_empty()
+                    {
+                        return Err("Parenthesized or commented destructuring initializer boundaries require upstream formatting".into());
+                    }
+                }
                 edits.push((
                     initializer.span(),
                     self.scope(variable.span, false, |emitter| {
-                        emitter.expression(
+                        emitter.placed_expression(
                             initializer,
                             Context {
-                                binding_name: Some(binding.name.as_str()),
+                                binding_name,
                                 ..Context::default()
                             },
+                            binding_name.is_some(),
                         )
                     })?,
                 ));

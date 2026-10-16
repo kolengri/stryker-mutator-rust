@@ -142,7 +142,7 @@ test('unsupported literal contexts reject the complete batch atomically', async 
     'const a = { ...{} };', 'const a = { method() { return "x"; } };',
     'const a = { get value() { return "x"; } };', 'const a = { set value(x) {} };',
     'const a = { ["x" + "y"]: "value" };', 'const a = { [`x`]: "value" };',
-    'const [a] = ["x"];', 'const { a } = { a: "x" };',
+    'const [a="default"] = ["x"];', 'const { a="default" } = { a: "x" };',
     'const a = tag`x`;', 'const a = (require?.("x")).value;', 'const a = (Symbol?.("x")).value;',
     'const a = import("x");', 'const a = (Array?.()).length;', 'const a = new Array(...items);',
     'const a = ([1]?.length).value;', 'const a = ("x"?.length).value;',
