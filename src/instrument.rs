@@ -502,8 +502,13 @@ fn instrument_file_inner(
         source: &file.content,
         parameter_expression: false,
         unproven: false,
+        in_function: false,
+        module_await: false,
     };
     assignments.visit_program(&parsed.program);
+    if assignments.module_await {
+        return Err("Top-level await requires upstream module evaluation".into());
+    }
     if assignments.unproven {
         return Err("Typed or parenthesized identifier assignment targets in defaults require upstream parameter parsing".into());
     }
@@ -971,10 +976,13 @@ fn is_parameter_property(parameter: &FormalParameter<'_>) -> bool {
 // Class heritage, computed keys, and static blocks inherit the current parser
 // expression scope. Field initializers and function/arrow bodies reset it, while
 // every nested parameter list establishes its own parameter expression scope.
+// The same complete walk keeps module-level await outside the native grammar.
 struct ParameterAssignments<'s> {
     source: &'s str,
     parameter_expression: bool,
     unproven: bool,
+    in_function: bool,
+    module_await: bool,
 }
 
 impl ParameterAssignments<'_> {
@@ -1004,13 +1012,26 @@ impl<'a> Visit<'a> for ParameterAssignments<'_> {
     }
 
     fn visit_function(&mut self, node: &Function<'a>, flags: oxc_syntax::scope::ScopeFlags) {
+        let previous = self.in_function;
+        self.in_function = true;
         self.expression_scope(false, |visitor| walk::walk_function(visitor, node, flags));
+        self.in_function = previous;
     }
 
     fn visit_arrow_function_expression(&mut self, node: &ArrowFunctionExpression<'a>) {
+        let previous = self.in_function;
+        self.in_function = true;
         self.expression_scope(false, |visitor| {
             walk::walk_arrow_function_expression(visitor, node)
         });
+        self.in_function = previous;
+    }
+
+    fn visit_await_expression(&mut self, node: &AwaitExpression<'a>) {
+        // Reuse the existing complete parser-scope walk, including opaque TS
+        // nodes: admitting local await must not admit async module evaluation.
+        self.module_await |= !self.in_function;
+        walk::walk_await_expression(self, node);
     }
 
     fn visit_property_definition(&mut self, node: &PropertyDefinition<'a>) {
@@ -1892,7 +1913,6 @@ impl Emitter<'_, '_> {
                 }
             }
             Expression::ArrowFunctionExpression(arrow) => {
-                if arrow.r#async { return Err("Async arrows require upstream instrumentation".into()); }
                 if let Some(parameters) = &arrow.type_parameters {
                     self.skip_ts(parameters.span)?;
                 }
@@ -1909,6 +1929,11 @@ impl Emitter<'_, '_> {
                         edits.push((body.span(), self.expression(body, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
                     }
                 }
+            }
+            Expression::AwaitExpression(await_expression) => {
+                // Await is a placement boundary, not part of a call/member
+                // spine. Preserve the engine-owned suspension and its operand.
+                edits.push((await_expression.argument.span(), self.expression(&await_expression.argument, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
             }
             _ => return Err("Unsupported expression in native grammar (import, regex, and type syntax require upstream)".into()),
         }
@@ -2000,10 +2025,9 @@ impl Emitter<'_, '_> {
         suppress_block: bool,
         constructor: bool,
     ) -> Result<Vec<(Span, String)>, String> {
-        if function.r#async || function.generator || function.this_param.is_some() {
+        if function.generator || function.this_param.is_some() {
             return Err(
-                "Async, generator, or this-parameter functions require upstream instrumentation"
-                    .into(),
+                "Generator or this-parameter functions require upstream instrumentation".into(),
             );
         }
         if let Some(parameters) = &function.type_parameters {

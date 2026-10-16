@@ -348,7 +348,6 @@ test('coverage stays at actual try catch finally and nested function execution s
 test('unproven catches declarations comments and whole-for clones reject atomically', async () => {
   for (const source of [
     'try{}catch({message}){consume(message);}', 'try{}catch([e]){consume(e);}',
-    'function calc(){async function inner(){return true;}return inner();}',
     'function calc(){function* inner(){return true;}return inner();}',
     'function calc(){function inner(){"use strict";return true;}return inner();}',
     'export default function calc(){function inner(){return true;}return inner();}',

@@ -8,12 +8,11 @@ use oxc_ast::ast::{ArrowFunctionBody, ArrowFunctionExpression, BindingPattern, E
 use oxc_ast_visit::{Visit, walk};
 use oxc_span::Span;
 
-pub(super) const UNSUPPORTED: &str = "Only synchronous concise arrows with untyped identifier parameters inside printed mutation replacements have native formatting";
+pub(super) const UNSUPPORTED: &str = "Only concise arrows with untyped identifier parameters inside printed mutation replacements have native formatting";
 const UNPROVEN: &str = "Arrow parameter spelling requires upstream replacement formatting: unproven generated arrow ranges";
 
 pub(super) fn supported(node: &ArrowFunctionExpression<'_>) -> bool {
-    !node.r#async
-        && !matches!(node.body, ArrowFunctionBody::FunctionBody(_))
+    !matches!(node.body, ArrowFunctionBody::FunctionBody(_))
         && node.type_parameters.is_none()
         && node.return_type.is_none()
         && node.params.rest.is_none()
@@ -31,15 +30,22 @@ pub(super) fn supported(node: &ArrowFunctionExpression<'_>) -> bool {
 
 #[derive(Default)]
 pub(super) struct Proof {
-    signatures: Vec<Vec<String>>,
+    signatures: Vec<Signature>,
     unsupported: bool,
+}
+
+struct Signature {
+    r#async: bool,
+    names: Vec<String>,
 }
 
 impl Proof {
     pub(super) fn record(&mut self, node: &ArrowFunctionExpression<'_>) {
         if supported(node) {
-            self.signatures.push(
-                node.params
+            self.signatures.push(Signature {
+                r#async: node.r#async,
+                names: node
+                    .params
                     .items
                     .iter()
                     .map(|param| match &param.pattern {
@@ -47,7 +53,7 @@ impl Proof {
                         _ => unreachable!(),
                     })
                     .collect(),
-            );
+            });
         } else {
             self.unsupported = true;
         }
@@ -87,7 +93,7 @@ impl Proof {
 
 struct Ranges<'a> {
     code: &'a str,
-    expected: &'a [Vec<String>],
+    expected: &'a [Signature],
     visited: usize,
     edits: Vec<(Span, String)>,
     proven: bool,
@@ -98,9 +104,10 @@ impl<'a> Visit<'a> for Ranges<'_> {
         let expected = self.expected.get(self.visited);
         self.visited += 1;
         if !supported(node)
-            || !expected.is_some_and(|names| {
-                names.len() == node.params.items.len()
-                    && node.params.items.iter().zip(names).all(|(param, name)| {
+            || !expected.is_some_and(|signature| {
+                signature.r#async == node.r#async
+                    && signature.names.len() == node.params.items.len()
+                    && node.params.items.iter().zip(&signature.names).all(|(param, name)| {
                         matches!(&param.pattern, BindingPattern::BindingIdentifier(id) if id.name == name.as_str())
                     })
             })

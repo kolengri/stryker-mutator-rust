@@ -281,7 +281,6 @@ async function fallback(content, name = 'unsupported.js', config = options) {
 test('unproven arrow forms and prior printer boundaries fail closed for the whole batch', async () => {
   for (const [content, name = 'unsupported.js'] of [
     ['values.map(value=>{return value;}).filter(Boolean);'],
-    ['values.map(async value=>value).filter(Boolean);'],
     ['values.map((value=1)=>value).filter(Boolean);'],
     ['values.map((...value)=>value).filter(Boolean);'],
     ['values.map(({value})=>value).filter(Boolean);'],

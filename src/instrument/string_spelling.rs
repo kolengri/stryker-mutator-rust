@@ -8,10 +8,13 @@
 //! An immutable visit first compares parser-owned raw tokens with this pinned
 //! generator's literal spelling. If none differ, print the original AST directly.
 //! Concise arrows reuse that visit and the conditional output parse for their
-//! parameter ranges. Arrow-free paths gain no cloning or parsing work.
+//! parameter ranges. Await operands use Babel's extra grouping at generated AST
+//! ranges. Existing synchronous paths gain no cloning or parsing.
 
 use oxc_allocator::{Allocator, CloneIn};
-use oxc_ast::ast::{ArrowFunctionExpression, AssignmentTarget, Expression, StringLiteral};
+use oxc_ast::ast::{
+    ArrowFunctionExpression, AssignmentTarget, AwaitExpression, Expression, StringLiteral,
+};
 use oxc_ast_visit::{Visit, VisitMut, walk};
 use oxc_codegen::{Codegen, Gen};
 use oxc_parser::Parser;
@@ -32,10 +35,16 @@ fn literal_spelling(node: &StringLiteral<'_>) -> String {
 #[derive(Default)]
 struct NeedsProtection {
     strings: bool,
+    awaits: usize,
     arrows: printed_arrows::Proof,
 }
 
 impl<'a> Visit<'a> for NeedsProtection {
+    fn visit_await_expression(&mut self, node: &AwaitExpression<'a>) {
+        self.awaits += 1;
+        walk::walk_await_expression(self, node);
+    }
+
     fn visit_arrow_function_expression(&mut self, node: &ArrowFunctionExpression<'a>) {
         self.arrows.record(node);
         walk::walk_arrow_function_expression(self, node);
@@ -74,6 +83,48 @@ struct Ranges {
     proven: bool,
 }
 
+#[derive(Default)]
+struct AwaitGroups {
+    visited: usize,
+    edits: Vec<(Span, String)>,
+}
+
+impl AwaitGroups {
+    fn group(&mut self, node: &Expression<'_>) {
+        if let Expression::AwaitExpression(node) = node {
+            self.edits.push((Span::empty(node.span.start), "(".into()));
+            self.edits.push((Span::empty(node.span.end), ")".into()));
+        }
+    }
+}
+
+impl<'a> Visit<'a> for AwaitGroups {
+    fn visit_await_expression(&mut self, node: &AwaitExpression<'a>) {
+        self.visited += 1;
+        walk::walk_await_expression(self, node);
+    }
+
+    fn visit_expression(&mut self, node: &Expression<'a>) {
+        // Pinned Babel 8's YieldExpression rule also groups await in binary/
+        // logical operands, unary arguments and conditional tests. Preserved
+        // generated parentheses are distinct AST nodes, avoiding double wraps.
+        match node {
+            Expression::BinaryExpression(node) => {
+                self.group(&node.left);
+                self.group(&node.right);
+            }
+            Expression::LogicalExpression(node) => {
+                self.group(&node.left);
+                self.group(&node.right);
+            }
+            Expression::UnaryExpression(node) => self.group(&node.argument),
+            Expression::ConditionalExpression(node) => self.group(&node.test),
+            _ => {}
+        }
+        walk::walk_expression(self, node);
+    }
+}
+
 impl<'a> Visit<'a> for Ranges {
     fn visit_string_literal(&mut self, node: &StringLiteral<'a>) {
         let index = node
@@ -97,9 +148,10 @@ fn restore(
     code: String,
     spellings: Vec<String>,
     arrows: printed_arrows::Proof,
+    awaits: usize,
 ) -> Result<String, String> {
     arrows.check()?;
-    if spellings.is_empty() && arrows.is_empty() {
+    if spellings.is_empty() && arrows.is_empty() && awaits == 0 {
         return Ok(code);
     }
     let allocator = Allocator::default();
@@ -124,6 +176,14 @@ fn restore(
         .collect::<Vec<_>>();
     if !arrows.is_empty() {
         edits.extend(arrows.edits(&expression, &code)?);
+    }
+    if awaits > 0 {
+        let mut groups = AwaitGroups::default();
+        groups.visit_expression(&expression);
+        if groups.visited != awaits {
+            return Err("Await grouping requires proven generated await ranges".into());
+        }
+        edits.extend(groups.edits);
     }
     edits.sort_unstable_by_key(|(span, _)| span.start);
     let mut result = String::new();
@@ -152,6 +212,7 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
             generator.into_source_text(),
             vec![],
             needs_protection.arrows,
+            needs_protection.awaits,
         );
     }
     let allocator = Allocator::default();
@@ -167,6 +228,7 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
         generator.into_source_text(),
         protect.spellings,
         needs_protection.arrows,
+        needs_protection.awaits,
     )
 }
 
@@ -184,6 +246,7 @@ pub(super) fn assignment_target(
             generator.into_source_text(),
             vec![],
             needs_protection.arrows,
+            needs_protection.awaits,
         );
     }
     let allocator = Allocator::default();
@@ -199,6 +262,7 @@ pub(super) fn assignment_target(
         generator.into_source_text(),
         protect.spellings,
         needs_protection.arrows,
+        needs_protection.awaits,
     )
 }
 
@@ -206,6 +270,37 @@ pub(super) fn assignment_target(
 mod tests {
     use super::*;
     use oxc_ast::builder::AstBuilder;
+
+    #[test]
+    fn await_grouping_uses_generated_parent_ranges_without_double_parentheses() {
+        for (source, expected) in [
+            ("await x + await y", "(await x) + (await y)"),
+            ("await x && await y", "(await x) && (await y)"),
+            ("await x ?? await y", "(await x) ?? (await y)"),
+            ("!(await x)", "!(await x)"),
+            (
+                "await x ? await y : await z",
+                "(await x) ? await y : await z",
+            ),
+            ("await await x", "await await x"),
+            ("(await x).value", "(await x).value"),
+            ("(await x)?.value", "(await x)?.value"),
+            ("f(async (x) => await x + 1)", "f(async x => (await x) + 1)"),
+            ("f('é', await x + await y)", "f('é', (await x) + (await y))"),
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::mjs())
+                .parse_expression()
+                .unwrap();
+            assert_eq!(
+                super::expression(&node, source).unwrap(),
+                expected,
+                "{source}"
+            );
+        }
+        assert!(restore("await x".into(), vec![], Default::default(), 2).is_err());
+        assert!(restore("x".into(), vec![], Default::default(), 1).is_err());
+    }
 
     fn arrow_proof(source: &str) -> printed_arrows::Proof {
         let allocator = Allocator::default();
@@ -225,10 +320,14 @@ mod tests {
             ("f((x, y) => x + y)", "f((x, y) => x + y)"),
             ("f((x) => (y) => x + y)", "f(x => y => x + y)"),
             ("f((é) => é, (é) => é)", "f(é => é, é => é)"),
+            ("f(async (é) => await é)", "f(async é => await é)"),
+            ("f(async () => true)", "f(async () => true)"),
+            ("f(async (x, y) => x + y)", "f(async (x, y) => x + y)"),
+            ("f(async (x) => (y) => x + y)", "f(async x => y => x + y)"),
             ("é(`😀(x) => x`, (x) => x)", "é(`😀(x) => x`, x => x)"),
         ] {
             assert_eq!(
-                restore(source.into(), vec![], arrow_proof(source)).unwrap(),
+                restore(source.into(), vec![], arrow_proof(source), 0).unwrap(),
                 expected
             );
         }
@@ -249,10 +348,19 @@ mod tests {
             "f(`(x) => x`)",
         ] {
             assert!(
-                restore(code.into(), vec![], arrow_proof("f((x) => x)")).is_err(),
+                restore(code.into(), vec![], arrow_proof("f((x) => x)"), 0).is_err(),
                 "{code}"
             );
         }
+        assert!(
+            restore(
+                "f((x) => x)".into(),
+                vec![],
+                arrow_proof("f(async (x) => x)"),
+                0
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -265,7 +373,6 @@ mod tests {
             "f(<T>(x: T) => x)",
             "f((x): number => x)",
             "f((x?) => x)",
-            "f(async x => x)",
             "f(x => { return x; })",
         ] {
             let allocator = Allocator::default();
@@ -417,7 +524,12 @@ mod tests {
             "['__stryker_raw_string_0__', '__stryker_raw_string_0__']",
         ] {
             assert_eq!(
-                restore(code.into(), vec!["'original'".into()], Default::default()),
+                restore(
+                    code.into(),
+                    vec!["'original'".into()],
+                    Default::default(),
+                    0
+                ),
                 Err(UNPROVEN.into())
             );
         }
@@ -430,7 +542,8 @@ mod tests {
             restore(
                 code.into(),
                 vec!["'\\x61'".into(), "\"a\"".into()],
-                Default::default()
+                Default::default(),
+                0
             )
             .unwrap(),
             "é(`😀__stryker_raw_string_0__`, \"a\", '\\x61')"

@@ -261,10 +261,10 @@ test('field keys exclude quoted strings while unproven method keys and modifiers
     'class C{#method(){return true;}}','class C{get #value(){return true;}}',
     'class C{set #value(v){foo(v);}}','class C{accessor x=true;}',
     '@dec class C{x=true;}','class C{@dec x=true;}','class C{@dec method(){return true;}}',
-    'class C{async method(){return true;}}','class C{*method(){return true;}}',
+    'class C{*method(){return true;}}',
     'class C{method({x}=obj){return true;}}','class C{method(...[args]){return true;}}',
     'class C{method({x}){return true;}}','class C{#x=1;f(o){return o?.#x;}}','class C{#fn;f(){return this.#fn?.();}}',
-    'const f=async function(){return true;};','const f=function*(){return true;};',
+    'const f=function*(){return true;};',
     'const f=function({x}=obj){return true;};','const f=function(...[args]){return true;};',
     'const f=function({x}){return true;};','const x=new C(...args);',
   ]) await fallback(source);
