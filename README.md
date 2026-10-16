@@ -142,14 +142,18 @@ upstream warnings still trigger whole-batch fallback.
 
 TypeScript bindings, identifier parameters, optional parameters, generic
 function/arrow signatures and return annotations preserve the original source.
-Type aliases, interfaces and ambient declarations are inert. `as` expressions
+Type aliases, interfaces, enum declarations and ambient declarations are opaque
+to mutation traversal, matching upstream. Enum initializers retain their runtime
+effects and consume no mutant IDs. `as` expressions
 remain opaque, matching upstream's skipped subtree. Generic calls retain type
 arguments in original code and drop them only in the replacements reconstructed
 by upstream. Statement-call filtering preserves the pinned TS skip behavior.
 `.ts`, `.mts`, `.cts` and their declaration extensions use the same runtime
 parsing policy as the reference instrumenter. Non-null assertions, `satisfies`,
-angle-bracket assertions, typed assignment targets, runtime enums/namespaces,
+angle-bracket assertions, typed updates/iteration targets, runtime namespaces,
 TSX and unproven typed replacement printing still require fallback.
+Plain `=` targets wrapped in `as` remain opaque; compound cast assignments and
+unproven printed ancestors still require fallback.
 
 Bounded class declarations and expressions support public instance/static fields,
 private fields, ordinary identifier-keyed methods, getters/setters, constructors,
@@ -160,11 +164,20 @@ direct-super-call predicate; static blocks have no own block deletion. Ordinary
 direct `super(...)` and unmapped super property calls. Throw-new deletion preserves
 the statement-call filter and its ID gaps. Class/member directive ownership is
 accepted only in proven statement/member gaps.
+Simple constructor parameter properties support accessibility/readonly modifiers
+and proven combinations with `override`. Constructor-body deletion also follows
+upstream's parameter-property/direct-super-call predicate. A standalone `override`
+uses fallback because the pinned Babel generator drops that modifier, changing
+subsequent parameter-property transformation. Defaults, decorators and non-simple
+parameter properties remain unsupported. Rust preserves original TypeScript;
+runtime syntax such as enum and parameter properties still needs the project's
+TypeScript transformation. Runtime tests transform completed upstream/native
+instrumentation identically; they do not transpile before mutation.
 
 Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
 Private methods/accessors, optional private members, decorators, auto-accessors,
-parameter properties, computed/quoted method keys, computed fields,
+unsupported parameter-property forms, computed/quoted method keys, computed fields,
 mapped super calls, dynamic imports, regex (including literal-first `new RegExp`),
 argument spread, array holes/spread, object methods,
 accessors/spread, complex computed keys, destructuring targets,
