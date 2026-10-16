@@ -22,3 +22,18 @@ export function nonNullValue(box?: { value: { toString(): string } }): string | 
 export function total(value: number = 1 + 2, ...rest: number[]): number {
   return value + rest.length;
 }
+
+export function recover(state: { value: number; finalized: boolean }): number {
+  try {
+    return inner(state.value);
+  } catch (error: any) {
+    return error;
+  } finally {
+    state.finalized = true;
+  }
+
+  function inner(value: number): number {
+    if (value < 0) throw value;
+    return value + 1;
+  }
+}

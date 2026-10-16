@@ -135,6 +135,14 @@ Active mutations on an iteration target's object spine, and omitted-test
 labelled loops whose mutation invalidates a labelled continue, use fallback.
 Comments attached to whole-for clones and incompatible clone formatting also
 require fallback.
+Synchronous `try`/`catch`/`finally` preserves catch lexical bindings and completion
+through the original constructs. Catch bindings can be absent or identifiers;
+supported TS annotations retain their actual skipped-node filter behavior.
+Ordinary nested synchronous declarations are accepted in statement lists without
+conversion or a new hoisting pass. Upstream's strict/sloppy behavior and possible
+duplicate-declaration compilation errors are preserved. Destructured catches,
+unbraced/labelled declarations and unproven whole-for serialization still use
+fallback.
 Mutation ranges select candidates using upstream UTF-16
 locations. Ordinary comments and Stryker disable/restore directives are accepted
 in unambiguous gaps between statements, including `next-line` and ignore reasons.

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { add, positive, startup, removeOptional, nonNullValue, total } from '../src/calculator.ts';
+import { add, positive, startup, removeOptional, nonNullValue, total, recover } from '../src/calculator.ts';
 
 describe('typed calculator', () => {
   it('adds values', () => assert.equal(add(2, 3), 5));
@@ -24,5 +24,12 @@ describe('typed calculator', () => {
     assert.equal(total(undefined, 5, 6), 5);
     assert.equal(total(10, 20), 11);
     assert.equal(total(0), 0);
+  });
+  it('calls a nested declaration before its source position and always finalizes', () => {
+    for (const [value, expected] of [[2, 3], [-2, -2]]) {
+      const state = { value, finalized: false };
+      assert.equal(recover(state), expected);
+      assert.equal(state.finalized, true);
+    }
   });
 });
