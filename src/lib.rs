@@ -9,10 +9,20 @@ mod runtime;
 /// Own a complete supported mutation run on a background libuv task.
 #[napi(js_name = "runNativeMutationTest", strict)]
 pub fn run_native_mutation_test(
+    env: napi::Env,
     input_json: String,
     cancellation_id: Option<String>,
-) -> napi::Result<napi::bindgen_prelude::AsyncTask<runtime::NativeRunTask>> {
-    runtime::task(input_json, cancellation_id)
+) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'static, String>> {
+    runtime::start(env, input_json, cancellation_id)
+}
+
+/// Discover configuration in Rust before asking the original caller to import.
+#[napi(js_name = "prepareNativeMutationTest", strict)]
+pub fn prepare_native_mutation_test(
+    input_json: String,
+    cancellation_id: Option<String>,
+) -> napi::Result<runtime::NativePreparation> {
+    runtime::NativePreparation::begin(input_json, cancellation_id)
 }
 
 /// Signal cancellation; the run Promise settles only after Rust cleanup.

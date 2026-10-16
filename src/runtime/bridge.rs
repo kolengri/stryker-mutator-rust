@@ -155,7 +155,11 @@ impl BridgeSession {
             BridgeError::Process("Cannot generate compatibility worker authentication token".into())
         })?;
         let token: String = entropy.iter().map(|byte| format!("{byte:02x}")).collect();
+        let context = super::preparation::caller_environment(&cancellation);
         let mut command = Command::new(spec.node_executable);
+        if let Some(context) = &context {
+            context.apply(&mut command);
+        }
         command
             .arg(spec.bridge_module)
             .current_dir(spec.cwd)
@@ -165,7 +169,10 @@ impl BridgeSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if std::env::var_os("STRYKER_MUTATOR_WORKER").is_none() {
+        if context.as_ref().map_or_else(
+            || std::env::var_os("STRYKER_MUTATOR_WORKER").is_none(),
+            |context| !context.has_worker,
+        ) {
             command.env("STRYKER_MUTATOR_WORKER", super::worker_id());
         }
         let (mut child, group) = Group::spawn(&mut command, "compatibility worker")

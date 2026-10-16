@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import { runNativeMutationTest } from '../lib/runtime.js';
@@ -161,3 +163,191 @@ setInterval(() => {}, 1000);
     assert.equal(await readFile(sentinel, 'utf8'), 'dependency target must survive');
   });
 }
+
+
+// These guards run in fresh real processes: this test file's module cache must
+// not hide an SDK import from the native JSON command boundary.
+const lazyRoot = fileURLToPath(new URL('../', import.meta.url));
+const lazyArtifacts = join(lazyRoot, 'artifacts/caller-config-handshake/lazy-json');
+const lazyRequire = createRequire(import.meta.url);
+
+async function lazyProcess(t, name, args, options) {
+  const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'], ...options });
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+  let output = '';
+  child.stdout.on('data', data => output += data);
+  child.stderr.on('data', data => output += data);
+  const exit = await new Promise((resolve, reject) => {
+    child.on('error', reject);
+    child.on('close', (code, signal) => resolve({ code, signal }));
+  });
+  await writeFile(join(lazyArtifacts, `${name}.log`), output);
+  return { exit, output };
+}
+
+test('native JSON command CLI, public wrapper and readiness keep upstream core/API/util outside the graph', { timeout: 60000 }, async (t) => {
+  await mkdir(lazyArtifacts, { recursive: true });
+  const cwd = await mkdtemp(join(lazyArtifacts, 'json-project-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await cp(join(lazyRoot, 'fixtures/native-command'), cwd, { recursive: true });
+  const source = await readFile(join(cwd, 'src/calculator.js'), 'utf8');
+  const guard = join(lazyArtifacts, 'forbid-json-sdk.mjs');
+  const helperURL = new URL('../lib/config-compat.js', import.meta.url).href;
+  await writeFile(guard, `import { registerHooks } from 'node:module';
+const packages = ['@stryker-mutator/core', '@stryker-mutator/api', '@stryker-mutator/util'];
+registerHooks({ resolve(specifier, context, nextResolve) {
+  if (packages.some(name => specifier === name || specifier.startsWith(name + '/'))) {
+    throw new Error('Unnecessary native JSON dependency: ' + specifier);
+  }
+  const result = nextResolve(specifier, context);
+  const url = decodeURIComponent(result.url).replaceAll('\\\\', '/');
+  if (result.url === ${JSON.stringify(helperURL)} || packages.some(name => url.includes('/' + name + '/'))) {
+    throw new Error('Unnecessary native JSON dependency URL: ' + result.url);
+  }
+  return result;
+} });
+`);
+  const guarded = {
+    ...process.env,
+    STRYKER_RUST_COORDINATOR_ENGINE: 'native', STRYKER_RUST_DIAGNOSTICS: '1',
+    // Inherited by baseline/mutant Node children as well as the caller.
+    NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(guard).href}`.trim(),
+  };
+  const negative = await lazyProcess(t, 'guard-negative-control', ['--input-type=module', '-e', "await import('@stryker-mutator/api/core')"], { cwd, env: guarded });
+  assert.notEqual(negative.exit.code, 0);
+  assert.match(negative.output, /Unnecessary native JSON dependency/);
+  const ready = await lazyProcess(t, 'guarded-readiness', [join(lazyRoot, 'bin/stryker-rust.js'), '--rust-info'], { cwd, env: guarded });
+  assert.deepEqual(ready.exit, { code: 0, signal: null }, ready.output);
+  assert.equal(JSON.parse(ready.output).nativeCoordinator, true);
+
+  const publicEntry = join(lazyArtifacts, 'public-json.mjs');
+  await writeFile(publicEntry, `import assert from 'node:assert/strict';
+import { runNativeMutationTest } from ${JSON.stringify(new URL('../lib/runtime.js', import.meta.url).href)};
+const result = await runNativeMutationTest();
+assert.equal(result.supported, true, result.reason);
+assert.equal(result.stats.coordinator, 'rust');
+assert.equal(result.stats.compatibilityCalls, 0);
+console.log(JSON.stringify(result.stats));
+`);
+  const upstream = join(dirname(lazyRequire.resolve('@stryker-mutator/core/package.json')), 'bin/stryker.js');
+  const canonical = report => ({ ...report, files: Object.fromEntries(Object.entries(report.files).map(([name, file]) => [name, {
+    ...file, mutants: [...file.mutants].sort((a, b) => a.id.localeCompare(b.id)),
+  }])) });
+  const reports = [];
+  for (const [name, entry, env] of [
+    ['json-upstream', upstream, { ...process.env, STRYKER_RUST_COORDINATOR_ENGINE: 'upstream' }],
+    ['json-native-cli', join(lazyRoot, 'bin/stryker-rust.js'), guarded],
+    ['json-native-public', publicEntry, guarded],
+  ]) {
+    await rm(join(cwd, 'reports'), { recursive: true, force: true });
+    const result = await lazyProcess(t, name, [entry, 'run'], { cwd, env });
+    assert.deepEqual(result.exit, { code: 0, signal: null }, result.output);
+    const report = JSON.parse(await readFile(join(cwd, 'reports/mutation.json'), 'utf8'));
+    await writeFile(join(lazyArtifacts, `${name}.json`), JSON.stringify(report, null, 2));
+    reports.push(canonical(report));
+    assert.equal(await readFile(join(cwd, 'src/calculator.js'), 'utf8'), source);
+    if (name !== 'json-upstream') assert.match(result.output, /"coordinator":"rust"/);
+  }
+  assert.deepEqual(reports[1], reports[0]);
+  assert.deepEqual(reports[2], reports[0]);
+  const mutants = Object.values(reports[0].files).flatMap(file => file.mutants);
+  assert.ok(mutants.some(mutant => mutant.status === 'Killed'));
+  assert.ok(mutants.some(mutant => mutant.status === 'Survived'));
+  await writeFile(join(lazyArtifacts, 'json-graph-receipt.json'), JSON.stringify({ reportsEqual: true, guardedCLI: true, guardedPublicWrapper: true, guardedReadiness: true, descendantsGuarded: true, negativeControlRejected: true, mutants: mutants.length, sourcePreserved: true, timingClaim: 'None' }, null, 2));
+});
+
+test('abort during a real helper dependency import retains ownership and skips user config after settlement', { timeout: 15000 }, async (t) => {
+  await mkdir(lazyArtifacts, { recursive: true });
+  const cwd = await mkdtemp(join(lazyArtifacts, 'helper-abort-'));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const options = {
+    testRunner: 'command', plugins: [], appendPlugins: [], checkers: [], coverageAnalysis: 'off',
+    commandRunner: { command: `${quote(process.execPath)} -e ""` },
+    mutate: [], allowEmpty: true, reporters: [], cleanTempDir: 'always', logLevel: 'off',
+  };
+  await writeFile(join(cwd, 'package.json'), '{"type":"module"}');
+  await writeFile(join(cwd, 'stryker.config.json'), JSON.stringify(options));
+  await writeFile(join(cwd, 'user.mjs'), `globalThis.lazyUserConfigEvaluated = true; export default ${JSON.stringify(options)};`);
+  const gate = join(lazyArtifacts, 'helper-dependency-gate.mjs');
+  await writeFile(gate, `globalThis.lazyHelperDependencyPending = true;
+await new Promise(resolve => { globalThis.releaseLazyHelperDependency = resolve; });
+`);
+  const caller = join(lazyArtifacts, 'helper-abort-caller.mjs');
+  await writeFile(caller, `import assert from 'node:assert/strict';
+import { registerHooks } from 'node:module';
+// Evaluate the real pinned SDK source under its original URL and cache identity.
+// Append only a test TLA dependency; no source/exports are replaced by a mock.
+const hook = registerHooks({ load(url, context, nextLoad) {
+  const actual = nextLoad(url, context);
+  if (!decodeURIComponent(url).endsWith('/@stryker-mutator/api/dist/src/core/stryker-options-schema.js')) return actual;
+  const source = typeof actual.source === 'string' ? actual.source : Buffer.from(actual.source).toString('utf8');
+  return { ...actual, source: source + '\\nawait import(' + ${JSON.stringify(JSON.stringify(pathToFileURL(gate).href))} + ');' };
+} });
+const { runNativeMutationTest } = await import(${JSON.stringify(new URL('../lib/runtime.js', import.meta.url).href)});
+const controller = new AbortController();
+const reason = new Error('cancel while helper dependencies load');
+let settled = false;
+const pending = runNativeMutationTest({ args: ['user.mjs'] }, { signal: controller.signal })
+  .then(value => ({ value }), error => ({ error })).finally(() => { settled = true; });
+try {
+  while (!globalThis.lazyHelperDependencyPending) {
+    assert.equal(settled, false, 'Executable preparation must request its helper dependency');
+    await new Promise(setImmediate);
+  }
+  controller.abort(reason);
+  await assert.rejects(runNativeMutationTest(), /exclusive native run ownership/);
+  await new Promise(setImmediate);
+  assert.equal(settled, false, 'Import cancellation must not release ownership before helper settlement');
+  assert.equal(globalThis.lazyUserConfigEvaluated, undefined);
+} finally { globalThis.releaseLazyHelperDependency?.(); }
+assert.equal((await pending).error, reason);
+assert.equal(globalThis.lazyUserConfigEvaluated, undefined, 'Abort after helper dependency import must skip user config');
+hook.deregister();
+const recovered = await runNativeMutationTest();
+assert.equal(recovered.supported, true, recovered.reason);
+assert.equal(recovered.stats.coordinator, 'rust');
+console.log(JSON.stringify({ helperImportAwaited: true, ownershipHeldUntilSettlement: true, userConfigSkipped: true, cancellationReasonPreserved: true, jsonRecovered: true }));
+`);
+  const result = await lazyProcess(t, 'helper-import-abort', [caller], { cwd });
+  assert.deepEqual(result.exit, { code: 0, signal: null }, result.output);
+  assert.match(result.output, /"userConfigSkipped":true/);
+});
+
+test('concurrent JSON worker runs capture distinct caller env copies and preserve main environment', { timeout: 15000 }, async (t) => {
+  const { Worker } = await import('node:worker_threads');
+  const previous = process.env.CCE_JSON_MAIN;
+  process.env.CCE_JSON_MAIN = 'main-only';
+  t.after(() => { if (previous === undefined) delete process.env.CCE_JSON_MAIN; else process.env.CCE_JSON_MAIN = previous; });
+  const workers = [];
+  for (const id of ['json-a', 'json-b']) {
+    const cwd = await project(t, `
+import assert from 'node:assert/strict';
+import {spawnSync} from 'node:child_process';
+assert.equal(process.env.CCE_JSON_VALUE, ${JSON.stringify(id)});
+assert.equal(process.env.CCE_JSON_MAIN, undefined);
+const child = spawnSync(process.execPath, ['-e', ${JSON.stringify(`if(process.env.CCE_JSON_VALUE!==${JSON.stringify(id)}||'CCE_JSON_MAIN' in process.env) process.exit(4);`)}]);
+assert.equal(child.status, 0);
+await new Promise(resolve => setTimeout(resolve, 50));
+`);
+    const worker = new Worker(`
+const {parentPort,workerData} = require('node:worker_threads');
+process.env.CCE_JSON_VALUE=workerData.id; delete process.env.CCE_JSON_MAIN;
+import(workerData.url).then(async ({runNativeMutationTest})=>{
+  parentPort.postMessage({ready:true});
+  await new Promise(resolve=>parentPort.once('message',resolve));
+  try {parentPort.postMessage({result:await runNativeMutationTest({cwd:workerData.cwd})});}
+  catch(error) {parentPort.postMessage({error:error.stack});}
+});`, { eval: true, workerData: { id, cwd, url: new URL('../lib/runtime.js', import.meta.url).href } });
+    t.after(() => worker.terminate());
+    const [ready] = await once(worker, 'message'); assert.equal(ready.ready, true);
+    workers.push(worker);
+  }
+  const pending = workers.map(worker => once(worker, 'message'));
+  for (const worker of workers) worker.postMessage('run');
+  for (const [message] of await Promise.all(pending)) {
+    assert.equal(message.error, undefined);
+    assert.equal(message.result.supported, true, message.result.reason);
+    assert.equal(message.result.stats.commandStarts, 1);
+  }
+  assert.equal(process.env.CCE_JSON_MAIN, 'main-only');
+});

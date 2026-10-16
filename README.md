@@ -15,7 +15,8 @@ worker lifecycle and test execution.
 
 An experimental native coordinator is being added separately from that legacy
 runner. `STRYKER_RUST_COORDINATOR_ENGINE=native stryker-rust run` selects it without
-an upstream coordinator fallback. Its current scope is JSON configuration,
+an upstream coordinator fallback. Its current scope includes JSON and
+[data-shaped caller-executed JS/MJS/CJS configuration](docs/native-caller-config.md),
 the built-in command runner with coverage off, or Mocha through the pinned
 `@stryker-mutator/mocha-runner` plugin. Checker plugins are not yet supported;
 reporters are limited to JSON or none. Rust owns file selection, instrumentation,

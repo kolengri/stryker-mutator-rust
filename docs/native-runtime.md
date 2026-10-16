@@ -6,7 +6,7 @@ It must not delegate scheduling to `Stryker.runMutationTest`, `Pool`, or upstrea
 process executors. The existing runner remains a migration oracle until the native
 runtime has equivalent coverage; it is not evidence of a native coordinator.
 
-Rust owns configuration discovery and ordinary JSON configuration, file selection,
+Rust owns configuration discovery, option merge/defaults/validation, file selection,
 instrumentation, sandbox files, caches, coverage indexing, test planning, bounded
 process scheduling, deadlines, retries, cancellation, incremental selection, and
 report assembly. Existing native instrumentation/coverage/planning modules are reused.
@@ -21,13 +21,22 @@ same complete useful work. Performance modes with additional assumptions must sa
 
 ## Addon entry
 
-The existing precompiled Node-API distribution is retained. A single asynchronous
-`runNativeMutationTest(requestJson, cancellationId?)` call owns a complete run in Rust; Node's event
-loop is not blocked. This avoids introducing a second native distribution format.
+The existing precompiled Node-API distribution is retained. The public wrapper
+uses an opaque, single-use `NativePreparation`: Rust discovers configuration
+synchronously, the original caller imports executable files when requested, and
+Rust performs option merge, defaults and validation before background execution.
+The adapter applies ordered Rust-authored effects to retained caller records.
+JSON preparation does not load the executable compatibility SDK graph.
+The direct addon `runNativeMutationTest(requestJson, cancellationId?)` remains
+available for JSON-only callers. No second native distribution format is introduced.
+See the [bounded caller configuration contract](native-caller-config.md) for
+import, identity, error, concurrency and cancellation semantics.
 
 The public `stryker-mutator-rust/native` entry accepts `{cwd, args, overrides}` and
 an optional second `{signal}` argument. It supplies the Node executable and adapter
-path. `cancelNativeRun(cancellationId)` signals Rust; the original promise settles
+path and snapshots the actual caller environment after compatibility effects.
+Rust applies that per-run context to command and compatibility-worker spawns.
+`cancelNativeRun(cancellationId)` signals Rust; the original promise settles
 only after cleanup. Pre-aborted signals create no native work.
 Confirmed cancellation uses the native `Cancelled` error code; the public wrapper
 then rejects with the signal's reason. Cleanup failures retain their own errors.
@@ -53,8 +62,10 @@ The first request shape is:
 `args` are the arguments after `run`; Rust interprets them. `overrides` are the
 programmatic Stryker options and take precedence over the configuration file.
 The Node fields are needed only for JavaScript compatibility operations.
-Unsupported features in an implementation slice must be identified before run
-side effects. No native proof may contain a hidden upstream coordinator fallback.
+Unsupported execution features must be identified before commands, sandboxes or
+report writes. Required caller-config import, merge and validation effects follow
+the pinned contract even when a later preflight rejects execution. No native proof
+may contain a hidden upstream coordinator fallback.
 
 A successful response contains `version: 1`, `supported: true`, `exitCode`,
 `mutants`, a full report when requested, and `stats.coordinator: "rust"`.
@@ -65,14 +76,15 @@ Operational errors after starting a run are errors, not unsupported preflight.
 All started children must be reaped and owned sandbox files cleaned according to
 the configured cleanup policy on completion, failure, timeout, and cancellation.
 
-The current vertical slice supports ordinary JSON configuration, the built-in
-`command` runner with coverage off, and the pinned Mocha plugin with SDK coverage
+The current vertical slice supports JSON and a bounded plain-data executable
+configuration handshake, the built-in `command` runner with coverage off, and
+the pinned Mocha plugin with SDK coverage
 collection. Rust discovers and instruments selected files, preprocesses its
 supported JSONC tsconfig subset, creates isolated persistent worker sandboxes,
 runs baseline and mutants, indexes coverage, plans tests and assembles the full
 JSON report. Mocha itself executes in Node through its actual SDK plugin.
-Checker plugins, executable configuration and other reporters are not yet wired
-into this coordinator. Unsupported syntax and options are rejected explicitly;
+Checker plugins, arbitrary executable object graphs and other reporters are not
+yet wired into this coordinator. Unsupported syntax and options are rejected explicitly;
 the existing legacy entry remains available independently.
 
 ### Windows candidate boundary

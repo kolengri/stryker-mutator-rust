@@ -1,0 +1,52 @@
+[
+  {
+    "base": "C:",
+    "joined": "C:\\index.html",
+    "bare": true
+  },
+  {
+    "base": "c:",
+    "joined": "c:\\index.html",
+    "bare": true
+  },
+  {
+    "base": "Z:",
+    "joined": "Z:\\index.html",
+    "bare": true
+  },
+  {
+    "base": "C:\\logs\\..\\reports",
+    "joined": "C:\\reports\\index.html",
+    "bare": false
+  },
+  {
+    "base": "c:/logs/./reports/",
+    "joined": "c:\\logs\\reports\\index.html",
+    "bare": false
+  },
+  {
+    "base": "\\logs\\..\\reports",
+    "joined": "\\reports\\index.html",
+    "bare": false
+  },
+  {
+    "base": "logs/../reports",
+    "joined": "reports\\index.html",
+    "bare": false
+  },
+  {
+    "base": "..\\reports",
+    "joined": "..\\reports\\index.html",
+    "bare": false
+  },
+  {
+    "base": ".",
+    "joined": "index.html",
+    "bare": false
+  },
+  {
+    "base": "",
+    "joined": "index.html",
+    "bare": false
+  }
+]

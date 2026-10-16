@@ -1,14 +1,14 @@
-//! Rust-owned command mutation coordinator. JavaScript only calls this async task.
+//! Rust-owned mutation coordinator with a caller-only executable config handshake.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     sync::{
-        Mutex, OnceLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-use napi::{Env, Task, bindgen_prelude::AsyncTask};
+use napi::{Env, Task, bindgen_prelude::PromiseRaw};
 use serde_json::{Value, json};
 use tokio::{sync::watch, task::JoinSet};
 
@@ -19,79 +19,82 @@ mod config;
 mod mocha;
 #[cfg(all(test, unix))]
 mod mocha_tests;
+mod preparation;
 mod process;
+pub use preparation::NativePreparation;
 mod project;
 mod report;
 #[cfg(all(test, unix))]
 mod tests;
 
-type Registry = Mutex<HashMap<String, watch::Sender<bool>>>;
-static CANCELLATIONS: OnceLock<Registry> = OnceLock::new();
 static WORKER_IDS: AtomicU64 = AtomicU64::new(0);
 
 fn worker_id() -> String {
     WORKER_IDS.fetch_add(1, Ordering::Relaxed).to_string()
 }
 
-pub struct NativeRunTask {
-    input: String,
-    cancellation: watch::Sender<bool>,
-    cancellation_id: Option<String>,
+enum NativeInput {
+    Raw(String),
+    Prepared(Result<Box<config::Config>, String>),
 }
 
-pub(crate) fn task(
+pub struct NativeRunTask {
+    input: Option<NativeInput>,
+    cancellation: watch::Sender<bool>,
+    // Held through compute, cleanup and promise completion, including teardown.
+    _ownership: Option<Arc<preparation::Ownership>>,
+}
+
+#[cfg(all(test, unix))]
+fn task(input: String, cancellation_id: Option<String>) -> napi::Result<NativeRunTask> {
+    let ownership = preparation::Ownership::acquire(false, cancellation_id)?;
+    Ok(new_task(NativeInput::Raw(input), Some(ownership)))
+}
+
+pub(crate) fn start(
+    env: Env,
     input: String,
     cancellation_id: Option<String>,
-) -> napi::Result<AsyncTask<NativeRunTask>> {
-    let (cancellation, _) = watch::channel(false);
-    if let Some(id) = &cancellation_id {
-        if id.is_empty() || id.len() > 256 {
-            return Err(napi::Error::from_reason("Invalid native cancellation ID"));
-        }
-        let mut registry = CANCELLATIONS
-            .get_or_init(Registry::default)
-            .lock()
-            .map_err(|_| napi::Error::from_reason("Native cancellation registry poisoned"))?;
-        if registry.contains_key(id) {
-            return Err(napi::Error::from_reason(
-                "Native cancellation ID is already active",
-            ));
-        }
-        registry.insert(id.clone(), cancellation.clone());
-    }
-    // Do not attach napi's automatic AbortSignal: the Promise must remain pending
-    // until Rust has killed/reaped every command and applied sandbox cleanup.
-    Ok(AsyncTask::new(NativeRunTask {
-        input,
+) -> napi::Result<PromiseRaw<'static, String>> {
+    let owner = preparation::Ownership::acquire(false, cancellation_id)?;
+    submit(env, NativeInput::Raw(input), Some(owner))
+}
+
+fn new_task(input: NativeInput, ownership: Option<Arc<preparation::Ownership>>) -> NativeRunTask {
+    let cancellation = ownership
+        .as_ref()
+        .map(|owner| owner.cancellation.clone())
+        .unwrap_or_else(|| watch::channel(false).0);
+    NativeRunTask {
+        input: Some(input),
         cancellation,
-        cancellation_id,
-    }))
+        _ownership: ownership,
+    }
+}
+
+fn submit(
+    env: Env,
+    input: NativeInput,
+    ownership: Option<Arc<preparation::Ownership>>,
+) -> napi::Result<PromiseRaw<'static, String>> {
+    submit_task(env, new_task(input, ownership))
+}
+
+fn submit_task(env: Env, task: NativeRunTask) -> napi::Result<PromiseRaw<'static, String>> {
+    let ownership = task._ownership.clone();
+    match env.spawn(task) {
+        Ok(work) => Ok(work.promise_object()),
+        Err(error) => {
+            if let Some(owner) = ownership {
+                owner.release();
+            }
+            Err(error)
+        }
+    }
 }
 
 pub(crate) fn cancel(id: &str) -> bool {
-    let Some(registry) = CANCELLATIONS.get() else {
-        return false;
-    };
-    let Ok(registry) = registry.lock() else {
-        return false;
-    };
-    if let Some(cancellation) = registry.get(id) {
-        cancellation.send_replace(true);
-        true
-    } else {
-        false
-    }
-}
-
-impl Drop for NativeRunTask {
-    fn drop(&mut self) {
-        if let Some(id) = &self.cancellation_id
-            && let Some(registry) = CANCELLATIONS.get()
-            && let Ok(mut registry) = registry.lock()
-        {
-            registry.remove(id);
-        }
-    }
+    preparation::cancel(id)
 }
 
 impl Task for NativeRunTask {
@@ -99,12 +102,25 @@ impl Task for NativeRunTask {
     type JsValue = String;
 
     fn compute(&mut self) -> napi::Result<String> {
+        if *self.cancellation.borrow() {
+            return Err(napi::Error::new(
+                napi::Status::Cancelled,
+                "Native mutation run cancelled",
+            ));
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+        let input = self.input.take().expect("task computes once");
+        let config = match input {
+            NativeInput::Raw(input) => serde_json::from_str::<config::Request>(&input)
+                .map_err(|error| error.to_string())
+                .and_then(config::prepare),
+            NativeInput::Prepared(config) => config.map(|config| *config),
+        };
         runtime
-            .block_on(run(&self.input, self.cancellation.clone()))
+            .block_on(run_config(config, self.cancellation.clone()))
             .map(|response| response.to_string())
             .map_err(|error| {
                 if error == "Native mutation run cancelled" {
@@ -124,14 +140,25 @@ fn unsupported(reason: String) -> Value {
     json!({"version":1,"supported":false,"reason":reason})
 }
 
+#[cfg(test)]
 pub(super) async fn run(input: &str, cancellation: watch::Sender<bool>) -> Result<Value, String> {
     if *cancellation.borrow() {
         return Err("Native mutation run cancelled".into());
     }
-    let mut config = match serde_json::from_str::<config::Request>(input)
+    let config = serde_json::from_str::<config::Request>(input)
         .map_err(|error| error.to_string())
-        .and_then(config::prepare)
-    {
+        .and_then(config::prepare);
+    run_config(config, cancellation).await
+}
+
+async fn run_config(
+    config: Result<config::Config, String>,
+    cancellation: watch::Sender<bool>,
+) -> Result<Value, String> {
+    if *cancellation.borrow() {
+        return Err("Native mutation run cancelled".into());
+    }
+    let mut config = match config {
         Ok(config) => config,
         Err(reason) => return Ok(unsupported(reason)),
     };

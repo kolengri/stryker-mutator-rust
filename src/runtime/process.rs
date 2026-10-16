@@ -141,17 +141,34 @@ pub(super) async fn reap(child: &mut Child, description: &str) -> Result<(), Str
         .map_err(|error| format!("Cannot reap {description}: {error}"))
 }
 
-fn shell_command(command: &str) -> Command {
+fn shell_command(
+    command: &str,
+    _context: Option<&super::preparation::CallerEnvironment>,
+) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let mut builder =
-            Command::new(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
-        // Match Node's shell:true cmd.exe invocation: do not apply CRT argument
-        // escaping to authored shell syntax, including its outer quote pair.
-        builder
-            .as_std_mut()
-            .raw_arg(format!("/D /S /C \"{command}\""));
+        let shell = _context
+            .and_then(|context| context.shell.clone())
+            .map(std::ffi::OsString::from)
+            .unwrap_or_else(|| std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
+        // Exact pinned Node child_process shell:true discrimination. Preserve
+        // the existing direct-addon path when no caller context was supplied.
+        static CMD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+        let cmd = _context.is_none()
+            || CMD
+                .get_or_init(|| {
+                    regex::Regex::new(r"(?i)^(?:.*\\)?cmd(?:\.exe)?$").expect("shell regex")
+                })
+                .is_match(&shell.to_string_lossy());
+        let mut builder = Command::new(shell);
+        if cmd {
+            builder
+                .as_std_mut()
+                .raw_arg(format!(r#"/D /S /C "{command}""#));
+        } else {
+            builder.arg("-c").arg(command);
+        }
         builder
     }
     #[cfg(not(windows))]
@@ -219,7 +236,11 @@ pub(super) async fn run(
     let timeout = Duration::try_from_secs_f64(timeout_ms / 1000.0)
         .map_err(|error| format!("Invalid command deadline: {error}"))?;
     let started = Instant::now();
-    let mut builder = shell_command(command);
+    let context = super::preparation::caller_environment(&cancellation);
+    let mut builder = shell_command(command, context.as_deref());
+    if let Some(context) = &context {
+        context.apply(&mut builder);
+    }
     builder
         .current_dir(cwd)
         .stdin(Stdio::null())
@@ -228,7 +249,10 @@ pub(super) async fn run(
         .kill_on_drop(true);
     // Baseline must never inherit a caller's stale active-mutant selection.
     builder.env_remove("__STRYKER_ACTIVE_MUTANT__");
-    if std::env::var_os("STRYKER_MUTATOR_WORKER").is_none() {
+    if context.as_ref().map_or_else(
+        || std::env::var_os("STRYKER_MUTATOR_WORKER").is_none(),
+        |context| !context.has_worker,
+    ) {
         builder.env("STRYKER_MUTATOR_WORKER", worker_id);
     }
     if let Some(id) = mutant {
