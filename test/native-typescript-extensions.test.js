@@ -403,5 +403,5 @@ test('original non null error and unproven optional chain shapes remain fallback
     assert.ok(failure);
     assert.match(failure.message, /TSNonNullExpression/);
   }
-  for (const source of ["const value=(a||'qux')+b;", '(input?.id)!.toString();', 'delete obj?.method();']) await fallback(source);
+  for (const source of ['(input?.id)!.toString();', 'delete obj?.method();']) await fallback(source);
 });

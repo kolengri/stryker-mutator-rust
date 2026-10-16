@@ -290,7 +290,7 @@ test('strict delete preserves non-configurable and false proxy-trap exceptions',
   }
 });
 
-test('logical clones preserve only the validated simple single-quoted RHS and generated string mutants use double quotes', async () => {
+test('logical clones preserve raw quotes and generated string mutants use double quotes', async () => {
   for (const quote of ["'", '"']) for (const operator of ['??','||','&&']) {
     const pair = await compare([file(`function calc(){return obj?.x ${operator} ${quote}qux${quote};}`)]);
     assert.ok(pair.actual.mutants.some(m => m.mutatorName === 'LogicalOperator' && m.replacement.endsWith(`${quote}qux${quote}`)));
@@ -344,15 +344,12 @@ async function fallback(content) {
   return failure;
 }
 
-test('typed lvalues private/super and parenthesized optional spines and unproven raw clones remain atomic fallback', async () => {
+test('typed lvalues private/super and parenthesized optional spines remain atomic fallback', async () => {
   for (const source of ['obj!.x!++;','obj!.x! = value;','for(obj!.x! of values) ;','delete value;',
     'delete factory();','delete (obj?.x)!.y;','(obj?.x)!.trim();','(obj?.trim!)();',
     'class C{#x;f(){return this?.#x!;}}','class C{#x;f(){return this.#x!;}}',
     'class C{#x;f(){return this!.#x;}}','class C{#x;f(){return this!.#x();}}',
-    'class C extends B{f(){return super.x!.trim();}}',
-    "const value=(a||'qux')+b;", "const value=a||'q\\nx';", "const value=a||'é';",
-    "const value=a||'q\"x';", 'const value="left"||\'qux\';', "const value=a||'x'||b;",
-    "for(;;){a||'qux';break;}", "obj?.run(a||'qux');", "const value=a||'qux\t';"]) await fallback(source);
+    'class C extends B{f(){return super.x!.trim();}}']) await fallback(source);
   const source = process.env.STRYKER_UPSTREAM
     ? await readFile(`${process.env.STRYKER_UPSTREAM}/packages/instrumenter/testResources/instrumenter/non-null-expression.ts`,'utf8')
     : 'c[index]!++;';

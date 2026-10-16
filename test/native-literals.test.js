@@ -147,7 +147,6 @@ test('unsupported literal contexts reject the complete batch atomically', async 
     'const a = import("x");', 'const a = (Array?.()).length;', 'const a = new Array(...items);',
     'const a = ([1]?.length).value;', 'const a = ("x"?.length).value;',
     '"use strict"; const a = "x";', 'function calc() { "use strict"; return []; }',
-    `const a = value === 'x';`, 'const a = value === "\\u0078";', `const a = 'x' + value + 1;`,
     'const a = value || { value: "x" };', 'const a = value + (() => "x");',
   ];
   for (const content of sources) {

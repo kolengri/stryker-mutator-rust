@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet};
 use oxc_allocator::{Allocator, Box as ArenaBox, CloneIn};
 use oxc_ast::{ast::*, builder::AstBuilder};
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
-use oxc_codegen::{Codegen, CodegenOptions, Gen};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -24,6 +23,7 @@ use crate::mutations::{
 };
 
 mod parallel;
+mod string_spelling;
 
 // Keep the protocol and caching behavior in sync with Stryker 10 syntax-helpers.
 // This includes truthy currentTestId selection, dynamic activeMutant checks, and
@@ -673,7 +673,6 @@ struct Context<'a> {
     binding_name: Option<&'a str>,
     printed_ancestor: bool,
     skip_string: bool,
-    raw_string_rhs: Option<Span>,
 }
 
 fn arithmetic_replacement(binary: &BinaryExpression<'_>) -> Option<B> {
@@ -868,15 +867,6 @@ fn chain_prints(node: &Expression<'_>) -> bool {
         Expression::PrivateFieldExpression(member) => chain_prints(&member.object),
         Expression::TSNonNullExpression(non_null) => chain_prints(&non_null.expression),
         _ => false,
-    }
-}
-
-#[derive(Default)]
-struct StringLiteralCount(usize);
-
-impl<'a> Visit<'a> for StringLiteralCount {
-    fn visit_string_literal(&mut self, _: &StringLiteral<'a>) {
-        self.0 += 1;
     }
 }
 
@@ -1162,47 +1152,15 @@ impl Emitter<'_, '_> {
         output
     }
 
-    fn print(&self, node: &Expression<'_>) -> String {
-        let mut generator = Codegen::new().with_source_text(self.source);
-        generator.print_expression(node);
-        generator.into_source_text()
-    }
-
-    fn single_quoted_logical_rhs(
-        &self,
-        node: &Expression<'_>,
-        context: Context<'_>,
-    ) -> Option<Span> {
-        if context.printed_ancestor {
-            return None;
-        }
-        let Expression::LogicalExpression(logical) = node else {
-            return None;
-        };
-        let Expression::StringLiteral(string) = &logical.right else {
-            return None;
-        };
-        let raw = self
-            .text(string.span)
-            .strip_prefix('\'')?
-            .strip_suffix('\'')?;
-        if !raw
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
-            || raw.contains(['\\', '\'', '"'])
-        {
-            return None;
-        }
-        let mut strings = StringLiteralCount::default();
-        strings.visit_expression(node);
-        (strings.0 == 1).then_some(string.span)
+    fn print(&self, node: &Expression<'_>) -> Result<String, String> {
+        string_spelling::expression(node, self.source)
     }
 
     fn changed(
         &self,
         expression: &Expression<'_>,
         change: impl FnOnce(&mut Expression<'_>),
-    ) -> String {
+    ) -> Result<String, String> {
         let allocator = Allocator::default();
         let mut cloned = expression.clone_in(&allocator);
         change(&mut cloned);
@@ -1358,14 +1316,18 @@ impl Emitter<'_, '_> {
                 visitor.replaced
             ));
         }
-        Ok(self.print(&branch))
+        self.print(&branch)
     }
 
-    fn method_replacement(&self, call: &CallExpression<'_>) -> Option<String> {
-        let (object, name) = method_target(&call.callee)?;
-        let replacement = method_mapping(name)?;
+    fn method_replacement(&self, call: &CallExpression<'_>) -> Result<Option<String>, String> {
+        let Some((object, name)) = method_target(&call.callee) else {
+            return Ok(None);
+        };
+        let Some(replacement) = method_mapping(name) else {
+            return Ok(None);
+        };
         let Some(name) = replacement else {
-            return Some(self.print(object));
+            return self.print(object).map(Some);
         };
         let allocator = Allocator::default();
         let mut mutated = call.clone_in(&allocator);
@@ -1387,9 +1349,10 @@ impl Emitter<'_, '_> {
             optional,
             &builder,
         ));
-        Some(self.print(&Expression::CallExpression(ArenaBox::new_in(
+        self.print(&Expression::CallExpression(ArenaBox::new_in(
             mutated, &builder,
-        ))))
+        )))
+        .map(Some)
     }
 
     fn lvalue(
@@ -1460,7 +1423,6 @@ impl Emitter<'_, '_> {
         }
         // Collect before descending: Stryker IDs follow Babel pre-order and the
         // allMutators ordering. Mutation branches use the uninstrumented snapshot.
-        let raw_string_rhs = self.single_quoted_logical_rhs(node, context);
         let mut switches = vec![];
         if let Expression::BinaryExpression(binary) = node
             && let Some(replacement) = arithmetic_replacement(binary)
@@ -1469,7 +1431,7 @@ impl Emitter<'_, '_> {
                 if let Expression::BinaryExpression(binary) = node {
                     binary.operator = replacement;
                 }
-            });
+            })?;
             self.collect(node.span(), text, "ArithmeticOperator", &mut switches);
         }
         if let Expression::ArrayExpression(array) = node {
@@ -1550,7 +1512,7 @@ impl Emitter<'_, '_> {
             ),
             Expression::UnaryExpression(unary) if unary.operator == U::LogicalNot => self.collect(
                 node.span(),
-                self.print(&unary.argument),
+                self.print(&unary.argument)?,
                 "BooleanLiteral",
                 &mut switches,
             ),
@@ -1601,7 +1563,7 @@ impl Emitter<'_, '_> {
                     if let Expression::BinaryExpression(binary) = node {
                         binary.operator = replacement;
                     }
-                });
+                })?;
                 self.collect(node.span(), text, "EqualityOperator", &mut switches);
             }
         }
@@ -1617,21 +1579,11 @@ impl Emitter<'_, '_> {
                 unreachable!()
             };
             cloned_logical.operator = replacement;
-            // Babel preserves this one validated raw RHS when cloning. Oxc's
-            // quote option is safe only for a clone with this sole literal.
-            let mut generator =
-                Codegen::new()
-                    .with_source_text(self.source)
-                    .with_options(CodegenOptions {
-                        single_quote: raw_string_rhs.is_some(),
-                        ..CodegenOptions::default()
-                    });
-            generator.print_expression(&cloned);
-            let text = generator.into_source_text();
+            let text = self.print(&cloned)?;
             self.collect(node.span(), text, "LogicalOperator", &mut switches);
         }
         if let Expression::CallExpression(call) = node
-            && let Some(replacement) = self.method_replacement(call)
+            && let Some(replacement) = self.method_replacement(call)?
         {
             self.collect(node.span(), replacement, "MethodExpression", &mut switches);
         }
@@ -1675,8 +1627,8 @@ impl Emitter<'_, '_> {
                             U::UnaryPlus
                         };
                     }
-                })),
-                U::BitwiseNot => Some(self.print(&unary.argument)),
+                })?),
+                U::BitwiseNot => Some(self.print(&unary.argument)?),
                 _ => None,
             };
             if let Some(text) = replacement {
@@ -1692,7 +1644,7 @@ impl Emitter<'_, '_> {
                         UpdateOperator::Decrement => UpdateOperator::Increment,
                     };
                 }
-            });
+            })?;
             self.collect(node.span(), replacement, "UpdateOperator", &mut switches);
         }
 
@@ -1705,7 +1657,7 @@ impl Emitter<'_, '_> {
                 Expression::StaticMemberExpression(member) => member.optional = false,
                 Expression::ComputedMemberExpression(member) => member.optional = false,
                 _ => unreachable!("own_optional accepts only calls and public members"),
-            });
+            })?;
             self.collect(node.span(), replacement, "OptionalChaining", &mut switches);
         }
 
@@ -1716,7 +1668,7 @@ impl Emitter<'_, '_> {
                 if let Expression::AssignmentExpression(assignment) = node {
                     assignment.operator = operator;
                 }
-            });
+            })?;
             self.collect(
                 node.span(),
                 replacement,
@@ -1802,14 +1754,13 @@ impl Emitter<'_, '_> {
             Expression::NumericLiteral(_) => {
                 // Oxc normalizes some number spellings while Babel preserves raw
                 // literals in cloned mutations. Reject incompatible record text.
-                if self.print(node) != self.text(node.span()) { return Err("Numeric literal spelling requires upstream replacement formatting".into()); }
+                if self.print(node)? != self.text(node.span()) { return Err("Numeric literal spelling requires upstream replacement formatting".into()); }
             }
-            Expression::StringLiteral(_) => {
-                // Babel keeps raw string spellings in cloned operator mutants;
-                // Oxc prints the decoded value. Standalone switches preserve the
-                // original bytes, but printed ancestors need identical spelling.
-                if context.printed_ancestor && context.raw_string_rhs != Some(node.span()) && self.print(node) != self.text(node.span()) {
-                    return Err("String literal spelling requires upstream replacement formatting".into());
+            Expression::StringLiteral(string) => {
+                // The whole-statement formatter indents physical lines. Keep
+                // continuations out of that path until their ranges survive it.
+                if self.printed_statement && string.raw.as_ref().is_some_and(|raw| raw.contains(['\r', '\n'])) {
+                    return Err("Multiline strings in whole-for replacements require upstream formatting".into());
                 }
             }
             Expression::TemplateLiteral(template) => {
@@ -1864,7 +1815,7 @@ impl Emitter<'_, '_> {
             Expression::LogicalExpression(logical) => {
                 let child_context = Context { logical_parent: Some(logical.operator), printed_ancestor: true, ..Context::default() };
                 edits.push((logical.left.span(), self.expression(&logical.left, child_context)?));
-                edits.push((logical.right.span(), self.expression(&logical.right, Context { raw_string_rhs, ..child_context })?));
+                edits.push((logical.right.span(), self.expression(&logical.right, child_context)?));
             }
             Expression::UnaryExpression(unary) => {
                 if unary.operator == U::Delete {
@@ -2292,8 +2243,8 @@ impl Emitter<'_, '_> {
                 let replacement = match &node.test {
                     // Babel retains the original spelling when cloning a case.
                     Some(Expression::StringLiteral(string)) => format!("case {}:", emitter.text(string.span)),
-                    Some(test @ Expression::SequenceExpression(_)) => format!("case ({}):", emitter.print(test)),
-                    Some(test) => format!("case {}:", emitter.print(test)),
+                    Some(test @ Expression::SequenceExpression(_)) => format!("case ({}):", emitter.print(test)?),
+                    Some(test) => format!("case {}:", emitter.print(test)?),
                     None => "default:".into(),
                 };
                 emitter.collect(node.span, replacement, "ConditionalExpression", &mut switches);
@@ -2357,7 +2308,7 @@ impl Emitter<'_, '_> {
                     return Err("Destructuring bindings require upstream instrumentation".into());
                 };
                 declarations.push(if let Some(init) = &declaration.init {
-                    let text = expression(init);
+                    let text = expression(init)?;
                     let text = if matches!(init, Expression::SequenceExpression(_)) {
                         format!("({text})")
                     } else {
@@ -2397,10 +2348,7 @@ impl Emitter<'_, '_> {
             if let ForStatementLeft::VariableDeclaration(node) = node {
                 variables(node, true)
             } else {
-                let mut generator = Codegen::new().with_source_text(self.source);
-                node.to_assignment_target()
-                    .print(&mut generator, oxc_codegen::Context::empty());
-                Ok(generator.into_source_text())
+                string_spelling::assignment_target(node.to_assignment_target(), self.source)
             }
         };
         Ok(match node {
@@ -2417,13 +2365,12 @@ impl Emitter<'_, '_> {
                     format!("{{\n{}\n}}", indent(&body))
                 }
             }
-            Statement::ExpressionStatement(node) => format!("{};", expression(&node.expression)),
+            Statement::ExpressionStatement(node) => format!("{};", expression(&node.expression)?),
             Statement::VariableDeclaration(node) => format!("{};", variables(node, false)?),
-            Statement::ReturnStatement(node) => {
-                node.argument.as_ref().map_or("return;".into(), |node| {
-                    format!("return {};", expression(node))
-                })
-            }
+            Statement::ReturnStatement(node) => match &node.argument {
+                Some(node) => format!("return {};", expression(node)?),
+                None => "return;".into(),
+            },
             Statement::BreakStatement(node) => node
                 .label
                 .as_ref()
@@ -2440,7 +2387,7 @@ impl Emitter<'_, '_> {
                     consequent = format!("{{\n{}\n}}", indent(&consequent));
                 }
                 let braced = consequent.ends_with('}');
-                let mut result = format!("if ({}) {consequent}", expression(&node.test));
+                let mut result = format!("if ({}) {consequent}", expression(&node.test)?);
                 if let Some(alternate) = &node.alternate {
                     if braced {
                         result.push(' ');
@@ -2451,31 +2398,33 @@ impl Emitter<'_, '_> {
             }
             Statement::WhileStatement(node) => format!(
                 "while ({}){}",
-                expression(&node.test),
+                expression(&node.test)?,
                 loop_body(&node.body, false)?
             ),
             Statement::DoWhileStatement(node) => format!(
                 "do {} while ({});",
                 self.print_statement(&node.body)?,
-                expression(&node.test)
+                expression(&node.test)?
             ),
             Statement::ForStatement(node) => {
                 let init = match &node.init {
                     Some(ForStatementInit::VariableDeclaration(node)) => variables(node, true)?,
                     Some(node) => {
-                        expression(node.as_expression().ok_or("Unsupported for initializer")?)
+                        expression(node.as_expression().ok_or("Unsupported for initializer")?)?
                     }
                     None => String::new(),
                 };
                 let test = node
                     .test
                     .as_ref()
-                    .map(|node| format!(" {}", expression(node)))
+                    .map(|node| expression(node).map(|text| format!(" {text}")))
+                    .transpose()?
                     .unwrap_or_default();
                 let update = node
                     .update
                     .as_ref()
-                    .map(|node| format!(" {}", expression(node)))
+                    .map(|node| expression(node).map(|text| format!(" {text}")))
+                    .transpose()?
                     .unwrap_or_default();
                 format!(
                     "for ({init};{test};{update}){}",
@@ -2485,11 +2434,11 @@ impl Emitter<'_, '_> {
             Statement::ForInStatement(node) => format!(
                 "for ({} in {}){}",
                 for_left(&node.left)?,
-                expression(&node.right),
+                expression(&node.right)?,
                 loop_body(&node.body, true)?
             ),
             Statement::ForOfStatement(node) => {
-                let right = expression(&node.right);
+                let right = expression(&node.right)?;
                 let right = if matches!(node.right, Expression::SequenceExpression(_)) {
                     format!("({right})")
                 } else {
@@ -2507,14 +2456,17 @@ impl Emitter<'_, '_> {
             Statement::SwitchStatement(node) => {
                 let mut cases = vec![];
                 for case in &node.cases {
-                    let head = case.test.as_ref().map_or("default:".into(), |test| {
-                        let text = expression(test);
-                        if matches!(test, Expression::SequenceExpression(_)) {
-                            format!("case ({text}):")
-                        } else {
-                            format!("case {text}:")
+                    let head = match &case.test {
+                        None => "default:".into(),
+                        Some(test) => {
+                            let text = expression(test)?;
+                            if matches!(test, Expression::SequenceExpression(_)) {
+                                format!("case ({text}):")
+                            } else {
+                                format!("case {text}:")
+                            }
                         }
-                    });
+                    };
                     let body = case
                         .consequent
                         .iter()
@@ -2528,11 +2480,11 @@ impl Emitter<'_, '_> {
                     });
                 }
                 if cases.is_empty() {
-                    format!("switch ({}) {{}}", expression(&node.discriminant))
+                    format!("switch ({}) {{}}", expression(&node.discriminant)?)
                 } else {
                     format!(
                         "switch ({}) {{\n{}\n}}",
-                        expression(&node.discriminant),
+                        expression(&node.discriminant)?,
                         indent(&cases.join("\n"))
                     )
                 }
@@ -2804,7 +2756,6 @@ mod tests {
         for source in [
             "function f(){ return (obj?.call)(); }",
             "const o = {method(){ return 1; }};",
-            "const x = a === 'string';",
             "const x = 1 /* Stryker disable all */ + 2;",
             "function f({x} = obj) { return x; }",
             "const x = (a?.value).next;",
@@ -3049,6 +3000,10 @@ mod tests {
     fn assignment_and_update_printer_guards_follow_serialized_ancestors() {
         for source in [
             "a += 'raw';", // No assignment candidate: only the string is printed.
+            "obj['raw']++;",
+            "a += ('raw' + b);",
+            "factory().trim().field = 'raw';",
+            "const x = a === 'string';",
             "a = x => x;",
             "obj.x = {key: 1};",
         ] {
@@ -3056,9 +3011,6 @@ mod tests {
             assert!(response.supported, "{source}: {:?}", response.reason);
         }
         for source in [
-            "obj['raw']++;",
-            "a += ('raw' + b);",
-            "factory().trim().field = 'raw';",
             "factory().trim().field = x => x;",
             "a += {key: 1};",
             "[a] = b;",
