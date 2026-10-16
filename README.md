@@ -315,9 +315,15 @@ Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
 Non-null private/super combinations and unsupported delete argument shapes also
 require fallback.
+Regex literals support a bounded subset with no flags: start/end anchors,
+ASCII letters, digits, spaces, underscores and hyphens, escaped slashes and
+backslashes, positive literal character classes, digit classes (`\d`/`\D`),
+and greedy `?`/`+` quantifiers. Native mutations preserve upstream ordering and
+duplicates. Flags, ranges, groups, alternation, other escapes and unproven forms
+trigger whole-batch fallback, as do string-pattern `new RegExp` calls.
 Private methods/accessors, optional private members, decorators, auto-accessors,
 unsupported parameter-property forms, computed/quoted method keys, computed fields,
-mapped super calls, dynamic imports, regex (including literal-first `new RegExp`),
+mapped super calls, dynamic imports,
 argument spread, array holes/spread, object methods,
 accessors/spread, complex computed keys, destructuring targets,
 async/generators, `for-await`, directive prologues and hashbangs trigger whole-batch fallback.

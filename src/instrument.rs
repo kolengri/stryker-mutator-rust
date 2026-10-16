@@ -24,6 +24,7 @@ use crate::mutations::{
 
 mod parallel;
 mod printed_arrows;
+mod regex_mutation;
 mod string_spelling;
 
 // Keep the protocol and caching behavior in sync with Stryker 10 syntax-helpers.
@@ -1678,6 +1679,11 @@ impl Emitter<'_, '_> {
         {
             self.collect(node.span(), "{}".into(), "ObjectLiteral", &mut switches);
         }
+        if let Expression::RegExpLiteral(regex) = node {
+            for replacement in regex_mutation::mutate(regex)? {
+                self.collect(node.span(), replacement, "Regex", &mut switches);
+            }
+        }
         match node {
             Expression::StringLiteral(string) if !context.skip_string => self.collect(
                 node.span(),
@@ -1769,7 +1775,7 @@ impl Emitter<'_, '_> {
         pending.extend(switches);
         let mut edits = vec![];
         match node {
-            Expression::Identifier(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) | Expression::ThisExpression(_) | Expression::Super(_) => {},
+            Expression::Identifier(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) | Expression::ThisExpression(_) | Expression::Super(_) | Expression::RegExpLiteral(_) => {},
             Expression::CallExpression(call) => {
                 if call.optional && matches!(method_target(&call.callee), Some((Expression::Super(_), _))) {
                     return Err("Optional super calls require upstream instrumentation".into());
@@ -1950,7 +1956,7 @@ impl Emitter<'_, '_> {
                 // spine. Preserve the engine-owned suspension and its operand.
                 edits.push((await_expression.argument.span(), self.expression(&await_expression.argument, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
             }
-            _ => return Err("Unsupported expression in native grammar (import, regex, and type syntax require upstream)".into()),
+            _ => return Err("Unsupported expression in native grammar (import and type syntax require upstream)".into()),
         }
         Ok(self.apply(node.span(), edits))
     }

@@ -355,6 +355,6 @@ test('all 17 registry mutators are accounted for at the accepted grammar boundar
   const call = await compare([file('foo();')]);
   assert.deepEqual(call.actual.mutants.map(m=>m.mutatorName),['CallExpression']);
   runtime(pair, 'let a=0,b=2;const obj={x:4,trim(){events.push("trim");return 3;}};function foo(x){events.push(x);}', '[calc(),calc()]', '[typeof a,b]');
-  // Regex is the only remaining registry member and is outside native grammar.
-  await fallback('a = /abc/;');
+  // Regex range syntax remains unproven and requires upstream fallback.
+  await fallback('a = /[a-z]/;');
 });

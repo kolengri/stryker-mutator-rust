@@ -12,3 +12,8 @@ remain applicable. See LICENSE and the licenses shipped with dependencies.
 Oxc is used under its MIT license. napi-rs is used under its MIT license. BLAKE3 is
 used under its CC0-1.0 or Apache-2.0 license. See the respective dependency sources
 and Cargo.lock for exact versions. Dependencies retain their own licenses.
+
+The conservative native regex mutation rules are derived from weapon-regex 2.0.6,
+licensed under Apache-2.0, Copyright Stryker Mutator contributors:
+https://github.com/stryker-mutator/weapon-regex/tree/v2.0.6
+See src/instrument/regex_mutation.rs for the bounded rule and traversal port.
