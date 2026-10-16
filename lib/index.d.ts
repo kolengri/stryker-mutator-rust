@@ -1,0 +1,29 @@
+import { Stryker as UpstreamStryker } from '@stryker-mutator/core';
+import type { Instrumenter, InstrumenterOptions, InstrumentResult, File } from '@stryker-mutator/instrumenter';
+import type { Logger } from '@stryker-mutator/api/logging';
+
+export interface AccelerationStats { hits: number; misses: number; bypasses: number; errors: number; nativeBatches: number; fallbackBatches: number; nativeErrors: number }
+export interface AccelerationOptions {
+  cache?: boolean;
+  engine?: 'auto' | 'upstream' | 'native';
+  cacheDir?: string;
+  onEvent?: (event: { type: keyof AccelerationStats; reason?: string }) => void;
+}
+export interface Candidate { start: number; end: number; replacement: string; mutatorName: string }
+/** Experimental candidates only; supported is false until complete semantic parity. */
+export function analyze(source: string, fileName?: string): { supported: false; reason: string; mutants: Candidate[] };
+export function nativeStatus(): { available: boolean; target: string; nativeInstrumentation: boolean; napi?: number; candidateEngine?: string; error?: string };
+export class InstrumentationCache {
+  constructor(options?: AccelerationOptions);
+  readonly stats: AccelerationStats;
+  instrument(instrument: Instrumenter['instrument'], files: readonly File[], options: InstrumenterOptions): Promise<InstrumentResult>;
+}
+/** Process-wide; the first call sets options for all subsequent Stryker instances. */
+export function installAcceleration(options?: AccelerationOptions): InstrumentationCache;
+export function createInstrumenter(logger: Logger, options?: AccelerationOptions): {
+  instrument(files: readonly File[], options: InstrumenterOptions): Promise<InstrumentResult>;
+  stats: AccelerationStats;
+};
+export class Stryker extends UpstreamStryker {
+  constructor(options?: ConstructorParameters<typeof UpstreamStryker>[0], acceleration?: AccelerationOptions);
+}

@@ -1,0 +1,11 @@
+node_modules/
+target/
+artifacts/
+*.node
+*.tgz
+npm/
+.stryker-tmp/
+.grepai/
+/native/
+fixtures/**/reports/
+fixtures/**/.stryker-tmp/

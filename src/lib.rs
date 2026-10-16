@@ -1,0 +1,47 @@
+use napi_derive::napi;
+
+mod instrument;
+mod mutations;
+
+/// Hash UTF-8 input with BLAKE3, returning lowercase hexadecimal.
+#[napi(js_name = "cacheKey", strict)]
+pub fn cache_key(input: String) -> String {
+    blake3::hash(input.as_bytes()).to_hex().to_string()
+}
+
+/// Return an experimental AST mutation preview as JSON.
+///
+/// Candidate ranges are zero-based, end-exclusive JavaScript UTF-16 offsets.
+/// `supported` is deliberately false until upstream Stryker filtering, preprocessing,
+/// and all mutators have parity. Parse failures return no candidates and a reason.
+#[napi(js_name = "analyze", strict)]
+pub fn analyze(source: String, file_name: String) -> String {
+    serde_json::to_string(&mutations::analyze_source(&source, &file_name))
+        .expect("mutation preview contains only JSON-serializable values")
+}
+
+/// Instrument a conservative JavaScript grammar entirely in Rust.
+/// Unsupported batches have no partial result and must be delegated to StrykerJS.
+#[napi(js_name = "instrumentBatch", strict)]
+pub fn instrument_batch(input_json: String) -> String {
+    serde_json::to_string(&instrument::instrument_batch(&input_json))
+        .expect("instrumentation result contains only JSON-serializable values")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_keys_match_blake3_reference_vectors() {
+        assert_eq!(
+            cache_key(String::new()),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_eq!(
+            cache_key("abc".into()),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+        assert_ne!(cache_key("é".into()), cache_key("e\u{301}".into()));
+    }
+}

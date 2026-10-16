@@ -1,0 +1,13 @@
+{
+  "testRunner": "vitest",
+  "plugins": ["@stryker-mutator/vitest-runner"],
+  "mutate": ["src/**/*.js"],
+  "reporters": ["json"],
+  "jsonReporter": { "fileName": "reports/mutation.json" },
+  "coverageAnalysis": "perTest",
+  "concurrency": 1,
+  "timeoutMS": 1000,
+  "timeoutFactor": 2,
+  "thresholds": { "high": 80, "low": 60, "break": 0 },
+  "cleanTempDir": "always"
+}

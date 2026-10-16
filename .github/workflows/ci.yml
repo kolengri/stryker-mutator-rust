@@ -1,0 +1,132 @@
+name: Native package verification
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, target: aarch64-apple-darwin, node: '22', musl: false }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, node: '24', musl: false }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu, node: '22', musl: false }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, node: '24', musl: false }
+          - { runner: windows-2025, target: x86_64-pc-windows-msvc, node: '22', musl: false }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, node: '24', musl: false }
+          - { runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, node: '22', musl: true }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, node: '22', musl: true }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: stryker-mutator/stryker-js
+          ref: c931a93237816901f1e9f48da411170beeb3dfca
+          path: artifacts/upstream/stryker-js
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Install Rust toolchain
+        shell: bash
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt --target ${{ matrix.target }}
+      - name: Rust checks
+        run: cargo +1.99.0 fmt --check
+      - run: cargo +1.99.0 clippy --all-targets --locked -- -D warnings
+      - run: cargo +1.99.0 test --locked
+      - name: Build native addon
+        if: ${{ !matrix.musl }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *-unknown-linux-gnu ]]; then
+            npm run build -- --target ${{ matrix.target }} --use-napi-cross
+          else
+            npm run build -- --target ${{ matrix.target }}
+          fi
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+      - name: Build musl addon
+        if: matrix.musl
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          export CC=musl-gcc
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          npm run build -- --target ${{ matrix.target }}
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.0
+      - name: Unit, semantic, corpus and real-run parity
+        if: ${{ !matrix.musl }}
+        run: |
+          npm test
+          npm run test:corpus
+          npm run test:integration
+          node scripts/integration.js native
+          node scripts/integration.js vitest
+          npm run pack:local
+          node scripts/install-smoke.js
+      - name: Verify musl in its actual runtime
+        if: matrix.musl
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work node:22-alpine sh -ec '
+            npm test
+            npm run test:corpus
+            node scripts/integration.js native
+            npm run pack:local
+            node scripts/install-smoke.js
+          '
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: binding-${{ matrix.target }}
+          path: native/*.node
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: evidence-${{ matrix.target }}
+          path: |
+            artifacts/verification/*.log
+            artifacts/verification/*/*.log
+            artifacts/verification/*/result.json
+            artifacts/verification/*/summary.json
+          if-no-files-found: warn
+
+  bundle:
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: '24'
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          pattern: binding-*
+          path: native
+          merge-multiple: true
+      - run: npm run pack:release
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: npm-release-bundle
+          path: |
+            artifacts/package/release/*.tgz
+            artifacts/package/release/manifest.json
+          if-no-files-found: error

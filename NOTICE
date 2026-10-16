@@ -1,0 +1,14 @@
+Stryker Mutator Rust
+
+This package is an independent implementation and compatibility experiment. It is
+not an official Stryker Mutator release.
+
+The compatibility runner depends on StrykerJS 10.0.0, licensed under Apache-2.0.
+Native mutation semantics and the instrumentation runtime are based on StrykerJS:
+https://github.com/stryker-mutator/stryker-js
+Copyright Stryker Mutator contributors. Original copyright and attribution notices
+remain applicable. See LICENSE and the licenses shipped with dependencies.
+
+Oxc is used under its MIT license. napi-rs is used under its MIT license. BLAKE3 is
+used under its CC0-1.0 or Apache-2.0 license. See the respective dependency sources
+and Cargo.lock for exact versions. Dependencies retain their own licenses.
