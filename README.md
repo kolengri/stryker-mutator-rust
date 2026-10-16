@@ -17,7 +17,8 @@ An experimental native coordinator is being added separately from that legacy
 runner. `STRYKER_RUST_COORDINATOR_ENGINE=native stryker-rust run` selects it without
 an upstream coordinator fallback. Its current scope includes JSON and
 [data-shaped caller-executed JS/MJS/CJS configuration](docs/native-caller-config.md),
-the built-in command runner with coverage off, or Mocha through the pinned
+the built-in command runner executing `bun test` with coverage off, or existing
+Mocha projects through the pinned
 `@stryker-mutator/mocha-runner` plugin. Checker plugins are not yet supported;
 reporters are limited to JSON or none. Rust owns file selection, instrumentation,
 coverage indexing, test planning, sandboxes, process scheduling, deadlines,
@@ -35,6 +36,39 @@ establish Windows runtime support.
 
 The corresponding API is `runNativeMutationTest({ cwd, args, overrides }, { signal })`
 from `stryker-mutator-rust/native`. Cancellation settles only after native cleanup.
+
+## Bun execution
+
+Bun is the primary execution target for new fixtures and performance work. Existing
+tests written with `bun:test` run unchanged. Select the Rust coordinator explicitly
+and configure its built-in command runner:
+
+```json
+{
+  "testRunner": "command",
+  "plugins": [],
+  "coverageAnalysis": "off",
+  "mutate": ["src/**/*.js", "src/**/*.ts"],
+  "commandRunner": { "command": "bun --no-env-file test ./test" },
+  "reporters": ["json"]
+}
+```
+
+```sh
+STRYKER_RUST_COORDINATOR_ENGINE=native npx stryker-rust run
+```
+
+Rust owns instrumentation, sandboxes, scheduling, deadlines, process cleanup and
+reporting. Bun executes the tests directly; this path creates no Node SDK runner
+worker and performs no test conversion. Bun must be installed separately and
+available on `PATH`. The local Bun validation version is 1.4.3.
+
+Each mutant currently starts a fresh Bun process and runs the selected test
+command. This preserves module initialization isolation. Per-test mutation
+coverage, hit limits and persistent Bun test workers are not implemented. Ordinary
+Bun LCOV coverage is not a substitute for mutation-to-test coverage. Mocha remains
+an adapter for existing projects; its test APIs are not automatically converted.
+See [the Bun execution contract](docs/bun.md).
 
 ## Build and install
 
@@ -57,9 +91,9 @@ npm install --save-dev /absolute/path/stryker-mutator-rust-0.1.0.tgz
 npx stryker-rust run
 ```
 
-Keep the runner plugin already used by the target project installed, for example
-`@stryker-mutator/mocha-runner@10.0.0`. This package does not replace its test
-framework. No npm release has been published.
+For existing projects, keep their selected test framework and runner plugin
+installed. Bun command execution needs no Stryker framework plugin. No npm release
+has been published.
 
 ## CLI and API
 
@@ -329,6 +363,7 @@ incremental result cache is separate and retains its original semantics.
 
 ```sh
 npm run check
+npm run test:bun
 npm run test:integration
 node scripts/integration.js native
 node scripts/integration.js vitest

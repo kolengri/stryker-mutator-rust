@@ -1,0 +1,16 @@
+{
+  "testRunner": "command",
+  "plugins": [],
+  "appendPlugins": [],
+  "checkers": [],
+  "mutate": ["src/**/*.ts"],
+  "commandRunner": { "command": "bun --no-env-file test ./test/calculator.test.ts" },
+  "reporters": ["json"],
+  "jsonReporter": { "fileName": "reports/mutation.json" },
+  "coverageAnalysis": "off",
+  "concurrency": 2,
+  "timeoutMS": 1000,
+  "timeoutFactor": 2,
+  "thresholds": { "high": 80, "low": 60, "break": 0 },
+  "cleanTempDir": "always"
+}

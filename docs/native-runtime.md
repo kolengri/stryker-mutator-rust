@@ -12,6 +12,8 @@ process scheduling, deadlines, retries, cancellation, incremental selection, and
 report assembly. Existing native instrumentation/coverage/planning modules are reused.
 The Node adapter owns only operations requiring JavaScript execution or plugin objects.
 Built-in command tests are spawned directly by Rust; there is no Node pool around them.
+Bun is the primary new execution target through this command path; see the
+[Bun contract](bun.md). Mocha remains an adapter for existing projects.
 
 Upstream defects and unnecessary work may be corrected. A correction must identify
 the original behavior, intended behavior, and a regression oracle. Preserve public

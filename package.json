@@ -36,6 +36,7 @@
     "test": "node --test test/*.test.js",
     "test:integration": "node scripts/integration.js",
     "test:integration:native": "node scripts/native-runtime-integration.js",
+    "test:bun": "node scripts/bun-runtime-integration.js bun-js && node scripts/bun-runtime-integration.js bun-ts",
     "test:corpus": "node scripts/corpus.js",
     "bench": "node scripts/benchmark.js",
     "check": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test && npm test",
