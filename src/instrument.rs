@@ -329,6 +329,31 @@ struct Context<'a> {
     logical_parent: Option<L>,
     binding_name: Option<&'a str>,
     printed_ancestor: bool,
+    skip_string: bool,
+}
+
+fn arithmetic_replacement(binary: &BinaryExpression<'_>) -> Option<B> {
+    // Match Stryker's syntactic exclusion, including the rightmost operand of
+    // one immediately nested binary on the left. This is not type inference.
+    let left = match &binary.left {
+        Expression::BinaryExpression(left) => &left.right,
+        left => left,
+    };
+    if [left, &binary.right].iter().any(|operand| {
+        matches!(
+            operand,
+            Expression::StringLiteral(_) | Expression::TemplateLiteral(_)
+        )
+    }) {
+        return None;
+    }
+    match binary.operator {
+        B::Addition => Some(B::Subtraction),
+        B::Subtraction => Some(B::Addition),
+        B::Multiplication => Some(B::Division),
+        B::Division | B::Remainder => Some(B::Multiplication),
+        _ => None,
+    }
 }
 
 struct Switch {
@@ -427,22 +452,28 @@ impl Emitter<'_, '_> {
         // Collect before descending: Stryker IDs follow Babel pre-order and the
         // allMutators ordering. Mutation branches use the uninstrumented snapshot.
         let mut switches = vec![];
-        if let Expression::BinaryExpression(binary) = node {
-            let replacement = match binary.operator {
-                B::Addition => Some(B::Subtraction),
-                B::Subtraction => Some(B::Addition),
-                B::Multiplication => Some(B::Division),
-                B::Division | B::Remainder => Some(B::Multiplication),
-                _ => None,
-            };
-            if let Some(replacement) = replacement {
-                let text = self.changed(node, |node| {
-                    if let Expression::BinaryExpression(binary) = node {
-                        binary.operator = replacement;
-                    }
-                });
-                self.collect(node.span(), text, "ArithmeticOperator", &mut switches);
-            }
+        if let Expression::BinaryExpression(binary) = node
+            && let Some(replacement) = arithmetic_replacement(binary)
+        {
+            let text = self.changed(node, |node| {
+                if let Expression::BinaryExpression(binary) = node {
+                    binary.operator = replacement;
+                }
+            });
+            self.collect(node.span(), text, "ArithmeticOperator", &mut switches);
+        }
+        if let Expression::ArrayExpression(array) = node {
+            self.collect(
+                node.span(),
+                if array.elements.is_empty() {
+                    "[\"Stryker was here\"]"
+                } else {
+                    "[]"
+                }
+                .into(),
+                "ArrayDeclaration",
+                &mut switches,
+            );
         }
         if let Expression::ArrowFunctionExpression(arrow) = node
             && !matches!(&arrow.body, ArrowFunctionBody::FunctionBody(_))
@@ -530,6 +561,36 @@ impl Emitter<'_, '_> {
             });
             self.collect(node.span(), text, "LogicalOperator", &mut switches);
         }
+        if let Expression::ObjectExpression(object) = node
+            && !object.properties.is_empty()
+        {
+            self.collect(node.span(), "{}".into(), "ObjectLiteral", &mut switches);
+        }
+        match node {
+            Expression::StringLiteral(string) if !context.skip_string => self.collect(
+                node.span(),
+                if string.value.is_empty() {
+                    "\"Stryker was here!\""
+                } else {
+                    "\"\""
+                }
+                .into(),
+                "StringLiteral",
+                &mut switches,
+            ),
+            Expression::TemplateLiteral(template) => self.collect(
+                node.span(),
+                if template.quasis.len() == 1 && template.quasis[0].value.raw.is_empty() {
+                    "`Stryker was here!`"
+                } else {
+                    "``"
+                }
+                .into(),
+                "StringLiteral",
+                &mut switches,
+            ),
+            _ => {}
+        }
         if let Expression::UnaryExpression(unary) = node {
             let replacement = match unary.operator {
                 U::UnaryPlus | U::UnaryNegation => Some(self.changed(node, |node| {
@@ -557,9 +618,52 @@ impl Emitter<'_, '_> {
                 // literals in cloned mutations. Reject incompatible record text.
                 if self.print(node) != self.text(node.span()) { return Err("Numeric literal spelling requires upstream replacement formatting".into()); }
             }
+            Expression::StringLiteral(_) => {
+                // Babel keeps raw string spellings in cloned operator mutants;
+                // Oxc prints the decoded value. Standalone switches preserve the
+                // original bytes, but printed ancestors need identical spelling.
+                if context.printed_ancestor && self.print(node) != self.text(node.span()) {
+                    return Err("String literal spelling requires upstream replacement formatting".into());
+                }
+            }
+            Expression::TemplateLiteral(template) => {
+                for child in &template.expressions {
+                    edits.push((child.span(), self.expression(child, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
+                }
+                if context.printed_ancestor && template.quasis.iter().any(|quasi| quasi.value.raw.contains('\r')) {
+                    return Err("Template line endings require upstream replacement formatting".into());
+                }
+            }
+            Expression::ArrayExpression(array) => {
+                for element in &array.elements {
+                    let child = element.as_expression().ok_or("Array holes and spread require upstream instrumentation")?;
+                    edits.push((child.span(), self.expression(child, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
+                }
+            }
+            Expression::ObjectExpression(object) => {
+                if context.printed_ancestor {
+                    return Err("Objects inside printed mutation replacements require upstream formatting".into());
+                }
+                for property in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        return Err("Object spread requires upstream instrumentation".into());
+                    };
+                    if property.method || property.kind != PropertyKind::Init {
+                        return Err("Object methods and accessors require upstream instrumentation".into());
+                    }
+                    // A mutated computed key is placed at an ancestor by Babel,
+                    // rather than at the key itself. Only inert literal keys are
+                    // accepted here; their strings are deliberately not mutated.
+                    if property.computed && !matches!(property.key, PropertyKey::StringLiteral(_) | PropertyKey::NumericLiteral(_)) {
+                        return Err("Computed object keys require upstream placement semantics".into());
+                    }
+                    edits.push((property.value.span(), self.expression(&property.value, Context::default())?));
+                }
+            }
             Expression::BinaryExpression(binary) => {
                 if !matches!(binary.operator, B::Addition | B::Subtraction | B::Multiplication | B::Division | B::Remainder | B::Equality | B::Inequality | B::StrictEquality | B::StrictInequality | B::LessThan | B::LessEqualThan | B::GreaterThan | B::GreaterEqualThan) { return Err("Unsupported binary operator in native grammar".into()); }
-                let child_context = Context { printed_ancestor: true, ..Context::default() };
+                let printed = context.printed_ancestor || arithmetic_replacement(binary).is_some() || binary.operator.is_equality() || binary.operator.is_compare();
+                let child_context = Context { printed_ancestor: printed, ..Context::default() };
                 edits.push((binary.left.span(), self.expression(&binary.left, child_context)?));
                 edits.push((binary.right.span(), self.expression(&binary.right, child_context)?));
             }
@@ -589,7 +693,7 @@ impl Emitter<'_, '_> {
                     }
                 }
             }
-            _ => return Err("Unsupported expression in native grammar (calls, members, strings, templates, regex, collections, classes, assignments, updates, and type syntax require upstream)".into()),
+            _ => return Err("Unsupported expression in native grammar (calls, members, regex, classes, assignments, updates, and type syntax require upstream)".into()),
         }
         let mut original = self.apply(node.span(), edits);
         if switches.is_empty() {
@@ -741,7 +845,7 @@ impl Emitter<'_, '_> {
             Statement::VariableDeclaration(variables) => return self.variables(variables),
             Statement::BlockStatement(block) => return self.block(block.span, &block.body),
             Statement::ReturnStatement(statement) => if let Some(expression) = &statement.argument { edits.push((expression.span(), self.expression(expression, Context::default())?)); },
-            Statement::ExpressionStatement(statement) => edits.push((statement.expression.span(), self.expression(&statement.expression, Context::default())?)),
+            Statement::ExpressionStatement(statement) => edits.push((statement.expression.span(), self.expression(&statement.expression, Context { skip_string: true, ..Context::default() })?)),
             Statement::IfStatement(statement) => {
                 edits.push((statement.test.span(), self.expression(&statement.test, Context { if_test: true, ..Context::default() })?));
                 edits.push((statement.consequent.span(), self.statement(&statement.consequent, false)?));
@@ -832,8 +936,8 @@ mod tests {
     fn rejects_batches_atomically_and_rejects_options() {
         for source in [
             "function f(){ return call(); }",
-            "const o = {a:1};",
-            "const x = 'string';",
+            "const o = {method(){ return 1; }};",
+            "const x = a === 'string';",
             "// Stryker disable all\nconst x = 1;",
             "function f(x = 1) { return x; }",
             "const x = a.value;",
@@ -861,6 +965,43 @@ mod tests {
         );
         assert!(!response.supported);
         assert!(response.result.is_none());
+    }
+
+    #[test]
+    fn literal_records_skip_keys_and_keep_nested_preorder() {
+        let response = run(
+            "const value = { 'key': ['', `x${1+2}`], empty: {} }; 'skip';",
+            serde_json::json!({"noHeader": true}),
+        );
+        assert!(response.supported, "{:?}", response.reason);
+        let result = response.result.unwrap();
+        let records: Vec<_> = result
+            .mutants
+            .iter()
+            .map(|mutant| {
+                (
+                    mutant.id.as_str(),
+                    mutant.mutator_name,
+                    mutant.replacement.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            records,
+            [
+                ("0", "ObjectLiteral", "{}"),
+                ("1", "ArrayDeclaration", "[]"),
+                ("2", "StringLiteral", "\"Stryker was here!\""),
+                ("3", "StringLiteral", "``"),
+                ("4", "ArithmeticOperator", "1 - 2"),
+            ]
+        );
+        let output = &result.files[0].content;
+        assert!(!output.contains("function stryNS_9fa48"));
+        assert!(output.contains("stryMutAct_9fa48(\"0\")"));
+        assert!(output.contains("stryCov_9fa48(\"4\")"));
+        assert!(output.contains("'key':"));
+        assert!(output.ends_with("'skip';"));
     }
 
     #[test]
