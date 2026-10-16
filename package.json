@@ -17,6 +17,10 @@
       "types": "./lib/index.d.ts",
       "import": "./lib/index.js"
     },
+    "./instrumenter": {
+      "types": "./lib/instrumenter.d.ts",
+      "import": "./lib/instrumenter.js"
+    },
     "./native": {
       "types": "./lib/runtime.d.ts",
       "import": "./lib/runtime.js"

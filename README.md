@@ -132,6 +132,12 @@ hooks; its first call owns the settings for subsequent instances. `createInstrum
 options)` creates an isolated instrumenter without a global hook. Importing the
 package alone does not install the hook.
 
+For standalone instrumentation in Node or Bun, use
+`stryker-mutator-rust/instrumenter`. Supported native calls and cache hits avoid
+loading the upstream instrumenter and core; auto-mode fallback loads one original
+upstream instance per factory on demand. The root compatibility API retains its
+real `Stryker` subclass and process-wide hooks. See the [instrumentation API](docs/instrumenter.md).
+
 `analyze(source, fileName)` is a broader **experimental candidate preview**. Its
 UTF-16, zero-based, end-exclusive offsets can be used with JavaScript `slice`.
 It always reports `supported: false`: it is neither the production instrumenter
@@ -152,7 +158,7 @@ or process-wide hook is created. `1` selects serial execution. Empty environment
 values select automatic mode; invalid values throw before hooks are installed.
 
 ```js
-import { createInstrumenter } from 'stryker-mutator-rust';
+import { createInstrumenter } from 'stryker-mutator-rust/instrumenter';
 
 const instrumenter = createInstrumenter(logger, {
   engine: 'native',
@@ -218,8 +224,13 @@ identifier parameters/bindings, identifier defaults and final identifier rest
 parameters, variable declarations, concise/block arrows,
 return/if/block/expression statements, plain imports/named exports and pure
 arithmetic, bitwise/shift traversal, comparisons, equality, boolean, logical, unary and conditional
-expressions. Strings, untagged templates, dense array literals and plain object
-literals are supported in compatible placement and printing contexts. Mutation
+expressions. Strings, untagged templates, identifier-tagged templates without type
+arguments (including ordinary `html`/`svg` tags), dense array literals and plain
+object literals are supported in compatible placement and printing contexts. Tagged
+quasi mutations wrap the complete tagged expression; substitutions retain their
+own placements. Member/call tags remain unsupported. Spread arguments are supported
+for ordinary nonoptional identifier calls, excluding built-ins with special mutation
+semantics (`Array`, `RegExp`, `require`, `Symbol`, and `eval`). Mutation
 records, IDs, locations, exclusions and runtime coverage follow the pinned
 Stryker contract. Bitwise operators visit their operands without inventing arithmetic
 mutants. Cloned replacement records preserve each string literal's original quotes

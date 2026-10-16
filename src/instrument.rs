@@ -801,6 +801,7 @@ enum ChainKind {
     ComputedMember,
     PrivateMember,
     NonNull,
+    Template,
 }
 
 fn chain_kind(node: &Expression<'_>) -> Option<ChainKind> {
@@ -810,6 +811,7 @@ fn chain_kind(node: &Expression<'_>) -> Option<ChainKind> {
         Expression::ComputedMemberExpression(_) => Some(ChainKind::ComputedMember),
         Expression::PrivateFieldExpression(_) => Some(ChainKind::PrivateMember),
         Expression::TSNonNullExpression(_) => Some(ChainKind::NonNull),
+        Expression::TemplateLiteral(_) => Some(ChainKind::Template),
         // The wrapper aliases the effective ChainElement, including its kind.
         Expression::ChainExpression(chain) => match &chain.expression {
             ChainElement::CallExpression(_) => Some(ChainKind::Call),
@@ -947,6 +949,19 @@ struct ReplaceExpression<'a, 'b> {
 }
 
 impl<'a> VisitMut<'a> for ReplaceExpression<'a, '_> {
+    fn visit_template_literal(&mut self, node: &mut TemplateLiteral<'a>) {
+        // A tagged quasi is a TemplateLiteral field, not an Expression hook.
+        // Replace that child while cloning its entire tagged placement site.
+        if self.kind == ChainKind::Template && node.span == self.target {
+            if let Expression::TemplateLiteral(replacement) = self.replacement {
+                *node = replacement.as_ref().clone_in(self.allocator);
+                self.replaced += 1;
+            }
+        } else {
+            walk_mut::walk_template_literal(self, node);
+        }
+    }
+
     fn visit_expression(&mut self, node: &mut Expression<'a>) {
         if node.span() == self.target && chain_kind(node) == Some(self.kind) {
             let replacement = self.replacement.clone_in(self.allocator);
@@ -1337,8 +1352,8 @@ impl Emitter<'_, '_> {
         mut context: Context<'_>,
         parenthesized: bool,
     ) -> Result<String, String> {
-        // Only call/member/non-null nodes on a callee/object spine defer placement. Keys
-        // and arguments keep independent placements in the original branch.
+        // Call/member/non-null spines and tagged quasis defer placement. Keys,
+        // arguments and template substitutions keep their own eligible placements.
         context.printed_ancestor |= chain_prints(node);
         context.printed_ancestor |= self.printed_statement;
         let mut switches = vec![];
@@ -1418,7 +1433,7 @@ impl Emitter<'_, '_> {
                 "Parenthesized optional-chain spines require upstream replacement topology".into(),
             );
         }
-        if chain_kind(node).is_some() {
+        if chain_kind(node).is_some() && !matches!(node, Expression::TemplateLiteral(_)) {
             self.expression_deferred(node, context, pending)
         } else {
             self.expression(node, context)
@@ -1850,8 +1865,18 @@ impl Emitter<'_, '_> {
                 edits.push((call.callee.span(), self.chain_child(&call.callee, child_context, pending)?));
                 let skip_string = !optional_kind(node) && matches!(&call.callee, Expression::Identifier(identifier) if matches!(identifier.name.as_str(), "require" | "Symbol"));
                 for argument in &call.arguments {
-                    let argument = argument.as_expression().ok_or("Spread arguments require upstream instrumentation")?;
-                    edits.push((argument.span(), self.expression(argument, Context { skip_string, ..child_context })?));
+                    if let Argument::SpreadElement(spread) = argument {
+                        // The engine owns iteration and argument order. Bound this
+                        // traversal to ordinary identifier calls: constructor,
+                        // mapped-method and optional-call semantics stay separate.
+                        if call.optional || !matches!(&call.callee, Expression::Identifier(identifier) if !matches!(identifier.name.as_str(), "Array" | "RegExp" | "require" | "Symbol" | "eval")) {
+                            return Err("Spread arguments outside ordinary identifier calls require upstream instrumentation".into());
+                        }
+                        edits.push((spread.argument.span(), self.expression(&spread.argument, child_context)?));
+                    } else {
+                        let argument = argument.as_expression().ok_or("Unsupported call argument")?;
+                        edits.push((argument.span(), self.expression(argument, Context { skip_string, ..child_context })?));
+                    }
                 }
             }
             Expression::NewExpression(new) => {
@@ -1921,6 +1946,19 @@ impl Emitter<'_, '_> {
                 if context.printed_ancestor && template.quasis.iter().any(|quasi| quasi.value.raw.contains('\r')) {
                     return Err("Template line endings require upstream replacement formatting".into());
                 }
+            }
+            Expression::TaggedTemplateExpression(tagged) => {
+                if !matches!(tagged.tag, Expression::Identifier(_)) || tagged.type_arguments.is_some() {
+                    return Err("Only identifier tagged templates without type arguments have native placement semantics".into());
+                }
+                // Neither direct child can host a conditional in upstream.
+                // The quasi's mutants lift to this entire tagged expression;
+                // its substitutions still place independently inside the quasi.
+                let child_context = Context { printed_ancestor: true, ..Context::default() };
+                edits.push((tagged.tag.span(), self.expression_deferred(&tagged.tag, child_context, pending)?));
+                let allocator = Allocator::default();
+                let quasi = Expression::TemplateLiteral(ArenaBox::new_in(tagged.quasi.clone_in(&allocator), &AstBuilder::new(&allocator)));
+                edits.push((tagged.quasi.span, self.expression_deferred(&quasi, child_context, pending)?));
             }
             Expression::ArrayExpression(array) => {
                 // Oxc expands arrays with more than two elements over multiple

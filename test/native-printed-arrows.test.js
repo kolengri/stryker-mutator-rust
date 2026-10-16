@@ -298,7 +298,7 @@ test('unproven arrow forms and prior printer boundaries fail closed for the whol
     ['values.map(value=>0x10n).filter(Boolean);'],
     ['values.map(value=>value as number).filter(Boolean);', 'opaque.ts'],
     ['values.map(value=>value/* (value) => */).filter(Boolean);'],
-    ['values.map(value=>invoke(...value)).filter(Boolean);'],
+    ['values.map(value=>receiver.invoke(...value)).filter(Boolean);'],
     ['const broken=values.map((value)=>;'],
   ]) await fallback(content, name);
   // Excluding emitted mutants does not prove an unsupported printer grammar.
