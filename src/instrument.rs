@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use oxc_allocator::{Allocator, Box as ArenaBox, CloneIn};
 use oxc_ast::{ast::*, builder::AstBuilder};
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
-use oxc_codegen::Codegen;
+use oxc_codegen::{Codegen, Gen};
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
@@ -470,6 +470,14 @@ fn instrument_file(
         records,
         next_id,
         placed: 0,
+        printed_statement: false,
+        labels: vec![],
+        comment_spans: parsed
+            .program
+            .comments
+            .iter()
+            .map(|comment| comment.span)
+            .collect(),
     };
     emitter.pruned = !file.mutate.overlaps(&emitter.location(parsed.program.span));
     let edits = parsed
@@ -564,6 +572,7 @@ impl Positions {
 #[derive(Default, Clone, Copy)]
 struct Context<'a> {
     if_test: bool,
+    loop_test: bool,
     logical_parent: Option<L>,
     binding_name: Option<&'a str>,
     printed_ancestor: bool,
@@ -740,6 +749,25 @@ impl<'a> VisitMut<'a> for ReplaceExpression<'a, '_> {
 enum TargetPlacement {
     Assignment,
     Update,
+    Iteration,
+}
+
+struct InvalidatedContinue<'a> {
+    labels: Vec<&'a str>,
+    found: bool,
+}
+
+impl<'a> Visit<'a> for InvalidatedContinue<'_> {
+    fn visit_continue_statement(&mut self, node: &ContinueStatement<'a>) {
+        self.found |= node
+            .label
+            .as_ref()
+            .is_some_and(|label| self.labels.contains(&label.name.as_str()));
+    }
+
+    fn visit_function(&mut self, _: &Function<'a>, _: oxc_syntax::scope::ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _: &ArrowFunctionExpression<'a>) {}
 }
 
 struct Switch {
@@ -761,6 +789,9 @@ struct Emitter<'s, 'r> {
     records: &'r mut Vec<ApiMutant>,
     next_id: &'r mut usize,
     placed: usize,
+    printed_statement: bool,
+    labels: Vec<(Span, String)>,
+    comment_spans: Vec<Span>,
 }
 
 impl Emitter<'_, '_> {
@@ -902,6 +933,7 @@ impl Emitter<'_, '_> {
         // Only call/member nodes on a callee/object spine defer placement. Keys
         // and arguments keep independent placements in the original branch.
         context.printed_ancestor |= chain_prints(node);
+        context.printed_ancestor |= self.printed_statement;
         let mut switches = vec![];
         let mut original = self.expression_deferred(node, context, &mut switches)?;
         if switches.is_empty() {
@@ -1047,10 +1079,10 @@ impl Emitter<'_, '_> {
             };
             edits.push((object.span(), emitter.chain_child(object, child_context, pending)?));
             if pending.len() != start {
-                if placement == TargetPlacement::Update {
-                    // Babel attempts a ConditionalExpression in UpdateExpression's
-                    // argument and throws. Preserve that diagnostic via fallback.
-                    return Err("Active update target-object mutations require upstream placement (invalid conditional lvalue)".into());
+                if placement != TargetPlacement::Assignment {
+                    // Babel attempts a conditional in an update argument or an
+                    // iteration target and throws. Preserve it via fallback.
+                    return Err("Active update target-object or iteration target-object mutations require upstream placement (invalid conditional lvalue)".into());
                 }
                 child_context.printed_ancestor = true;
             }
@@ -1148,7 +1180,9 @@ impl Emitter<'_, '_> {
             Expression::LogicalExpression(logical) => logical.operator != L::Coalesce,
             _ => false,
         };
-        let conditionals: &[&str] = if context.if_test {
+        let conditionals: &[&str] = if context.loop_test {
+            &["false"]
+        } else if context.if_test {
             &["true", "false"]
         } else if boolean_expression {
             match context.logical_parent {
@@ -1343,6 +1377,9 @@ impl Emitter<'_, '_> {
                 }
             }
             Expression::TemplateLiteral(template) => {
+                if self.printed_statement && template.quasis.iter().any(|quasi| quasi.value.raw.contains(['\r', '\n'])) {
+                    return Err("Multiline templates in whole-for replacements require upstream formatting".into());
+                }
                 for child in &template.expressions {
                     edits.push((child.span(), self.expression(child, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
                 }
@@ -1403,6 +1440,11 @@ impl Emitter<'_, '_> {
                     edits.push((child.span(), self.expression(child, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
                 }
             }
+            Expression::SequenceExpression(sequence) => {
+                for child in &sequence.expressions {
+                    edits.push((child.span(), self.expression(child, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
+                }
+            }
             Expression::ArrowFunctionExpression(arrow) => {
                 if arrow.r#async || arrow.type_parameters.is_some() || arrow.return_type.is_some() { return Err("Async or typed arrows require upstream instrumentation".into()); }
                 self.parameters(&arrow.params)?;
@@ -1414,7 +1456,7 @@ impl Emitter<'_, '_> {
                     }
                 }
             }
-            _ => return Err("Unsupported expression in native grammar (private members, new, import, regex, classes, sequences, and type syntax require upstream)".into()),
+            _ => return Err("Unsupported expression in native grammar (private members, new, import, regex, classes, and type syntax require upstream)".into()),
         }
         Ok(self.apply(node.span(), edits))
     }
@@ -1547,6 +1589,280 @@ impl Emitter<'_, '_> {
         }
     }
 
+    fn for_left(&mut self, node: &ForStatementLeft<'_>) -> Result<String, String> {
+        if let ForStatementLeft::VariableDeclaration(variables) = node {
+            return self.scope(variables.span, false, |emitter| {
+                emitter
+                    .variables(variables)
+                    .map(|text| text.trim_end_matches(';').into())
+            });
+        }
+        let target = node
+            .as_assignment_target()
+            .and_then(AssignmentTarget::as_simple_assignment_target)
+            .ok_or("Destructuring iteration targets require upstream instrumentation")?;
+        self.lvalue(
+            target,
+            Context::default(),
+            &mut vec![],
+            TargetPlacement::Iteration,
+        )
+    }
+
+    fn switch_case(&mut self, node: &SwitchCase<'_>) -> Result<String, String> {
+        self.scope(node.span, false, |emitter| {
+            let mut switches = vec![];
+            if !node.consequent.is_empty() {
+                let replacement = match &node.test {
+                    // Babel retains the original spelling when cloning a case.
+                    Some(Expression::StringLiteral(string)) => format!("case {}:", emitter.text(string.span)),
+                    Some(test @ Expression::SequenceExpression(_)) => format!("case ({}):", emitter.print(test)),
+                    Some(test) => format!("case {}:", emitter.print(test)),
+                    None => "default:".into(),
+                };
+                emitter.collect(node.span, replacement, "ConditionalExpression", &mut switches);
+            }
+            let mut edits = vec![];
+            if let Some(test) = &node.test {
+                edits.push((test.span(), emitter.expression(test, Context {
+                    printed_ancestor: !node.consequent.is_empty() && !matches!(test, Expression::StringLiteral(_)),
+                    ..Context::default()
+                })?));
+            }
+            let Some(first) = node.consequent.first() else {
+                return Ok(emitter.apply(node.span, edits));
+            };
+            let head = emitter.apply(Span::new(node.span.start, first.span().start), edits);
+            let mut edits = vec![];
+            for statement in &node.consequent {
+                edits.push((statement.span(), emitter.statement(statement, false)?));
+            }
+            let body = emitter.apply(Span::new(first.span().start, node.span.end), edits);
+            Ok(if let Some(switch) = switches.first() {
+                format!("{head} if (stryMutAct_9fa48(\"{}\")) {{}} else {{ stryCov_9fa48(\"{}\"); {body} }}", switch.id, switch.id)
+            } else { format!("{head}{body}") })
+        })
+    }
+
+    // Only whole-for clones need statement replacement text. Keep this bounded
+    // formatter beside the existing expression printer and apply its same guards
+    // to every descendant while traversing the original branch.
+    fn print_statement(&self, node: &Statement<'_>) -> Result<String, String> {
+        fn indent(text: &str) -> String {
+            text.lines()
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        fn ends_in_if(mut node: &Statement<'_>) -> bool {
+            loop {
+                node = match node {
+                    Statement::ForStatement(node) => &node.body,
+                    Statement::ForInStatement(node) => &node.body,
+                    Statement::ForOfStatement(node) => &node.body,
+                    Statement::WhileStatement(node) => &node.body,
+                    Statement::DoWhileStatement(node) => &node.body,
+                    Statement::LabeledStatement(node) => &node.body,
+                    _ => return matches!(node, Statement::IfStatement(_)),
+                };
+            }
+        }
+        let expression = |node: &Expression<'_>| self.print(node);
+        let variables = |node: &VariableDeclaration<'_>, header: bool| -> Result<String, String> {
+            let mut declarations = vec![];
+            for declaration in &node.declarations {
+                let BindingPattern::BindingIdentifier(binding) = &declaration.id else {
+                    return Err("Destructuring bindings require upstream instrumentation".into());
+                };
+                declarations.push(if let Some(init) = &declaration.init {
+                    let text = expression(init);
+                    let text = if matches!(init, Expression::SequenceExpression(_)) {
+                        format!("({text})")
+                    } else {
+                        text
+                    };
+                    format!("{} = {text}", binding.name)
+                } else {
+                    binding.name.to_string()
+                });
+            }
+            Ok(format!(
+                "{} {}",
+                node.kind.as_str(),
+                declarations.join(
+                    if !header && node.declarations.iter().any(|node| node.init.is_some()) {
+                        ",\n  "
+                    } else {
+                        ", "
+                    }
+                )
+            ))
+        };
+        let loop_body = |node: &Statement<'_>, for_parent: bool| -> Result<String, String> {
+            let text = match node {
+                Statement::VariableDeclaration(node) if for_parent => {
+                    format!("{};", variables(node, true)?)
+                }
+                _ => self.print_statement(node)?,
+            };
+            Ok(if matches!(node, Statement::EmptyStatement(_)) {
+                text
+            } else {
+                format!(" {text}")
+            })
+        };
+        let for_left = |node: &ForStatementLeft<'_>| -> Result<String, String> {
+            if let ForStatementLeft::VariableDeclaration(node) = node {
+                variables(node, true)
+            } else {
+                let mut generator = Codegen::new().with_source_text(self.source);
+                node.to_assignment_target()
+                    .print(&mut generator, oxc_codegen::Context::empty());
+                Ok(generator.into_source_text())
+            }
+        };
+        Ok(match node {
+            Statement::BlockStatement(block) => {
+                if block.body.is_empty() {
+                    "{}".into()
+                } else {
+                    let body = block
+                        .body
+                        .iter()
+                        .map(|node| self.print_statement(node))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .join("\n");
+                    format!("{{\n{}\n}}", indent(&body))
+                }
+            }
+            Statement::ExpressionStatement(node) => format!("{};", expression(&node.expression)),
+            Statement::VariableDeclaration(node) => format!("{};", variables(node, false)?),
+            Statement::ReturnStatement(node) => {
+                node.argument.as_ref().map_or("return;".into(), |node| {
+                    format!("return {};", expression(node))
+                })
+            }
+            Statement::BreakStatement(node) => node
+                .label
+                .as_ref()
+                .map_or("break;".into(), |label| format!("break {};", label.name)),
+            Statement::ContinueStatement(node) => {
+                node.label.as_ref().map_or("continue;".into(), |label| {
+                    format!("continue {};", label.name)
+                })
+            }
+            Statement::EmptyStatement(_) => ";".into(),
+            Statement::IfStatement(node) => {
+                let mut consequent = self.print_statement(&node.consequent)?;
+                if node.alternate.is_some() && ends_in_if(&node.consequent) {
+                    consequent = format!("{{\n{}\n}}", indent(&consequent));
+                }
+                let braced = consequent.ends_with('}');
+                let mut result = format!("if ({}) {consequent}", expression(&node.test));
+                if let Some(alternate) = &node.alternate {
+                    if braced {
+                        result.push(' ');
+                    }
+                    result.push_str(&format!("else {}", self.print_statement(alternate)?));
+                }
+                result
+            }
+            Statement::WhileStatement(node) => format!(
+                "while ({}){}",
+                expression(&node.test),
+                loop_body(&node.body, false)?
+            ),
+            Statement::DoWhileStatement(node) => format!(
+                "do {} while ({});",
+                self.print_statement(&node.body)?,
+                expression(&node.test)
+            ),
+            Statement::ForStatement(node) => {
+                let init = match &node.init {
+                    Some(ForStatementInit::VariableDeclaration(node)) => variables(node, true)?,
+                    Some(node) => {
+                        expression(node.as_expression().ok_or("Unsupported for initializer")?)
+                    }
+                    None => String::new(),
+                };
+                let test = node
+                    .test
+                    .as_ref()
+                    .map(|node| format!(" {}", expression(node)))
+                    .unwrap_or_default();
+                let update = node
+                    .update
+                    .as_ref()
+                    .map(|node| format!(" {}", expression(node)))
+                    .unwrap_or_default();
+                format!(
+                    "for ({init};{test};{update}){}",
+                    loop_body(&node.body, true)?
+                )
+            }
+            Statement::ForInStatement(node) => format!(
+                "for ({} in {}){}",
+                for_left(&node.left)?,
+                expression(&node.right),
+                loop_body(&node.body, true)?
+            ),
+            Statement::ForOfStatement(node) => {
+                let right = expression(&node.right);
+                let right = if matches!(node.right, Expression::SequenceExpression(_)) {
+                    format!("({right})")
+                } else {
+                    right
+                };
+                format!(
+                    "for ({} of {right}){}",
+                    for_left(&node.left)?,
+                    loop_body(&node.body, true)?
+                )
+            }
+            Statement::LabeledStatement(node) => {
+                format!("{}: {}", node.label.name, self.print_statement(&node.body)?)
+            }
+            Statement::SwitchStatement(node) => {
+                let mut cases = vec![];
+                for case in &node.cases {
+                    let head = case.test.as_ref().map_or("default:".into(), |test| {
+                        let text = expression(test);
+                        if matches!(test, Expression::SequenceExpression(_)) {
+                            format!("case ({text}):")
+                        } else {
+                            format!("case {text}:")
+                        }
+                    });
+                    let body = case
+                        .consequent
+                        .iter()
+                        .map(|node| self.print_statement(node))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .join("\n");
+                    cases.push(if body.is_empty() {
+                        head
+                    } else {
+                        format!("{head}\n{}", indent(&body))
+                    });
+                }
+                if cases.is_empty() {
+                    format!("switch ({}) {{}}", expression(&node.discriminant))
+                } else {
+                    format!(
+                        "switch ({}) {{\n{}\n}}",
+                        expression(&node.discriminant),
+                        indent(&cases.join("\n"))
+                    )
+                }
+            }
+            _ => {
+                return Err(
+                    "Statement in whole-for replacement requires upstream formatting".into(),
+                );
+            }
+        })
+    }
+
     fn statement(&mut self, node: &Statement<'_>, top_level: bool) -> Result<String, String> {
         self.scope(node.span(), true, |emitter| {
             emitter.statement_inner(node, top_level)
@@ -1591,6 +1907,86 @@ impl Emitter<'_, '_> {
                 edits.push((statement.consequent.span(), self.statement(&statement.consequent, false)?));
                 if let Some(alternate) = &statement.alternate { edits.push((alternate.span(), self.statement(alternate, false)?)); }
             }
+            Statement::WhileStatement(statement) => {
+                edits.push((statement.test.span(), self.expression(&statement.test, Context { loop_test: true, ..Context::default() })?));
+                edits.push((statement.body.span(), self.statement(&statement.body, false)?));
+            }
+            Statement::DoWhileStatement(statement) => {
+                // Babel visits the body before the test, even though the test
+                // owns the loop's ConditionalExpression candidate.
+                edits.push((statement.body.span(), self.statement(&statement.body, false)?));
+                edits.push((statement.test.span(), self.expression(&statement.test, Context { loop_test: true, ..Context::default() })?));
+            }
+            Statement::ForStatement(statement) => {
+                let mut switches = vec![];
+                let previous_printed = self.printed_statement;
+                if statement.test.is_none() {
+                    if self.comment_spans.iter().any(|comment| {
+                        statement.span.contains_inclusive(*comment)
+                            || (comment.end <= statement.span.start && self.text(Span::new(comment.end, statement.span.start)).trim_matches(js_whitespace).is_empty())
+                            || (comment.start >= statement.span.end && self.text(Span::new(statement.span.end, comment.start)).trim_matches(js_whitespace).is_empty())
+                    }) {
+                        return Err("Comments in or adjacent to whole-for replacements require upstream formatting".into());
+                    }
+                    let allocator = Allocator::default();
+                    let mut replacement = node.clone_in(&allocator);
+                    let Statement::ForStatement(replacement_for) = &mut replacement else { unreachable!() };
+                    replacement_for.test = Some(Expression::new_boolean_literal(Span::default(), false, &AstBuilder::new(&allocator)));
+                    let text = self.print_statement(&replacement)?;
+                    self.collect(statement.span, text, "ConditionalExpression", &mut switches);
+                    // Wrapping the directly labelled loop in an if makes those
+                    // labels cease to denote an iteration statement in upstream.
+                    if !switches.is_empty() {
+                        let mut invalid = InvalidatedContinue {
+                            labels: self.labels.iter().filter(|(span, _)| *span == statement.span).map(|(_, label)| label.as_str()).collect(),
+                            found: false,
+                        };
+                        invalid.visit_statement(&statement.body);
+                        if invalid.found { return Err("Labelled continue across a whole-for mutation requires upstream invalid placement".into()); }
+                    }
+                    self.printed_statement = true;
+                }
+                if let Some(init) = &statement.init {
+                    let text = if let ForStatementInit::VariableDeclaration(variables) = init {
+                        self.scope(variables.span, false, |emitter| emitter.variables(variables))?.trim_end_matches(';').into()
+                    } else { self.expression(init.as_expression().ok_or("Unsupported for initializer")?, Context::default())? };
+                    edits.push((init.span(), text));
+                }
+                if let Some(test) = &statement.test { edits.push((test.span(), self.expression(test, Context { loop_test: true, ..Context::default() })?)); }
+                if let Some(update) = &statement.update { edits.push((update.span(), self.expression(update, Context::default())?)); }
+                edits.push((statement.body.span(), self.statement(&statement.body, false)?));
+                self.printed_statement = previous_printed;
+                let original = self.apply(statement.span, edits);
+                return Ok(if let Some(switch) = switches.first() {
+                    // The clone is uninstrumented; only the baseline descends.
+                    // A block also protects dangling-else and label boundaries.
+                    format!("{{ if (stryMutAct_9fa48(\"{}\")) {{ {} }} else {{ stryCov_9fa48(\"{}\"); {original} }} }}", switch.id, switch.replacement, switch.id)
+                } else { original });
+            }
+            Statement::ForInStatement(statement) => {
+                edits.push((statement.left.span(), self.for_left(&statement.left)?));
+                edits.push((statement.right.span(), self.expression(&statement.right, Context::default())?));
+                edits.push((statement.body.span(), self.statement(&statement.body, false)?));
+            }
+            Statement::ForOfStatement(statement) => {
+                if statement.r#await { return Err("for-await requires upstream instrumentation".into()); }
+                edits.push((statement.left.span(), self.for_left(&statement.left)?));
+                edits.push((statement.right.span(), self.expression(&statement.right, Context::default())?));
+                edits.push((statement.body.span(), self.statement(&statement.body, false)?));
+            }
+            Statement::SwitchStatement(statement) => {
+                edits.push((statement.discriminant.span(), self.expression(&statement.discriminant, Context::default())?));
+                for case in &statement.cases { edits.push((case.span, self.switch_case(case)?)); }
+            }
+            Statement::LabeledStatement(statement) => {
+                let mut body = &statement.body;
+                while let Statement::LabeledStatement(labelled) = body { body = &labelled.body; }
+                self.labels.push((body.span(), statement.label.name.to_string()));
+                let result = self.statement(&statement.body, false);
+                self.labels.pop();
+                edits.push((statement.body.span(), result?));
+            }
+            Statement::BreakStatement(_) | Statement::ContinueStatement(_) => return Ok(Self::terminate(self.text(node.span()).into())),
             Statement::ExportDeclaration(export) => edits.push((export.declaration.span(), self.declaration(&export.declaration)?)),
             Statement::ExportNamedDeclaration(export) => {
                 if export.specifiers.iter().any(|specifier| matches!(specifier.local, ModuleExportName::StringLiteral(_)) || matches!(specifier.exported, ModuleExportName::StringLiteral(_))) {
@@ -1609,7 +2005,7 @@ impl Emitter<'_, '_> {
                 if import.phase.is_some() || import.with_clause.is_some() { return Err("Import phases and attributes require upstream instrumentation".into()); }
             }
             Statement::EmptyStatement(_) => {},
-            _ => return Err("Unsupported statement in native grammar (loops, switch, try, classes, default exports, and control-flow extensions require upstream)".into()),
+            _ => return Err("Unsupported statement in native grammar (try, classes, default exports, and control-flow extensions require upstream)".into()),
         }
         let output = self.apply(node.span(), edits);
         Ok(
@@ -1935,7 +2331,7 @@ mod tests {
             "factory().trim().field = x => x;",
             "a += {key: 1};",
             "[a] = b;",
-            "(a++, b++);",
+            "([a] = b, c++);",
         ] {
             let response = run(source, Value::Null);
             assert!(!response.supported, "{source}");
