@@ -82,14 +82,20 @@ arithmetic, comparisons, equality, boolean, logical, unary and conditional
 expressions. Strings, untagged templates, dense array literals and plain object
 literals are supported in compatible placement and printing contexts. Mutation
 records, IDs, locations, exclusions and runtime coverage follow the pinned
-Stryker contract. Calls, members, regex, array holes/spread, object methods,
+Stryker contract. Mutation ranges select candidates using upstream UTF-16
+locations. Ordinary comments and Stryker disable/restore directives are accepted
+in unambiguous gaps between statements, including `next-line` and ignore reasons.
+Comments inside expressions, ambiguous attachments and directives requiring
+upstream warnings still trigger whole-batch fallback.
+
+Calls, members, regex, array holes/spread, object methods,
 accessors/spread, complex computed keys, assignments/updates, loops, classes,
-async/generators, comments, directives and mutation ranges trigger whole-batch
-fallback. Noncanonical number spellings, incompatible raw string/template
-spellings inside printed mutation replacements, and objects or arrays with more
-than two elements inside those replacements also fall back. See
-`src/instrument.rs` for the definitive
-acceptance checks. The native engine does not claim the broader preview's scope.
+async/generators, directive prologues and hashbangs trigger whole-batch fallback.
+Noncanonical number spellings and incompatible raw string/template spellings
+inside printed mutation replacements also fall back, as do objects and arrays
+with more than two elements inside those replacements. See `src/instrument.rs`
+for the definitive acceptance checks. The native engine does not claim the
+broader preview's scope.
 
 Node stays responsible for running existing JavaScript tests and plugins. Custom
 ignore plugins receive real Babel `NodePath` objects in Stryker; an ordinary JSON
@@ -112,8 +118,11 @@ participate in the key. Test changes still cause tests to run.
 
 The default directory is `node_modules/.cache/stryker-rust`, outside sandbox input.
 Use `STRYKER_RUST_CACHE_DIR` to move it or `STRYKER_RUST_CACHE=0` to disable it.
-Caches bypass custom ignorers, framework parsers and ambient Babel configurations;
-cache I/O failures fall back to normal execution. Clear development caches after
+Caches bypass custom ignorers, framework parsers and ambient Babel configurations.
+Potential `Stryker disable`/`restore` text also bypasses the cache so upstream
+warnings are emitted on every invocation. This conservative text check can also
+match string contents; native dispatch remains available for supported directives.
+Cache I/O failures fall back to normal execution. Clear development caches after
 rebuilding an unpublished native binary without changing the package version.
 
 Instrumentation cache hits do not establish whole-run acceleration. Stryker's own

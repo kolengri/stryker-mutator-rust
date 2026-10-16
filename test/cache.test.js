@@ -71,6 +71,36 @@ test('custom ignorers are invoked on every call and never cached', async (t) => 
   assert.equal(sut.stats.bypasses, 2);
 });
 
+test('directive inputs preserve repeated warnings without disabling native dispatch', async (t) => {
+  const { directory } = await context(t);
+  for (const directive of ['disable UnknownName', 'restore UnknownName', 'disable ALL', 'disable BooleanLiteral,', 'disable next-line ', 'disable BooleanLiteral']) {
+    for (const engine of ['auto', 'upstream']) {
+      const files = [{ name: 'directive.js', content: `// Stryker ${directive}\nconst flag = true;`, mutate: true }];
+      const expectedWarnings = [], actualWarnings = [];
+      const reference = new Instrumenter({ ...logger, warn: (...args) => expectedWarnings.push(args) });
+      const sut = createInstrumenter({ ...logger, warn: (...args) => actualWarnings.push(args) }, { cacheDir: directory, engine });
+      let previous;
+      for (let invocation = 0; invocation < 2; invocation++) {
+        const expected = await reference.instrument(files, options);
+        const actual = await sut.instrument(files, options);
+        assert.deepEqual(actual.mutants, expected.mutants, `${engine}: ${directive}`);
+        assert.deepEqual(actualWarnings, expectedWarnings, `${engine}: ${directive}: invocation ${invocation}`);
+        if (previous) assert.deepEqual(actual, previous);
+        previous = actual;
+      }
+      const native = engine === 'auto' && directive === 'disable BooleanLiteral';
+      assert.equal(expectedWarnings.length, directive === 'disable BooleanLiteral' ? 0 : 2);
+      assert.equal(sut.stats.nativeBatches, native ? 2 : 0);
+      assert.equal(sut.stats.fallbackBatches, native ? 0 : 2);
+      assert.equal(sut.stats.nativeErrors, 0);
+      assert.equal(sut.stats.bypasses, 2);
+      assert.equal(sut.stats.hits, 0);
+      assert.equal(sut.stats.misses, 0);
+    }
+  }
+  assert.deepEqual(await readdir(directory), [], 'directive output must never enter the cache');
+});
+
 test('cache I/O errors and diagnostic callback failures do not affect execution', async (t) => {
   const { directory } = await context(t);
   const path = join(directory, 'file');

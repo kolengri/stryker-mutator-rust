@@ -306,7 +306,7 @@ export function calc(x) { return [flag, text, x + 1]; }`;
 
 test('comment-only files and cached range results preserve the selection contract', async (t) => {
   await parity([{ name: 'comments-only.js', content: '// Stryker disable UnknownName\n/* ordinary */', mutate: true }], options, '1');
-  const content = '// Stryker disable BooleanLiteral\nconst flag = true; const value = 1 + 2;';
+  const content = '// ordinary comment\nconst flag = true; const value = 1 + 2;';
   const selected = [{ name: 'cache.js', content, mutate: [range(content, 'true')] }];
   const cacheDir = await mkdtemp(join(tmpdir(), 'stryker-rust-directives-'));
   t.after(() => rm(cacheDir, { recursive: true, force: true }));
