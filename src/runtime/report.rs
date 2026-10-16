@@ -80,21 +80,21 @@ pub(super) fn assemble(config: &Config, project: &Project, mutants: &[Value]) ->
         let relative = Path::new(file_name)
             .strip_prefix(&config.cwd)
             .expect("owned mutant source");
-        let name = relative.to_string_lossy();
-        if files.get(name.as_ref()).is_none() {
+        let name = super::project::name(relative).expect("validated UTF-8 mutant source");
+        if files.get(name.as_str()).is_none() {
             let language = match relative.extension().and_then(|value| value.to_str()) {
                 Some("ts" | "tsx") => "typescript",
                 Some("html" | "vue") => "html",
                 _ => "javascript",
             };
-            files[name.as_ref()] = json!({"language":language,"source": project.originals[name.as_ref()],"mutants":[]});
+            files[name.as_str()] = json!({"language":language,"source": project.originals[name.as_str()],"mutants":[]});
         }
         let mut record = mutant.clone();
         record
             .as_object_mut()
             .expect("mutant object")
             .remove("fileName");
-        files[name.as_ref()]["mutants"]
+        files[name.as_str()]["mutants"]
             .as_array_mut()
             .expect("report mutant list")
             .push(record);
@@ -132,20 +132,20 @@ pub(super) fn assemble_mocha(
         let relative = Path::new(file_name)
             .strip_prefix(&config.cwd)
             .unwrap_or_else(|_| Path::new(file_name));
-        let name = relative.to_string_lossy();
-        if files.get(name.as_ref()).is_none() {
-            files[name.as_ref()] = json!({"tests":[]});
+        let name = super::project::name(relative)?;
+        if files.get(name.as_str()).is_none() {
+            files[name.as_str()] = json!({"tests":[]});
             if !file_name.is_empty() && project.files.iter().any(|file| file == relative) {
                 let source = fs::read_to_string(config.cwd.join(relative))
                     .map_err(|error| format!("Cannot read original test source: {error}"))?;
-                files[name.as_ref()]["source"] = source.into();
+                files[name.as_str()]["source"] = source.into();
             }
         }
         let mut definition = json!({"id":ids.get(test["id"].as_str().ok_or("SDK test omitted ID")?).ok_or("Missing test slot")?,"name":test["name"]});
         if let Some(position) = test.get("startPosition") {
             definition["location"] = json!({"start":{"line":position["line"].as_u64().ok_or("Invalid test line")?+1,"column":position["column"].as_u64().ok_or("Invalid test column")?+1}});
         }
-        files[name.as_ref()]["tests"]
+        files[name.as_str()]["tests"]
             .as_array_mut()
             .expect("test list")
             .push(definition);

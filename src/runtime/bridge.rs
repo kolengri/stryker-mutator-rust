@@ -19,7 +19,7 @@ use tokio::{
     time::Instant,
 };
 
-use super::process::{Group, cancelled, terminate_group};
+use super::process::{Group, cancelled, reap};
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_SAFE_ID: u64 = 9_007_199_254_740_991;
@@ -27,6 +27,10 @@ const OUTPUT_LIMIT: usize = 1024 * 1024;
 const EVENT_LIMIT: usize = 256;
 const EVENT_BYTES_LIMIT: usize = 1024 * 1024;
 const DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+
+#[cfg(all(test, windows))]
+#[path = "windows_bridge_tests.rs"]
+mod windows_tests;
 
 pub(super) struct BridgeSpec {
     pub node_executable: PathBuf,
@@ -123,9 +127,9 @@ impl BridgeSession {
         if *cancellation.borrow() {
             return Err(BridgeError::Cancelled);
         }
-        if !cfg!(unix) {
+        if !cfg!(any(unix, windows)) {
             return Err(BridgeError::Process(
-                "Compatibility worker process groups require POSIX support".into(),
+                "Compatibility worker process containment is unsupported on this platform".into(),
             ));
         }
         if !spec.cwd.is_absolute()
@@ -164,12 +168,10 @@ impl BridgeSession {
         if std::env::var_os("STRYKER_MUTATOR_WORKER").is_none() {
             command.env("STRYKER_MUTATOR_WORKER", super::worker_id());
         }
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command.spawn().map_err(|error| {
-            BridgeError::Process(format!("Cannot spawn compatibility worker: {error}"))
-        })?;
-        let pid = child.id().expect("a newly spawned child has a PID");
+        let (mut child, group) = Group::spawn(&mut command, "compatibility worker")
+            .await
+            .map_err(BridgeError::Process)?;
+        let pid = group.pid;
         let capture = Arc::new(Mutex::new(Capture::default()));
         let stdout = tokio::spawn(drain(
             child.stdout.take().expect("stdout is piped"),
@@ -187,7 +189,7 @@ impl BridgeSession {
         let mut session = Self {
             child: Some(child),
             pid,
-            group: Some(Group { pid, armed: true }),
+            group: Some(group),
             writer: None,
             reader: None,
             responses,
@@ -427,33 +429,47 @@ impl BridgeSession {
             reader.abort();
             let _ = reader.await;
         }
+        #[allow(unused_mut)]
         let mut termination = self
             .group
             .as_ref()
-            .map(|group| terminate_group(group.pid))
+            .map(Group::terminate)
             .transpose()
             .map_err(BridgeError::Process);
-        let reaped = if let Some(child) = &mut self.child {
-            let _ = child.start_kill();
-            child.wait().await.map(|_| ()).map_err(|error| {
-                BridgeError::Process(format!("Cannot reap compatibility worker: {error}"))
-            })
-        } else {
-            Ok(())
-        };
+        let (reaped, empty) = tokio::join!(
+            async {
+                if let Some(child) = &mut self.child {
+                    let _ = child.start_kill();
+                    reap(child, "compatibility worker")
+                        .await
+                        .map_err(BridgeError::Process)
+                } else {
+                    Ok(())
+                }
+            },
+            async {
+                if let Some(group) = &self.group {
+                    group.wait_empty().await.map_err(BridgeError::Process)
+                } else {
+                    Ok(())
+                }
+            }
+        );
         // Darwin's killpg1 skips SZOMB members and can return EPERM for a
         // zombie-only group. Reap our leader, then require a real successful
         // group termination/ESRCH retry; absence of the leader alone is no proof.
+        #[cfg(unix)]
         if termination.is_err() && reaped.is_ok() {
             termination = self
                 .group
                 .as_ref()
-                .map(|group| terminate_group(group.pid))
+                .map(Group::terminate)
                 .transpose()
                 .map_err(BridgeError::Process);
         }
         if termination.is_ok()
             && reaped.is_ok()
+            && empty.is_ok()
             && let Some(group) = &mut self.group
         {
             group.armed = false;
@@ -462,7 +478,7 @@ impl BridgeSession {
             join_drain(self.stdout.take()),
             join_drain(self.stderr.take())
         );
-        let errors: Vec<_> = [termination.map(|_| ()), reaped, stdout, stderr]
+        let errors: Vec<_> = [termination.map(|_| ()), reaped, empty, stdout, stderr]
             .into_iter()
             .filter_map(Result::err)
             .map(|error| error.to_string())
@@ -470,6 +486,9 @@ impl BridgeSession {
         if errors.is_empty() {
             Ok(())
         } else {
+            if let Some(group) = &mut self.group {
+                group.armed = true;
+            }
             let error = BridgeError::Cleanup(errors.join("; "));
             self.cleanup_failure = Some(error.clone());
             Err(error)

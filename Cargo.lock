@@ -225,6 +225,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd8e701084c37e7ef62d3f9e453b618130cbc0ef3573847785952a3ac3f746bf"
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -645,6 +651,16 @@ dependencies = [
  "num-traits",
  "serde_json",
  "zmij",
+]
+
+[[package]]
+name = "junction"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cde48f36530cbd91b65f050101e6c056d6eb743cea2a8f0f19beef69c6742ff8"
+dependencies = [
+ "scopeguard",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1528,10 +1544,12 @@ name = "stryker-mutator-rust"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "dunce",
  "getrandom 0.4.3",
  "globset",
  "jsonc-parser",
  "jsonschema",
+ "junction",
  "napi",
  "napi-build",
  "napi-derive",
@@ -1549,6 +1567,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "windows-sys",
 ]
 
 [[package]]

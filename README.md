@@ -15,7 +15,7 @@ worker lifecycle and test execution.
 
 An experimental native coordinator is being added separately from that legacy
 runner. `STRYKER_RUST_COORDINATOR_ENGINE=native stryker-rust run` selects it without
-an upstream coordinator fallback. Its current scope is POSIX, JSON configuration,
+an upstream coordinator fallback. Its current scope is JSON configuration,
 the built-in command runner with coverage off, or Mocha through the pinned
 `@stryker-mutator/mocha-runner` plugin. Checker plugins are not yet supported;
 reporters are limited to JSON or none. Rust owns file selection, instrumentation,
@@ -24,6 +24,13 @@ cancellation, cleanup, and report assembly. Node workers retain the actual Mocha
 plugin and test framework. Unsupported configuration exits before starting a
 mutation run. This scope does not establish full compatibility; performance must
 be measured for the chosen runner and workload.
+
+The Windows backend is a candidate requiring actual Windows CI verification.
+It uses owned Job Objects and dependency junctions, and accepts only project and
+sandbox paths that safely normalize to ordinary absolute drive paths. UNC/device
+and still-verbatim project paths, and ambiguous TSConfig path aliases, are rejected
+explicitly. POSIX retains process-group cleanup. Cross-compilation alone does not
+establish Windows runtime support.
 
 The corresponding API is `runNativeMutationTest({ cwd, args, overrides }, { signal })`
 from `stryker-mutator-rust/native`. Cancellation settles only after native cleanup.

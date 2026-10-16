@@ -82,7 +82,7 @@ jobs:
           npm run pack:local
           node scripts/install-smoke.js
       - name: Native coordinator full-report parity
-        if: ${{ !matrix.musl && runner.os != 'Windows' }}
+        if: ${{ !matrix.musl }}
         run: npm run test:integration:native
       - name: Verify musl in its actual runtime
         if: matrix.musl
@@ -112,6 +112,8 @@ jobs:
             artifacts/verification/*/summary.json
             artifacts/native-runtime/integration/*.log
             artifacts/native-runtime/integration/receipt.json
+            artifacts/native-runtime/integration-mocha/*.log
+            artifacts/native-runtime/integration-mocha/receipt.json
           if-no-files-found: warn
 
   bundle:

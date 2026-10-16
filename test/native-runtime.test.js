@@ -9,7 +9,8 @@ import { test } from 'node:test';
 import { runNativeMutationTest } from '../lib/runtime.js';
 
 async function project(t, script = '') {
-  const directory = resolve('artifacts/native-runtime/public-api', `${process.pid}-${randomUUID()}`);
+  const suffix = process.platform === 'win32' ? ' Windows spaces & paths' : '';
+  const directory = resolve('artifacts/native-runtime/public-api', `${process.pid}-${randomUUID()}${suffix}`);
   await mkdir(directory, { recursive: true });
   t.after(() => rm(directory, { recursive: true, force: true }));
   await writeFile(join(directory, 'package.json'), '{"type":"module"}');
@@ -22,7 +23,7 @@ async function project(t, script = '') {
   return directory;
 }
 
-const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+const quote = (value) => process.platform === 'win32' ? `"${value}"` : `'${value.replaceAll("'", "'\\''")}'`;
 
 test('public native pre-abort preserves the reason without running a command or creating a sandbox', async (t) => {
   const cwd = await project(t, "throw new Error('must not execute');");
@@ -102,5 +103,61 @@ setInterval(() => {}, 1000);
     assert.equal(recovered.supported, true);
     assert.equal(recovered.stats.coordinator, 'rust');
     assert.equal(recovered.stats.commandStarts, 1);
+  });
+}
+
+if (process.platform === 'win32') {
+  test('public Windows abort awaits root and grandchildren exit and junction cleanup while preserving dependency targets', { timeout: 20000 }, async (t) => {
+    const cwd = await project(t);
+    const sentinel = join(cwd, 'node_modules', 'original-sentinel');
+    await mkdir(join(cwd, 'node_modules'));
+    await writeFile(sentinel, 'dependency target must survive');
+    const pidFile = join(cwd, 'children.json');
+    const branch = `
+const {spawn} = require('node:child_process');
+const {writeFileSync} = require('node:fs');
+const leaf = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio:'ignore'});
+writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([Number(process.argv[1]), process.pid, leaf.pid]));
+setInterval(() => {}, 1000);
+`;
+    await writeFile(join(cwd, 'test.mjs'), `
+import {spawn} from 'node:child_process';
+spawn(process.execPath, ['-e', ${JSON.stringify(branch)}, String(process.pid)], {stdio:'ignore'});
+setInterval(() => {}, 1000);
+`);
+    const controller = new AbortController();
+    const reason = new Error('Windows public cancellation reason');
+    const settled = runNativeMutationTest({ cwd }, { signal: controller.signal })
+      .then((value) => ({ value }), (error) => ({ error }));
+    let pids;
+    let result;
+    try {
+      const started = performance.now();
+      while (performance.now() - started < 12000) {
+        try {
+          pids = JSON.parse(await readFile(pidFile, 'utf8'));
+          break;
+        } catch (error) {
+          if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+        }
+        await delay(10);
+      }
+      assert.equal(pids?.length, 3, 'Root, child and grandchild must start while Node remains responsive');
+      assert.ok(pids.every((pid) => Number.isSafeInteger(pid) && pid > 0));
+    } finally {
+      controller.abort(reason);
+      result = await settled;
+    }
+    assert.equal(result.error, reason, 'AbortSignal reason follows native tree and sandbox cleanup');
+    assert.ok(!(await readdir(cwd)).includes('.stryker-tmp'), 'Promise settled before junction/sandbox cleanup');
+    assert.equal(await readFile(sentinel, 'utf8'), 'dependency target must survive');
+    for (const pid of pids) {
+      assert.throws(() => process.kill(pid, 0), (error) => error.code === 'ESRCH', `Process ${pid} remains active after settlement`);
+    }
+    const recovered = await runNativeMutationTest({ cwd, overrides: { commandRunner: { command: 'exit /B 0' } } });
+    assert.equal(recovered.supported, true);
+    assert.equal(recovered.stats.coordinator, 'rust');
+    assert.equal(recovered.stats.commandStarts, 1);
+    assert.equal(await readFile(sentinel, 'utf8'), 'dependency target must survive');
   });
 }

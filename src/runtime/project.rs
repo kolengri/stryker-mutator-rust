@@ -17,6 +17,9 @@ use selection::{Ignore, Pattern};
 mod project_tests;
 #[path = "tsconfig.rs"]
 mod tsconfig;
+#[cfg(all(test, windows))]
+#[path = "windows_integration_tests.rs"]
+mod windows_tests;
 
 pub(super) struct Project {
     pub files: Vec<PathBuf>,
@@ -55,7 +58,13 @@ fn walk(
         if !selection::included(ignored, &name, kind.is_dir()) {
             continue;
         }
-        if kind.is_symlink() {
+        #[cfg(windows)]
+        let reparse = super::config::is_link(
+            &fs::symlink_metadata(&path).map_err(|error| error.to_string())?,
+        );
+        #[cfg(not(windows))]
+        let reparse = false;
+        if kind.is_symlink() || reparse {
             return Err(format!(
                 "Project symlink requires compatibility handling: {name}"
             ));
@@ -459,11 +468,19 @@ fn disable_type_checks(source: &str, path: &Path) -> String {
     }
 }
 
+#[cfg(windows)]
+struct DependencyJunction {
+    path: PathBuf,
+    detached: bool,
+}
+
 pub(super) struct Sandbox {
     pub path: PathBuf,
     parent: PathBuf,
     cleanup: bool,
     always: bool,
+    #[cfg(windows)]
+    junctions: Vec<DependencyJunction>,
 }
 
 impl Sandbox {
@@ -475,16 +492,26 @@ impl Sandbox {
         );
         fs::create_dir_all(&parent)
             .map_err(|error| format!("Cannot create sandbox parent: {error}"))?;
-        let path = tempfile::Builder::new()
+        let temporary = tempfile::Builder::new()
             .prefix("sandbox-")
             .tempdir_in(&parent)
-            .map_err(|error| error.to_string())?
-            .keep();
-        let sandbox = Self {
+            .map_err(|error| error.to_string())?;
+        #[cfg(windows)]
+        let path = {
+            let path = super::config::canonicalize(temporary.path())?;
+            let _ = temporary.keep();
+            path
+        };
+        #[cfg(not(windows))]
+        let path = temporary.keep();
+        #[allow(unused_mut)]
+        let mut sandbox = Self {
             path,
             parent,
             cleanup: config.options["cleanTempDir"] == "always",
             always: config.options["cleanTempDir"] == "always",
+            #[cfg(windows)]
+            junctions: Vec::new(),
         };
         for relative in &project.files {
             let target = sandbox.path.join(relative);
@@ -507,6 +534,26 @@ impl Sandbox {
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(config.cwd.join(relative), target)
                     .map_err(|error| format!("Cannot link sandbox dependencies: {error}"))?;
+                #[cfg(windows)]
+                {
+                    if let Err(error) = junction::create(config.cwd.join(relative), &target) {
+                        // create may leave its owned empty directory behind. A
+                        // nonrecursive removal cannot walk into the dependency.
+                        let rollback = fs::remove_dir(&target);
+                        return Err(format!(
+                            "Cannot link sandbox dependencies: {error}{}",
+                            rollback
+                                .err()
+                                .filter(|error| error.kind() != std::io::ErrorKind::NotFound)
+                                .map(|error| format!("; cannot remove failed junction: {error}"))
+                                .unwrap_or_default()
+                        ));
+                    }
+                    sandbox.junctions.push(DependencyJunction {
+                        path: target,
+                        detached: false,
+                    });
+                }
             }
         }
         Ok(sandbox)
@@ -519,6 +566,35 @@ impl Sandbox {
     pub fn cleanup(&mut self) -> Result<(), String> {
         if !self.cleanup {
             return Ok(());
+        }
+        #[cfg(windows)]
+        while let Some(link) = self.junctions.last_mut() {
+            if !link.detached {
+                match junction::delete(&link.path) {
+                    Ok(()) => link.detached = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.junctions.pop();
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "Cannot unlink owned sandbox junction {}: {error}",
+                            link.path.display()
+                        ));
+                    }
+                }
+            }
+            // The reparse point is gone. Remove only its owned empty directory;
+            // on failure retain the stage and never recurse through this path.
+            if let Err(error) = fs::remove_dir(&link.path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(format!(
+                    "Cannot remove owned junction directory {}: {error}",
+                    link.path.display()
+                ));
+            }
+            self.junctions.pop();
         }
         match fs::remove_dir_all(&self.path) {
             Ok(()) => {}

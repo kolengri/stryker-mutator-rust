@@ -296,7 +296,8 @@ fn external_rewrites_resolve_to_original_targets_at_every_sandbox_depth() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("project");
     fs::create_dir(&root).unwrap();
-    let root = root.canonicalize().unwrap();
+    // A glob is a lexical pattern, not a verbatim Windows filesystem path.
+    let root = tsconfig::normalize(&root.canonicalize().unwrap());
     write(
         &root,
         "nested/tsconfig.json",
@@ -369,6 +370,178 @@ fn absolute_paths_and_array_extends_keep_sandbox_and_original_resolution() {
     sandbox.cleanup().unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn native_windows_tsconfig_paths_preserve_targets_and_selected_reference_dfs() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("project");
+    fs::create_dir(&root).unwrap();
+    // Keep the standard library's verbatim canonical form in this fixture. The
+    // rewriter must match it with ordinary absolute paths without reading targets.
+    let root = root.canonicalize().unwrap();
+    let ordinary_root = dunce::simplified(&root);
+    let drive_root = ordinary_root.ancestors().last().unwrap();
+    let rooted_internal = ordinary_root
+        .join("src/file.ts")
+        .components()
+        .skip(1)
+        .collect::<PathBuf>();
+    let other_drive = if name(drive_root).unwrap().starts_with("C:") {
+        r"D:\unread-external\missing.ts"
+    } else {
+        r"C:\unread-external\missing.ts"
+    };
+    let other_config = Path::new(other_drive).with_extension("json");
+    write(&root, "base.json", "{}");
+    write(&root, ".base.json", "{}");
+    write(&root, "model/tsconfig.json", "{}");
+    let source = json!({
+        "extends": [r"..\base.json", ordinary_root.join("base.json"), root.join(".base.json"), other_config],
+        "references": [{"path": "..\\model\\"}],
+        "files": [r"..\src\file.ts", rooted_internal, other_drive],
+        "include": [r"..\..\external\**\*.ts"],
+        "exclude": [r"\unread-external\generated"]
+    })
+    .to_string();
+    write(&root, "nested/tsconfig.json", &source);
+    let mut config = config(&root);
+    config.options["tsconfigFile"] = r"nested\tsconfig.json".into();
+    config.options["tempDirName"] = r"build\cache\sandboxes".into();
+    let project = prepare(&config).unwrap();
+    assert_eq!(
+        project
+            .preprocessed
+            .iter()
+            .map(|(path, _)| name(path).unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "base.json",
+            ".base.json",
+            "model/tsconfig.json",
+            "nested/tsconfig.json"
+        ]
+    );
+    assert!(!root.join("build").exists());
+    let mut sandbox = Sandbox::create(&config, &project).unwrap();
+    let rewritten: Value =
+        serde_json::from_slice(&fs::read(sandbox.path.join("nested/tsconfig.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        rewritten["extends"],
+        json!([
+            r"..\base.json",
+            "../base.json",
+            "../.base.json",
+            other_config
+        ])
+    );
+    assert_eq!(rewritten["references"], json!([{"path": "..\\model\\"}]));
+    assert_eq!(
+        rewritten["files"],
+        json!([r"..\src\file.ts", "../src/file.ts", other_drive])
+    );
+    for (value, target) in [
+        (
+            &rewritten["include"][0],
+            tsconfig::normalize(root.parent().unwrap()).join("external/**/*.ts"),
+        ),
+        (
+            &rewritten["exclude"][0],
+            drive_root.join("unread-external/generated"),
+        ),
+    ] {
+        assert_eq!(
+            tsconfig::normalize(&sandbox.path.join("nested").join(value.as_str().unwrap())),
+            tsconfig::normalize(&target)
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(root.join("nested/tsconfig.json")).unwrap(),
+        source
+    );
+    for path in ["base.json", ".base.json", "model/tsconfig.json"] {
+        assert_eq!(fs::read_to_string(root.join(path)).unwrap(), "{}");
+    }
+    sandbox.finish(&config);
+    sandbox.cleanup().unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_tsconfig_relative_paths_keep_drive_roots_and_absolute_other_drives() {
+    assert_eq!(
+        tsconfig::normalize(Path::new(r"c:\project\base.json")),
+        Path::new(r"C:\project\base.json")
+    );
+    assert_eq!(
+        tsconfig::normalize(Path::new(r"C:\..\..\external\file.ts")),
+        Path::new(r"C:\external\file.ts")
+    );
+    assert_eq!(
+        tsconfig::relative(
+            Path::new(r"C:\project\sandbox"),
+            Path::new(r"D:\external\missing.json")
+        )
+        .unwrap(),
+        "D:/external/missing.json"
+    );
+    assert_eq!(
+        tsconfig::relative(
+            Path::new(r"\\?\C:\project\sandbox"),
+            Path::new(r"C:\project\src\file.ts")
+        )
+        .unwrap(),
+        "../src/file.ts"
+    );
+    assert!(
+        tsconfig::relative(
+            Path::new(r"C:\Project\src"),
+            Path::new(r"c:\project\base.json")
+        )
+        .unwrap_err()
+        .contains("case-different Windows path alias")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn case_different_windows_tsconfig_aliases_fail_before_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("CaseSensitiveProject");
+    fs::create_dir(&root).unwrap();
+    write(&root, "base.json", "{}");
+    let root = root.canonicalize().unwrap();
+    let config = config(&root);
+    let case_alias_root = dunce::simplified(&root)
+        .to_str()
+        .unwrap()
+        .replace("CaseSensitiveProject", "casesensitiveproject");
+    for value in [
+        json!({"extends": "./BASE.json"}),
+        json!({"extends": format!("{case_alias_root}\\base.json")}),
+        json!({"files": [format!("{case_alias_root}\\src\\file.ts")]}),
+        json!({"references": [{"path": "./BASE.json"}]}),
+    ] {
+        let source = value.to_string();
+        write(&root, "tsconfig.json", &source);
+        let error = match prepare(&config) {
+            Ok(_) => panic!("Unexpectedly accepted {source}"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("case-different Windows path alias"),
+            "{error}"
+        );
+        assert!(!root.join(".stryker-tmp").exists());
+        assert!(!root.join("reports").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("tsconfig.json")).unwrap(),
+            source
+        );
+        assert_eq!(fs::read_to_string(root.join("base.json")).unwrap(), "{}");
+    }
+}
+
 #[test]
 fn malformed_or_ambiguous_tsconfig_fails_before_sandbox_effects() {
     let directory = tempfile::tempdir().unwrap();
@@ -383,11 +556,49 @@ fn malformed_or_ambiguous_tsconfig_fails_before_sandbox_effects() {
         "{\"extends\":[[\"base.json\"]]}",
         "{\"references\":[{}]}",
         "{\"include\":[false]}",
-        "{\"files\":[\"..\\\\secret\"]}",
+        "{\"files\":[\"\"]}",
+        "{\"files\":[\"bad\\u0000path\"]}",
     ] {
         write(directory.path(), "tsconfig.json", source);
         let error = match prepare(&config) {
             Ok(_) => panic!("Unexpectedly accepted {source}"),
+            Err(error) => error,
+        };
+        assert!(error.contains("TSConfig"), "{error}");
+        assert!(!directory.path().join(".stryker-tmp").exists());
+        assert!(!directory.path().join("reports").exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("tsconfig.json")).unwrap(),
+            source
+        );
+    }
+}
+
+#[test]
+fn platform_ambiguous_tsconfig_paths_fail_before_sandbox_effects() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = config(directory.path());
+    #[cfg(unix)]
+    let paths = [
+        r"..\secret",
+        r"C:\secret\file.ts",
+        "C:/secret/file.ts",
+        "C:relative.ts",
+    ];
+    #[cfg(windows)]
+    let paths = [
+        r"C:relative.ts",
+        "C:",
+        r"\\server\share\file.ts",
+        r"\\.\PhysicalDrive0",
+        r"\\?\C:\CON",
+        r"\\?\C:\literal\..\file.ts",
+    ];
+    for path in paths {
+        let source = json!({"files": [path]}).to_string();
+        write(directory.path(), "tsconfig.json", &source);
+        let error = match prepare(&config) {
+            Ok(_) => panic!("Unexpectedly accepted {path}"),
             Err(error) => error,
         };
         assert!(error.contains("TSConfig"), "{error}");

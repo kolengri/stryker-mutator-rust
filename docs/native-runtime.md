@@ -75,6 +75,31 @@ Checker plugins, executable configuration and other reporters are not yet wired
 into this coordinator. Unsupported syntax and options are rejected explicitly;
 the existing legacy entry remains available independently.
 
+### Windows candidate boundary
+
+Windows uses a retained, owned Job Object for each command or compatibility worker.
+The root is created suspended, assigned before user code resumes, then cleanup
+terminates the job, reaps the root and waits for zero active job members before
+bounded pipe drains. Cancellation cannot hide a cleanup failure. POSIX retains
+its existing process groups and post-reap termination retry.
+
+Project and sandbox cwd must safely normalize to ordinary absolute drive paths;
+paths still requiring verbatim, device or UNC cwd identities fail explicitly.
+TSConfig preprocessing supports native Windows separators and safely simplified
+absolute drives; ambiguous case aliases and drive-relative forms are rejected.
+Different-drive external paths remain absolute. Report source/test keys use `/`.
+
+Dependency junctions are owned individually. Cleanup detaches each reparse point
+and removes only its owned empty directory before recursive sandbox removal.
+Either failure blocks recursion and retains the completed stage for retry;
+original dependency targets must survive. Included project reparse entries other
+than deliberately handled node_modules dependencies, and report reparse ancestors,
+are rejected. The junction library's administrative helper feature is disabled.
+
+This candidate requires real Windows default-feature builds, process/bridge/project
+tests, public cancellation, command/Mocha complete-report parity and packed-consumer
+smoke on the matrix. A feature-scoped cross-target typecheck is only compile evidence.
+
 Two upstream defects are corrected intentionally: selected test filenames are
 used to select Mocha files rather than incorrectly becoming title filters, and
 dependency disposal continues after individual cleanup failures without disposing

@@ -46,6 +46,41 @@ pub(super) fn defaults() -> Value {
         .expect("bundled Stryker defaults are valid JSON")
 }
 
+/// Keep filesystem identities compatible with Node's ordinary drive paths.
+/// Dunce preserves verbatim paths when stripping their prefix would change
+/// their meaning; reject those instead of silently disagreeing with Node cwd.
+pub(super) fn canonicalize(path: &Path) -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        let path = dunce::canonicalize(path).map_err(|error| error.to_string())?;
+        if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::Disk(_)))
+        {
+            return Err(
+                "Native Windows project and sandbox paths require a compatible absolute drive path"
+                    .into(),
+            );
+        }
+        Ok(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::canonicalize(path).map_err(|error| error.to_string())
+    }
+}
+
+pub(super) fn is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Include mount-point junctions and other reparse tags, not just symlinks.
+        metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
 pub(super) fn relative_path(value: &str) -> Result<PathBuf, String> {
     let path = Path::new(value);
     if path.as_os_str().is_empty()
@@ -64,7 +99,7 @@ fn owned_output_path(cwd: &Path, value: &str) -> Result<(), String> {
     let mut path = cwd.to_path_buf();
     for component in relative_path(value)?.components() {
         path.push(component);
-        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| is_link(&metadata)) {
             return Err(format!(
                 "Native output paths cannot traverse project symlinks: {value}"
             ));
@@ -75,26 +110,35 @@ fn owned_output_path(cwd: &Path, value: &str) -> Result<(), String> {
 
 fn report_output_path(cwd: &Path, value: &str) -> Result<(), String> {
     let path = Path::new(value);
+    #[cfg(windows)]
+    let path = dunce::simplified(path);
     if !path.is_absolute() {
         return owned_output_path(cwd, value);
     }
-    if path.file_name().is_none()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
-    {
+    if path.file_name().is_none() || path.components().any(|part| !normal_report_component(part)) {
         return Err(format!(
             "Native JSON report path must be normalized: {value}"
         ));
     }
     for ancestor in path.ancestors() {
-        if fs::symlink_metadata(ancestor).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        if fs::symlink_metadata(ancestor).is_ok_and(|metadata| is_link(&metadata)) {
             return Err(format!(
                 "Native output paths cannot traverse symlinks: {value}"
             ));
         }
     }
     Ok(())
+}
+
+fn normal_report_component(component: Component<'_>) -> bool {
+    #[cfg(windows)]
+    if let Component::Prefix(prefix) = component {
+        return matches!(
+            prefix.kind(),
+            std::path::Prefix::Disk(_) | std::path::Prefix::UNC(_, _)
+        );
+    }
+    matches!(component, Component::RootDir | Component::Normal(_))
 }
 
 fn merge(target: &mut Value, source: &Value) {
@@ -209,8 +253,8 @@ pub(super) fn prepare(request: Request) -> Result<Config, String> {
     if request.version != 1 {
         return Err("Unsupported native runtime request version".into());
     }
-    if !cfg!(unix) {
-        return Err("Native command process-tree cleanup currently requires POSIX".into());
+    if !cfg!(any(unix, windows)) {
+        return Err("Native process containment is unsupported on this platform".into());
     }
     if !request.cwd.is_absolute() || !request.cwd.is_dir() {
         return Err("cwd must be an existing absolute project directory".into());
@@ -227,10 +271,7 @@ pub(super) fn prepare(request: Request) -> Result<Config, String> {
             return Err("Compatibility executable/module paths must be absolute".into());
         }
     }
-    let cwd = request
-        .cwd
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
+    let cwd = canonicalize(&request.cwd)?;
     let mut arguments = cli(&request.args)?;
     merge(&mut arguments, &request.overrides);
     let config_file = if let Some(path) = arguments.get("configFile") {
