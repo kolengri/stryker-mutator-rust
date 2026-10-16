@@ -23,6 +23,8 @@ use crate::mutations::{
     Utf16Offsets, assignment_operator_replacement, method_replacement as method_mapping,
 };
 
+mod parallel;
+
 // Keep the protocol and caching behavior in sync with Stryker 10 syntax-helpers.
 // This includes truthy currentTestId selection, dynamic activeMutant checks, and
 // incrementing hitCount only after a matching activation check.
@@ -72,6 +74,8 @@ struct Input {
     files: Vec<File>,
     #[serde(default)]
     options: Value,
+    #[serde(default)]
+    execution: parallel::Request,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -88,6 +92,8 @@ pub(crate) struct Response {
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<InstrumentResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<parallel::Execution>,
 }
 
 #[derive(Serialize)]
@@ -415,29 +421,20 @@ pub(crate) fn instrument_batch(input: &str) -> Response {
         .map_err(|error| format!("Invalid instrumentation input: {error}"))
         .and_then(|input| {
             let options = Options::parse(input.options)?;
-            let mut records = vec![];
-            let mut next_id = 0;
-            let mut files = Vec::with_capacity(input.files.len());
-            for file in input.files {
-                let content = instrument_file(&file, &options, &mut records, &mut next_id)
-                    .map_err(|reason| format!("{}: {reason}", file.name))?;
-                files.push(File { content, ..file });
-            }
-            Ok(InstrumentResult {
-                files,
-                mutants: records,
-            })
+            parallel::execute(input.files, &options, input.execution)
         });
     match result {
-        Ok(result) => Response {
+        Ok((result, execution)) => Response {
             supported: true,
             reason: None,
             result: Some(result),
+            execution: Some(execution),
         },
         Err(reason) => Response {
             supported: false,
             reason: Some(reason),
             result: None,
+            execution: None,
         },
     }
 }
@@ -447,6 +444,16 @@ fn instrument_file(
     options: &Options,
     records: &mut Vec<ApiMutant>,
     next_id: &mut usize,
+) -> Result<String, String> {
+    instrument_file_inner(file, options, records, next_id, None)
+}
+
+fn instrument_file_inner(
+    file: &File,
+    options: &Options,
+    records: &mut Vec<ApiMutant>,
+    next_id: &mut usize,
+    relocation_proven: Option<&mut bool>,
 ) -> Result<String, String> {
     if file.content.len() > u32::MAX as usize {
         return Err("Source exceeds 32-bit span limits".into());
@@ -497,6 +504,12 @@ fn instrument_file(
     bindings.visit_program(&parsed.program);
     if bindings.found {
         return Err("Source shadows an instrumentation helper or runtime global".into());
+    }
+    if let Some(proven) = relocation_proven {
+        // This parallel-only walk intentionally has none of ReservedBindings'
+        // opaque TypeScript skips. Even an unexecuted helper reference prevents
+        // attributing every helper call in completed output to the emitter.
+        *proven = !parallel::has_helper_identifiers(&parsed.program);
     }
     let mut emitter = Emitter {
         source: &file.content,
