@@ -25,7 +25,7 @@ test('all 512 nested operator pairs retain complete upstream mutant records', as
 
 test('known printer incompatibilities must fallback rather than change record text', async () => {
   const upstream = new Instrumenter(logger);
-  for (const expression of ['a+(b=>b)', 'a+0x10', 'a+1_000', 'a+1e2']) {
+  for (const expression of ['a+(b=>{return b;})', 'a+0x10', 'a+1_000', 'a+1e2']) {
     const files = [{ name: 'input.js', mutate: true, content: `function f(a,b,c) { return ${expression}; }` }];
     const native = createInstrumenter(logger, { cache: false, engine: 'native' });
     await assert.rejects(native.instrument(files, options), /unsupported/i);

@@ -7,13 +7,17 @@
 //! span (replacement subtrees can have overlapping, reparsed source spans).
 //! An immutable visit first compares parser-owned raw tokens with this pinned
 //! generator's literal spelling. If none differ, print the original AST directly.
+//! Concise arrows reuse that visit and the conditional output parse for their
+//! parameter ranges. Arrow-free paths gain no cloning or parsing work.
 
 use oxc_allocator::{Allocator, CloneIn};
-use oxc_ast::ast::{AssignmentTarget, Expression, StringLiteral};
-use oxc_ast_visit::{Visit, VisitMut};
+use oxc_ast::ast::{ArrowFunctionExpression, AssignmentTarget, Expression, StringLiteral};
+use oxc_ast_visit::{Visit, VisitMut, walk};
 use oxc_codegen::{Codegen, Gen};
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
+
+use super::printed_arrows;
 
 const PREFIX: &str = "__stryker_raw_string_";
 const UNPROVEN: &str = "String literal spelling requires upstream replacement formatting: unproven generated literal ranges";
@@ -26,14 +30,22 @@ fn literal_spelling(node: &StringLiteral<'_>) -> String {
 }
 
 #[derive(Default)]
-struct NeedsProtection(bool);
+struct NeedsProtection {
+    strings: bool,
+    arrows: printed_arrows::Proof,
+}
 
 impl<'a> Visit<'a> for NeedsProtection {
+    fn visit_arrow_function_expression(&mut self, node: &ArrowFunctionExpression<'a>) {
+        self.arrows.record(node);
+        walk::walk_arrow_function_expression(self, node);
+    }
+
     fn visit_string_literal(&mut self, node: &StringLiteral<'a>) {
-        if !self.0
+        if !self.strings
             && let Some(raw) = &node.raw
         {
-            self.0 = literal_spelling(node) != raw.as_str();
+            self.strings = literal_spelling(node) != raw.as_str();
         }
     }
 }
@@ -81,8 +93,13 @@ impl<'a> Visit<'a> for Ranges {
     }
 }
 
-fn restore(code: String, spellings: Vec<String>) -> Result<String, String> {
-    if spellings.is_empty() {
+fn restore(
+    code: String,
+    spellings: Vec<String>,
+    arrows: printed_arrows::Proof,
+) -> Result<String, String> {
+    arrows.check()?;
+    if spellings.is_empty() && arrows.is_empty() {
         return Ok(code);
     }
     let allocator = Allocator::default();
@@ -93,7 +110,9 @@ fn restore(code: String, spellings: Vec<String>) -> Result<String, String> {
         spans: vec![None; spellings.len()],
         proven: true,
     };
-    ranges.visit_expression(&expression);
+    if !spellings.is_empty() {
+        ranges.visit_expression(&expression);
+    }
     if !ranges.proven || ranges.spans.iter().any(Option::is_none) {
         return Err(UNPROVEN.into());
     }
@@ -103,11 +122,17 @@ fn restore(code: String, spellings: Vec<String>) -> Result<String, String> {
         .zip(spellings)
         .map(|(span, spelling)| (span.unwrap(), spelling))
         .collect::<Vec<_>>();
+    if !arrows.is_empty() {
+        edits.extend(arrows.edits(&expression, &code)?);
+    }
     edits.sort_unstable_by_key(|(span, _)| span.start);
     let mut result = String::new();
     let mut start = 0;
     for (span, spelling) in edits {
         let end = span.start as usize;
+        if end < start {
+            return Err(UNPROVEN.into());
+        }
         result.push_str(code.get(start..end).ok_or(UNPROVEN)?);
         result.push_str(&spelling);
         start = span.end as usize;
@@ -119,10 +144,15 @@ fn restore(code: String, spellings: Vec<String>) -> Result<String, String> {
 pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, String> {
     let mut needs_protection = NeedsProtection::default();
     needs_protection.visit_expression(node);
-    if !needs_protection.0 {
+    needs_protection.arrows.check()?;
+    if !needs_protection.strings {
         let mut generator = Codegen::new().with_source_text(source);
         generator.print_expression(node);
-        return Ok(generator.into_source_text());
+        return restore(
+            generator.into_source_text(),
+            vec![],
+            needs_protection.arrows,
+        );
     }
     let allocator = Allocator::default();
     let mut cloned = node.clone_in(&allocator);
@@ -133,7 +163,11 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
     protect.visit_expression(&mut cloned);
     let mut generator = Codegen::new().with_source_text(source);
     generator.print_expression(&cloned);
-    restore(generator.into_source_text(), protect.spellings)
+    restore(
+        generator.into_source_text(),
+        protect.spellings,
+        needs_protection.arrows,
+    )
 }
 
 pub(super) fn assignment_target(
@@ -142,10 +176,15 @@ pub(super) fn assignment_target(
 ) -> Result<String, String> {
     let mut needs_protection = NeedsProtection::default();
     needs_protection.visit_assignment_target(node);
-    if !needs_protection.0 {
+    needs_protection.arrows.check()?;
+    if !needs_protection.strings {
         let mut generator = Codegen::new().with_source_text(source);
         node.print(&mut generator, oxc_codegen::Context::empty());
-        return Ok(generator.into_source_text());
+        return restore(
+            generator.into_source_text(),
+            vec![],
+            needs_protection.arrows,
+        );
     }
     let allocator = Allocator::default();
     let mut cloned = node.clone_in(&allocator);
@@ -156,13 +195,103 @@ pub(super) fn assignment_target(
     protect.visit_assignment_target(&mut cloned);
     let mut generator = Codegen::new().with_source_text(source);
     cloned.print(&mut generator, oxc_codegen::Context::empty());
-    restore(generator.into_source_text(), protect.spellings)
+    restore(
+        generator.into_source_text(),
+        protect.spellings,
+        needs_protection.arrows,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use oxc_ast::builder::AstBuilder;
+
+    fn arrow_proof(source: &str) -> printed_arrows::Proof {
+        let allocator = Allocator::default();
+        let node = Parser::new(&allocator, source, SourceType::mjs().with_typescript(true))
+            .parse_expression()
+            .unwrap();
+        let mut needs_protection = NeedsProtection::default();
+        needs_protection.visit_expression(&node);
+        needs_protection.arrows
+    }
+
+    #[test]
+    fn concise_arrows_restore_only_proven_identifier_parameter_ranges() {
+        for (source, expected) in [
+            ("f((x) => x)", "f(x => x)"),
+            ("f(() => true)", "f(() => true)"),
+            ("f((x, y) => x + y)", "f((x, y) => x + y)"),
+            ("f((x) => (y) => x + y)", "f(x => y => x + y)"),
+            ("f((é) => é, (é) => é)", "f(é => é, é => é)"),
+            ("é(`😀(x) => x`, (x) => x)", "é(`😀(x) => x`, x => x)"),
+        ] {
+            assert_eq!(
+                restore(source.into(), vec![], arrow_proof(source)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_occurrence_count_names_and_punctuation_fail_closed() {
+        for code in [
+            "f()",
+            "f((y) => y)",
+            "f((x, y) => x)",
+            "f((x) => x, (x) => x)",
+            "f(x => x)",
+            "f(( x ) => x)",
+            "f(async (x) => x)",
+            "f((x) => { return x; })",
+            "f((x: number) => x)",
+            "f(`(x) => x`)",
+        ] {
+            assert!(
+                restore(code.into(), vec![], arrow_proof("f((x) => x)")).is_err(),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_arrow_signatures_do_not_enter_the_printer() {
+        for source in [
+            "f((x = 1) => x)",
+            "f((...x) => x)",
+            "f(({x}) => x)",
+            "f((x: number) => x)",
+            "f(<T>(x: T) => x)",
+            "f((x): number => x)",
+            "f((x?) => x)",
+            "f(async x => x)",
+            "f(x => { return x; })",
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::mjs().with_typescript(true))
+                .parse_expression()
+                .unwrap();
+            assert_eq!(
+                super::expression(&node, source),
+                Err(printed_arrows::UNSUPPORTED.into()),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn arrow_and_literal_ranges_share_the_same_generated_coordinates() {
+        let source = r#"é((é) => f('__stryker_raw_string_0__', "\x61", "a"), `😀(é) => é`)"#;
+        let allocator = Allocator::default();
+        let node = Parser::new(&allocator, source, SourceType::mjs())
+            .parse_expression()
+            .unwrap();
+        assert_eq!(
+            super::expression(&node, source).unwrap(),
+            r#"é(é => f('__stryker_raw_string_0__', "\x61", "a"), `😀(é) => é`)"#
+        );
+    }
 
     #[test]
     fn generated_literals_without_raw_use_codegen_spelling() {
@@ -176,7 +305,7 @@ mod tests {
         ));
         let mut needs_protection = NeedsProtection::default();
         needs_protection.visit_expression(&expression);
-        assert!(!needs_protection.0);
+        assert!(!needs_protection.strings);
         assert_eq!(super::expression(&expression, "").unwrap(), "\"generated\"");
     }
 
@@ -194,7 +323,7 @@ mod tests {
                 .unwrap();
             let mut needs_protection = NeedsProtection::default();
             needs_protection.visit_expression(&node);
-            assert!(!needs_protection.0, "{source}");
+            assert!(!needs_protection.strings, "{source}");
             let mut generator = Codegen::new().with_source_text(source);
             generator.print_expression(&node);
             assert_eq!(
@@ -215,7 +344,7 @@ mod tests {
                 .unwrap();
             let mut needs_protection = NeedsProtection::default();
             needs_protection.visit_expression(&node);
-            assert!(needs_protection.0, "{source}");
+            assert!(needs_protection.strings, "{source}");
             assert_eq!(super::expression(&node, source).unwrap(), source);
         }
     }
@@ -232,11 +361,28 @@ mod tests {
             };
             let mut needs_protection = NeedsProtection::default();
             needs_protection.visit_assignment_target(&node.left);
-            assert_eq!(needs_protection.0, protected);
+            assert_eq!(needs_protection.strings, protected);
             assert_eq!(
                 assignment_target(&node.left, source).unwrap(),
                 source.strip_suffix(" = 1").unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn assignment_target_keys_share_arrow_and_raw_literal_ranges() {
+        for (source, expected) in [
+            (r#"obj[f((x) => "x")] = 1"#, r#"obj[f(x => "x")]"#),
+            ("obj[f((x) => 'x')] = 1", "obj[f(x => 'x')]"),
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::mjs())
+                .parse_expression()
+                .unwrap();
+            let Expression::AssignmentExpression(node) = node else {
+                panic!("assignment")
+            };
+            assert_eq!(assignment_target(&node.left, source).unwrap(), expected);
         }
     }
 
@@ -271,7 +417,7 @@ mod tests {
             "['__stryker_raw_string_0__', '__stryker_raw_string_0__']",
         ] {
             assert_eq!(
-                restore(code.into(), vec!["'original'".into()]),
+                restore(code.into(), vec!["'original'".into()], Default::default()),
                 Err(UNPROVEN.into())
             );
         }
@@ -281,7 +427,12 @@ mod tests {
     fn ranges_are_utf8_and_ast_typed_even_next_to_marker_text() {
         let code = "é(`😀__stryker_raw_string_0__`, '__stryker_raw_string_1__', '__stryker_raw_string_0__')";
         assert_eq!(
-            restore(code.into(), vec!["'\\x61'".into(), "\"a\"".into()]).unwrap(),
+            restore(
+                code.into(),
+                vec!["'\\x61'".into(), "\"a\"".into()],
+                Default::default()
+            )
+            .unwrap(),
             "é(`😀__stryker_raw_string_0__`, \"a\", '\\x61')"
         );
     }

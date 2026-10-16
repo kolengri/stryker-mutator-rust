@@ -23,6 +23,7 @@ use crate::mutations::{
 };
 
 mod parallel;
+mod printed_arrows;
 mod string_spelling;
 
 // Keep the protocol and caching behavior in sync with Stryker 10 syntax-helpers.
@@ -1410,8 +1411,7 @@ impl Emitter<'_, '_> {
         if context.printed_ancestor
             && matches!(
                 node,
-                Expression::ArrowFunctionExpression(_)
-                    | Expression::FunctionExpression(_)
+                Expression::FunctionExpression(_)
                     | Expression::ClassExpression(_)
                     | Expression::NewExpression(_)
             )
@@ -1420,6 +1420,12 @@ impl Emitter<'_, '_> {
                 "Function, class, and new expressions inside printed mutation replacements require upstream formatting"
                     .into(),
             );
+        }
+        if context.printed_ancestor
+            && let Expression::ArrowFunctionExpression(arrow) = node
+            && !printed_arrows::supported(arrow)
+        {
+            return Err(printed_arrows::UNSUPPORTED.into());
         }
         // Collect before descending: Stryker IDs follow Babel pre-order and the
         // allMutators ordering. Mutation branches use the uninstrumented snapshot.
@@ -1854,7 +1860,9 @@ impl Emitter<'_, '_> {
                     ArrowFunctionBody::FunctionBody(body) => edits.push((body.span, self.body(body)?)),
                     _ => {
                         let body = arrow.body.as_expression().ok_or("Unsupported arrow body")?;
-                        edits.push((body.span(), self.expression(body, Context::default())?));
+                        // Reset evaluation context, but keep the printer boundary:
+                        // the ancestor's replacement also clones this concise body.
+                        edits.push((body.span(), self.expression(body, Context { printed_ancestor: context.printed_ancestor, ..Context::default() })?));
                     }
                 }
             }
@@ -2763,7 +2771,7 @@ mod tests {
             "const x = a + 0x10;",
             "const x = a + 1_000;",
             "const x = a + 1e2;",
-            "const x = a + (b => b);",
+            "const x = a + (b => { return b; });",
             "export { 'source' as value } from 'module';",
             "export * from 'module' with { type: 'json' };",
         ] {
@@ -3005,13 +3013,14 @@ mod tests {
             "factory().trim().field = 'raw';",
             "const x = a === 'string';",
             "a = x => x;",
+            "factory().trim().field = x => x;",
             "obj.x = {key: 1};",
         ] {
             let response = run(source, Value::Null);
             assert!(response.supported, "{source}: {:?}", response.reason);
         }
         for source in [
-            "factory().trim().field = x => x;",
+            "factory().trim().field = x => { return x; };",
             "a += {key: 1};",
             "[a] = b;",
             "([a] = b, c++);",
