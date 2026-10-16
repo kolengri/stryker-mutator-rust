@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::*;
-use oxc_ast_visit::{Visit, walk};
+use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::Codegen;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
@@ -384,9 +384,10 @@ pub(crate) fn instrument_batch(input: &str) -> Response {
         .and_then(|input| {
             let options = Options::parse(input.options)?;
             let mut records = vec![];
+            let mut next_id = 0;
             let mut files = Vec::with_capacity(input.files.len());
             for file in input.files {
-                let content = instrument_file(&file, &options, &mut records)
+                let content = instrument_file(&file, &options, &mut records, &mut next_id)
                     .map_err(|reason| format!("{}: {reason}", file.name))?;
                 files.push(File { content, ..file });
             }
@@ -413,6 +414,7 @@ fn instrument_file(
     file: &File,
     options: &Options,
     records: &mut Vec<ApiMutant>,
+    next_id: &mut usize,
 ) -> Result<String, String> {
     if file.content.len() > u32::MAX as usize {
         return Err("Source exceeds 32-bit span limits".into());
@@ -462,6 +464,7 @@ fn instrument_file(
         directives,
         rules: vec![],
         records,
+        next_id,
         placed: 0,
     };
     emitter.pruned = !file.mutate.overlaps(&emitter.location(parsed.program.span));
@@ -587,7 +590,99 @@ fn arithmetic_replacement(binary: &BinaryExpression<'_>) -> Option<B> {
     }
 }
 
+// Literal upstream mapping plus its generated reverse entries. setUTCDate
+// deliberately does not overwrite the reverse setTime -> setDate entry.
+fn method_mapping(name: &str) -> Option<Option<&'static str>> {
+    Some(match name {
+        "charAt" | "filter" | "reverse" | "slice" | "sort" | "substr" | "substring" | "trim" => {
+            None
+        }
+        "endsWith" => Some("startsWith"),
+        "startsWith" => Some("endsWith"),
+        "every" => Some("some"),
+        "some" => Some("every"),
+        "toLocaleLowerCase" => Some("toLocaleUpperCase"),
+        "toLocaleUpperCase" => Some("toLocaleLowerCase"),
+        "toLowerCase" => Some("toUpperCase"),
+        "toUpperCase" => Some("toLowerCase"),
+        "trimEnd" => Some("trimStart"),
+        "trimStart" => Some("trimEnd"),
+        "min" => Some("max"),
+        "max" => Some("min"),
+        "setDate" | "setUTCDate" => Some("setTime"),
+        "setTime" => Some("setDate"),
+        "setFullYear" => Some("setMonth"),
+        "setMonth" => Some("setFullYear"),
+        "setHours" => Some("setMinutes"),
+        "setMinutes" => Some("setHours"),
+        "setSeconds" => Some("setMilliseconds"),
+        "setMilliseconds" => Some("setSeconds"),
+        "setUTCFullYear" => Some("setUTCMonth"),
+        "setUTCMonth" => Some("setUTCFullYear"),
+        "setUTCHours" => Some("setUTCMinutes"),
+        "setUTCMinutes" => Some("setUTCHours"),
+        "setUTCSeconds" => Some("setUTCMilliseconds"),
+        "setUTCMilliseconds" => Some("setUTCSeconds"),
+        _ => return None,
+    })
+}
+
+fn method_target<'b, 'a>(callee: &'b Expression<'a>) -> Option<(&'b Expression<'a>, &'b str)> {
+    match callee {
+        Expression::StaticMemberExpression(member) => {
+            Some((&member.object, member.property.name.as_str()))
+        }
+        Expression::ComputedMemberExpression(member) => match &member.expression {
+            Expression::Identifier(identifier) => Some((&member.object, identifier.name.as_str())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_chain_node(node: &Expression<'_>) -> bool {
+    matches!(
+        node,
+        Expression::CallExpression(_)
+            | Expression::StaticMemberExpression(_)
+            | Expression::ComputedMemberExpression(_)
+    )
+}
+
+fn chain_prints(node: &Expression<'_>) -> bool {
+    match node {
+        Expression::CallExpression(call) => {
+            matches!(&call.callee, Expression::Identifier(identifier) if identifier.name == "Array")
+                || method_target(&call.callee)
+                    .is_some_and(|(_, name)| method_mapping(name).is_some())
+                || chain_prints(&call.callee)
+        }
+        Expression::StaticMemberExpression(member) => chain_prints(&member.object),
+        Expression::ComputedMemberExpression(member) => chain_prints(&member.object),
+        _ => false,
+    }
+}
+
+// Replace a cloned AST node, never splice unprotected text into a callee. The
+// generator restores precedence for the mutated ancestor's entire chain.
+struct ReplaceExpression<'a, 'b> {
+    target: Span,
+    replacement: &'b Expression<'a>,
+    allocator: &'a Allocator,
+}
+
+impl<'a> VisitMut<'a> for ReplaceExpression<'a, '_> {
+    fn visit_expression(&mut self, node: &mut Expression<'a>) {
+        if node.span() == self.target {
+            *node = self.replacement.clone_in(self.allocator);
+        } else {
+            walk_mut::walk_expression(self, node);
+        }
+    }
+}
+
 struct Switch {
+    target: Span,
     id: String,
     replacement: String,
 }
@@ -602,6 +697,7 @@ struct Emitter<'s, 'r> {
     directives: HashMap<u32, Vec<Directive>>,
     rules: Vec<Rule>,
     records: &'r mut Vec<ApiMutant>,
+    next_id: &'r mut usize,
     placed: usize,
 }
 
@@ -712,7 +808,8 @@ impl Emitter<'_, '_> {
         if self.pruned || !self.selection.includes(&self.location(span)) {
             return;
         }
-        let id = self.records.len().to_string();
+        let id = self.next_id.to_string();
+        *self.next_id += 1;
         let reason = self.ignore_reason(self.positions.at(span.start).line, name);
         let ignored = reason.as_ref().is_some_and(|reason| !reason.is_empty());
         self.records.push(ApiMutant {
@@ -725,7 +822,11 @@ impl Emitter<'_, '_> {
             status: ignored.then_some("Ignored"),
         });
         if !ignored {
-            switches.push(Switch { id, replacement });
+            switches.push(Switch {
+                target: span,
+                id,
+                replacement,
+            });
             self.placed += 1;
         }
     }
@@ -733,17 +834,119 @@ impl Emitter<'_, '_> {
     fn expression(
         &mut self,
         node: &Expression<'_>,
+        mut context: Context<'_>,
+    ) -> Result<String, String> {
+        // Only call/member nodes on a callee/object spine defer placement. Keys
+        // and arguments keep independent placements in the original branch.
+        context.printed_ancestor |= chain_prints(node);
+        let mut switches = vec![];
+        let mut original = self.expression_deferred(node, context, &mut switches)?;
+        if switches.is_empty() {
+            return Ok(original);
+        }
+        if matches!(node, Expression::ArrowFunctionExpression(_))
+            && let Some(name) = context.binding_name
+        {
+            original = format!("(() => {{ const {name} = {original}; return {name}; }})()");
+        }
+        let ids = switches
+            .iter()
+            .map(|switch| format!("\"{}\"", switch.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut output = format!("(stryCov_9fa48({ids}), ({original}))");
+        for switch in switches {
+            let replacement = if switch.target == node.span() {
+                switch.replacement
+            } else {
+                self.replace_in_chain(node, switch.target, &switch.replacement)?
+            };
+            output = format!(
+                "(stryMutAct_9fa48(\"{}\") ? ({replacement}) : {output})",
+                switch.id
+            );
+        }
+        Ok(output)
+    }
+
+    fn expression_deferred(
+        &mut self,
+        node: &Expression<'_>,
         context: Context<'_>,
+        pending: &mut Vec<Switch>,
     ) -> Result<String, String> {
         self.scope(node.span(), false, |emitter| {
-            emitter.expression_inner(node, context)
+            emitter.expression_inner(node, context, pending)
         })
+    }
+
+    fn chain_child(
+        &mut self,
+        node: &Expression<'_>,
+        context: Context<'_>,
+        pending: &mut Vec<Switch>,
+    ) -> Result<String, String> {
+        if is_chain_node(node) {
+            self.expression_deferred(node, context, pending)
+        } else {
+            self.expression(node, context)
+        }
+    }
+
+    fn replace_in_chain(
+        &self,
+        root: &Expression<'_>,
+        target: Span,
+        text: &str,
+    ) -> Result<String, String> {
+        let allocator = Allocator::default();
+        let replacement = Parser::new(&allocator, text, SourceType::mjs())
+            .parse_expression()
+            .map_err(|error| format!("Invalid native replacement: {error:?}"))?;
+        let mut branch = root.clone_in(&allocator);
+        ReplaceExpression {
+            target,
+            replacement: &replacement,
+            allocator: &allocator,
+        }
+        .visit_expression(&mut branch);
+        Ok(self.print(&branch))
+    }
+
+    fn method_replacement(&self, call: &CallExpression<'_>) -> Result<Option<String>, String> {
+        let Some((object, name)) = method_target(&call.callee) else {
+            return Ok(None);
+        };
+        let Some(replacement) = method_mapping(name) else {
+            return Ok(None);
+        };
+        let Some(name) = replacement else {
+            return Ok(Some(self.print(object)));
+        };
+        let arguments = call
+            .arguments
+            .iter()
+            .map(|argument| {
+                argument
+                    .as_expression()
+                    .map(|expression| self.print(expression))
+                    .ok_or("Spread arguments require upstream instrumentation")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(", ");
+        let text = format!("({}).{name}({arguments})", self.print(object));
+        let allocator = Allocator::default();
+        let expression = Parser::new(&allocator, &text, SourceType::mjs())
+            .parse_expression()
+            .map_err(|error| format!("Invalid method replacement: {error:?}"))?;
+        Ok(Some(self.print(&expression)))
     }
 
     fn expression_inner(
         &mut self,
         node: &Expression<'_>,
         context: Context<'_>,
+        pending: &mut Vec<Switch>,
     ) -> Result<String, String> {
         if context.printed_ancestor && matches!(node, Expression::ArrowFunctionExpression(_)) {
             return Err(
@@ -771,6 +974,21 @@ impl Emitter<'_, '_> {
                     "[\"Stryker was here\"]"
                 } else {
                     "[]"
+                }
+                .into(),
+                "ArrayDeclaration",
+                &mut switches,
+            );
+        }
+        if let Expression::CallExpression(call) = node
+            && matches!(&call.callee, Expression::Identifier(identifier) if identifier.name == "Array")
+        {
+            self.collect(
+                node.span(),
+                if call.arguments.is_empty() {
+                    "Array([])"
+                } else {
+                    "Array()"
                 }
                 .into(),
                 "ArrayDeclaration",
@@ -863,6 +1081,11 @@ impl Emitter<'_, '_> {
             });
             self.collect(node.span(), text, "LogicalOperator", &mut switches);
         }
+        if let Expression::CallExpression(call) = node
+            && let Some(replacement) = self.method_replacement(call)?
+        {
+            self.collect(node.span(), replacement, "MethodExpression", &mut switches);
+        }
         if let Expression::ObjectExpression(object) = node
             && !object.properties.is_empty()
         {
@@ -912,9 +1135,30 @@ impl Emitter<'_, '_> {
             }
         }
 
+        pending.extend(switches);
         let mut edits = vec![];
         match node {
-            Expression::Identifier(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) => {},
+            Expression::Identifier(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) | Expression::ThisExpression(_) => {},
+            Expression::CallExpression(call) => {
+                if call.optional || call.type_arguments.is_some() { return Err("Optional or typed calls require upstream instrumentation".into()); }
+                let child_context = Context { printed_ancestor: context.printed_ancestor, ..Context::default() };
+                edits.push((call.callee.span(), self.chain_child(&call.callee, child_context, pending)?));
+                let skip_string = matches!(&call.callee, Expression::Identifier(identifier) if matches!(identifier.name.as_str(), "require" | "Symbol"));
+                for argument in &call.arguments {
+                    let argument = argument.as_expression().ok_or("Spread arguments require upstream instrumentation")?;
+                    edits.push((argument.span(), self.expression(argument, Context { skip_string, ..child_context })?));
+                }
+            }
+            Expression::StaticMemberExpression(member) => {
+                if member.optional { return Err("Optional members require upstream instrumentation".into()); }
+                edits.push((member.object.span(), self.chain_child(&member.object, Context { printed_ancestor: context.printed_ancestor, ..Context::default() }, pending)?));
+            }
+            Expression::ComputedMemberExpression(member) => {
+                if member.optional { return Err("Optional members require upstream instrumentation".into()); }
+                let child_context = Context { printed_ancestor: context.printed_ancestor, ..Context::default() };
+                edits.push((member.object.span(), self.chain_child(&member.object, child_context, pending)?));
+                edits.push((member.expression.span(), self.expression(&member.expression, child_context)?));
+            }
             Expression::NumericLiteral(_) => {
                 // Oxc normalizes some number spellings while Babel preserves raw
                 // literals in cloned mutations. Reject incompatible record text.
@@ -1000,30 +1244,9 @@ impl Emitter<'_, '_> {
                     }
                 }
             }
-            _ => return Err("Unsupported expression in native grammar (calls, members, regex, classes, assignments, updates, and type syntax require upstream)".into()),
+            _ => return Err("Unsupported expression in native grammar (optional chains, private members, new, import, regex, classes, assignments, updates, and type syntax require upstream)".into()),
         }
-        let mut original = self.apply(node.span(), edits);
-        if switches.is_empty() {
-            return Ok(original);
-        }
-        if matches!(node, Expression::ArrowFunctionExpression(_))
-            && let Some(name) = context.binding_name
-        {
-            original = format!("(() => {{ const {name} = {original}; return {name}; }})()");
-        }
-        let ids = switches
-            .iter()
-            .map(|switch| format!("\"{}\"", switch.id))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut output = format!("(stryCov_9fa48({ids}), ({original}))");
-        for switch in switches {
-            output = format!(
-                "(stryMutAct_9fa48(\"{}\") ? ({}) : {output})",
-                switch.id, switch.replacement
-            );
-        }
-        Ok(output)
+        Ok(self.apply(node.span(), edits))
     }
 
     fn parameters(&self, params: &FormalParameters<'_>) -> Result<(), String> {
@@ -1170,7 +1393,29 @@ impl Emitter<'_, '_> {
             Statement::VariableDeclaration(variables) => return self.variables(variables),
             Statement::BlockStatement(block) => return self.block(block.span, &block.body),
             Statement::ReturnStatement(statement) => if let Some(expression) = &statement.argument { edits.push((expression.span(), self.expression(expression, Context::default())?)); },
-            Statement::ExpressionStatement(statement) => edits.push((statement.expression.span(), self.expression(&statement.expression, Context { skip_string: true, ..Context::default() })?)),
+            Statement::ExpressionStatement(statement) => {
+                let start = self.records.len();
+                let mut switches = vec![];
+                if matches!(statement.expression, Expression::CallExpression(_)) {
+                    self.collect(statement.span, ";".into(), "CallExpression", &mut switches);
+                }
+                let own = self.records.get(start).filter(|record| record.mutator_name == "CallExpression").map(|record| record.id.clone());
+                let original = self.expression(&statement.expression, Context { skip_string: true, ..Context::default() })?;
+                let active = self.records[start..].iter().filter(|record| record.status.is_none()).count();
+                if active != 1 && let Some(id) = own
+                    && self.records[start].id == id && self.records[start].status_reason.is_none()
+                {
+                    self.records.remove(start);
+                    self.placed -= switches.len();
+                    switches.clear();
+                }
+                let original = Self::terminate(self.apply(statement.span, vec![(statement.expression.span(), original)]));
+                return Ok(if let Some(switch) = switches.first() {
+                    // A block protects both the original and generated else from
+                    // binding to an enclosing unbraced if.
+                    format!("{{ if (stryMutAct_9fa48(\"{}\")) ; else {{ stryCov_9fa48(\"{}\"); {original} }} }}", switch.id, switch.id)
+                } else { original });
+            },
             Statement::IfStatement(statement) => {
                 edits.push((statement.test.span(), self.expression(&statement.test, Context { if_test: true, ..Context::default() })?));
                 edits.push((statement.consequent.span(), self.statement(&statement.consequent, false)?));
@@ -1260,12 +1505,12 @@ mod tests {
     #[test]
     fn rejects_batches_atomically_and_rejects_options() {
         for source in [
-            "function f(){ return call(); }",
+            "function f(){ return call?.(); }",
             "const o = {method(){ return 1; }};",
             "const x = a === 'string';",
             "const x = 1 /* Stryker disable all */ + 2;",
             "function f(x = 1) { return x; }",
-            "const x = a.value;",
+            "const x = a?.value;",
             "const stryCov_9fa48 = 1;",
             "const x = a + 0x10;",
             "const x = a + 1_000;",
@@ -1286,7 +1531,7 @@ mod tests {
             assert!(!run("const x = 1 + 2;", options).supported);
         }
         let response = instrument_batch(
-            r#"{"files":[{"name":"first.js","mutate":true,"content":"const x=1+2;"},{"name":"second.js","mutate":true,"content":"call();"}],"options":{}}"#,
+            r#"{"files":[{"name":"first.js","mutate":true,"content":"const x=1+2;"},{"name":"second.js","mutate":true,"content":"call?.();"}],"options":{}}"#,
         );
         assert!(!response.supported);
         assert!(response.result.is_none());
@@ -1353,5 +1598,45 @@ mod tests {
         assert_eq!(result.mutants[0].location.start.column, 17);
         assert_eq!(result.mutants[1].location.start.line, 2);
         assert_eq!(result.mutants[1].location.start.column, 10);
+    }
+
+    #[test]
+    fn call_filter_keeps_monotonic_batch_ids_and_no_removed_switches() {
+        let response = instrument_batch(
+            r#"{"files":[{"name":"a.js","mutate":true,"content":"foo(1+2);"},{"name":"b.js","mutate":true,"content":"bar(); Array();"}]}"#,
+        );
+        assert!(response.supported);
+        let result = response.result.unwrap();
+        assert_eq!(
+            result
+                .mutants
+                .iter()
+                .map(|m| (m.id.as_str(), m.mutator_name, m.replacement.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("1", "ArithmeticOperator", "1 - 2"),
+                ("2", "CallExpression", ";"),
+                ("4", "ArrayDeclaration", "Array([])"),
+            ]
+        );
+        assert!(!result.files[0].content.contains("stryMutAct_9fa48(\"0\")"));
+        assert!(!result.files[1].content.contains("stryMutAct_9fa48(\"3\")"));
+    }
+
+    #[test]
+    fn chain_mutation_keeps_target_metadata_and_uninstrumented_ancestor_branch() {
+        let response = run("const x = obj.trim(a + b).length;", Value::Null);
+        assert!(response.supported);
+        let result = response.result.unwrap();
+        assert_eq!(result.mutants[0].mutator_name, "MethodExpression");
+        assert_eq!(result.mutants[0].replacement, "obj");
+        assert_eq!(result.mutants[0].location.start.column, 10);
+        assert_eq!(result.mutants[0].location.end.column, 25);
+        assert!(result.files[0].content.contains("? (obj.length)"));
+        assert!(
+            result.files[0]
+                .content
+                .contains("obj.trim((stryMutAct_9fa48(\"1\")")
+        );
     }
 }
