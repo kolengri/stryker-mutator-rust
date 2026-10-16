@@ -161,7 +161,11 @@ arithmetic, comparisons, equality, boolean, logical, unary and conditional
 expressions. Strings, untagged templates, dense array literals and plain object
 literals are supported in compatible placement and printing contexts. Mutation
 records, IDs, locations, exclusions and runtime coverage follow the pinned
-Stryker contract. Ordinary calls, continuous optional chains, public
+Stryker contract. Cloned replacement records preserve each string literal's
+original quotes and escape spelling, including mixed spellings of the same
+value. Physical multiline string tokens inside whole-for replacements still
+require fallback, as do unproven generated literal ranges.
+Ordinary calls, continuous optional chains, public
 static/computed members, `this`, direct `Array(...)` mutations and method
 mutations are supported. Chain
 placement preserves receivers and argument evaluation. Call-statement filtering
