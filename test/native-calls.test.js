@@ -184,8 +184,8 @@ test('statement ranges include semicolons independently of call spans', async ()
 
 test('conservative call boundaries reject the whole batch and auto returns the complete upstream result', async () => {
   const sources = [
-    ['const x=obj?.trim();','js'], ['const x=obj.trim?.();','js'], ['const x=foo?.();','js'],
-    ['const x=(obj?.trim)();','js'], ['const x=obj?.["key"];','js'], ['const x=new Array(2);','js'],
+    ['const x=(obj?.trim)?.();','js'], ['const x=(obj.trim?.()).length;','js'], ['const x=(foo?.())();','js'],
+    ['const x=(obj?.trim)();','js'], ['const x=(obj?.["key"]).length;','js'], ['const x=new Array(2);','js'],
     ['const x=import("x");','js'], ['foo(...args);','js'], ['obj.key=1;','js'], ['obj.key++;','js'],
     ['delete obj.key;','js'], ['const x=tag`x`;','js'], ['class C extends B { foo() { super.foo(); } }','js'],
     ['class C { #x=1; foo() { return this.#x; } }','js'], ['const x: number=foo();','ts'],

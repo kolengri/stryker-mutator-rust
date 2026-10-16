@@ -77,7 +77,7 @@ test('native exclusions, multiple files, selected-off files and global IDs match
 });
 
 test('unsupported grammar takes explicit atomic fallback without losing mutations', async () => {
-  const files = [{ name: '/fixture/methods.js', content: 'export const lower = value => value?.trim().toLowerCase();', mutate: true }];
+  const files = [{ name: '/fixture/methods.js', content: 'export const lower = value => (value?.trim()).toLowerCase();', mutate: true }];
   const expected = await new Instrumenter(logger).instrument(files, options);
   const auto = createInstrumenter(logger, { cache: false, engine: 'auto' });
   assert.deepEqual(await auto.instrument(files, options), expected);

@@ -6,8 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use oxc_allocator::{Allocator, CloneIn};
-use oxc_ast::ast::*;
+use oxc_allocator::{Allocator, Box as ArenaBox, CloneIn};
+use oxc_ast::{ast::*, builder::AstBuilder};
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use oxc_codegen::Codegen;
 use oxc_parser::{ParseOptions, Parser};
@@ -603,17 +603,59 @@ fn method_target<'b, 'a>(callee: &'b Expression<'a>) -> Option<(&'b Expression<'
     }
 }
 
-fn is_chain_node(node: &Expression<'_>) -> bool {
-    matches!(
-        node,
-        Expression::CallExpression(_)
-            | Expression::StaticMemberExpression(_)
-            | Expression::ComputedMemberExpression(_)
-    )
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChainKind {
+    Call,
+    StaticMember,
+    ComputedMember,
+}
+
+fn chain_kind(node: &Expression<'_>) -> Option<ChainKind> {
+    match node {
+        Expression::CallExpression(_) => Some(ChainKind::Call),
+        Expression::StaticMemberExpression(_) => Some(ChainKind::StaticMember),
+        Expression::ComputedMemberExpression(_) => Some(ChainKind::ComputedMember),
+        // The wrapper aliases the effective ChainElement, including its kind.
+        Expression::ChainExpression(chain) => match &chain.expression {
+            ChainElement::CallExpression(_) => Some(ChainKind::Call),
+            ChainElement::StaticMemberExpression(_) => Some(ChainKind::StaticMember),
+            ChainElement::ComputedMemberExpression(_) => Some(ChainKind::ComputedMember),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+// Babel kind propagates only along an uninterrupted callee/object spine. A
+// nested ChainExpression marks parentheses and starts a separate expression.
+fn optional_kind(node: &Expression<'_>) -> bool {
+    match node {
+        Expression::CallExpression(call) => call.optional || optional_kind(&call.callee),
+        Expression::StaticMemberExpression(member) => {
+            member.optional || optional_kind(&member.object)
+        }
+        Expression::ComputedMemberExpression(member) => {
+            member.optional || optional_kind(&member.object)
+        }
+        _ => false,
+    }
+}
+
+fn own_optional(node: &Expression<'_>) -> bool {
+    match node {
+        Expression::CallExpression(call) => call.optional,
+        Expression::StaticMemberExpression(member) => member.optional,
+        Expression::ComputedMemberExpression(member) => member.optional,
+        _ => false,
+    }
 }
 
 fn chain_prints(node: &Expression<'_>) -> bool {
+    if own_optional(node) {
+        return true;
+    }
     match node {
+        Expression::ChainExpression(_) => true,
         Expression::CallExpression(call) => {
             matches!(&call.callee, Expression::Identifier(identifier) if identifier.name == "Array")
                 || method_target(&call.callee)
@@ -630,14 +672,29 @@ fn chain_prints(node: &Expression<'_>) -> bool {
 // generator restores precedence for the mutated ancestor's entire chain.
 struct ReplaceExpression<'a, 'b> {
     target: Span,
+    kind: ChainKind,
     replacement: &'b Expression<'a>,
     allocator: &'a Allocator,
+    replaced: usize,
 }
 
 impl<'a> VisitMut<'a> for ReplaceExpression<'a, '_> {
     fn visit_expression(&mut self, node: &mut Expression<'a>) {
-        if node.span() == self.target {
-            *node = self.replacement.clone_in(self.allocator);
+        if node.span() == self.target && chain_kind(node) == Some(self.kind) {
+            let replacement = self.replacement.clone_in(self.allocator);
+            // The wrapper and its ChainElement root alias the same Babel node.
+            // Replace the wrapper once and do not visit its root hook. For an
+            // interior segment, the parser's new wrapper must be removed: it
+            // would otherwise introduce parentheses and terminate short-circuiting.
+            *node = match replacement {
+                Expression::ChainExpression(chain)
+                    if !matches!(node, Expression::ChainExpression(_)) =>
+                {
+                    Expression::from(chain.unbox().expression)
+                }
+                replacement => replacement,
+            };
+            self.replaced += 1;
         } else {
             walk_mut::walk_expression(self, node);
         }
@@ -646,6 +703,7 @@ impl<'a> VisitMut<'a> for ReplaceExpression<'a, '_> {
 
 struct Switch {
     target: Span,
+    kind: Option<ChainKind>,
     id: String,
     replacement: String,
 }
@@ -787,6 +845,7 @@ impl Emitter<'_, '_> {
         if !ignored {
             switches.push(Switch {
                 target: span,
+                kind: None,
                 id,
                 replacement,
             });
@@ -822,7 +881,7 @@ impl Emitter<'_, '_> {
             let replacement = if switch.target == node.span() {
                 switch.replacement
             } else {
-                self.replace_in_chain(node, switch.target, &switch.replacement)?
+                self.replace_in_chain(node, switch.target, switch.kind, &switch.replacement)?
             };
             output = format!(
                 "(stryMutAct_9fa48(\"{}\") ? ({replacement}) : {output})",
@@ -838,6 +897,13 @@ impl Emitter<'_, '_> {
         context: Context<'_>,
         pending: &mut Vec<Switch>,
     ) -> Result<String, String> {
+        // Oxc's wrapper is not a Babel node. Delegate collection/context once
+        // to its effective root while keeping the wrapper for branch printing.
+        if let Expression::ChainExpression(chain) = node {
+            let allocator = Allocator::default();
+            let inner = Expression::from(chain.expression.clone_in(&allocator));
+            return self.expression_deferred(&inner, context, pending);
+        }
         self.scope(node.span(), false, |emitter| {
             emitter.expression_inner(node, context, pending)
         })
@@ -849,7 +915,12 @@ impl Emitter<'_, '_> {
         context: Context<'_>,
         pending: &mut Vec<Switch>,
     ) -> Result<String, String> {
-        if is_chain_node(node) {
+        if matches!(node, Expression::ChainExpression(_)) {
+            return Err(
+                "Parenthesized optional-chain spines require upstream replacement topology".into(),
+            );
+        }
+        if chain_kind(node).is_some() {
             self.expression_deferred(node, context, pending)
         } else {
             self.expression(node, context)
@@ -860,6 +931,7 @@ impl Emitter<'_, '_> {
         &self,
         root: &Expression<'_>,
         target: Span,
+        kind: Option<ChainKind>,
         text: &str,
     ) -> Result<String, String> {
         let allocator = Allocator::default();
@@ -867,42 +939,49 @@ impl Emitter<'_, '_> {
             .parse_expression()
             .map_err(|error| format!("Invalid native replacement: {error:?}"))?;
         let mut branch = root.clone_in(&allocator);
-        ReplaceExpression {
+        let mut visitor = ReplaceExpression {
             target,
+            kind: kind.ok_or("Native descendant replacement requires a typed chain target")?,
             replacement: &replacement,
             allocator: &allocator,
+            replaced: 0,
+        };
+        visitor.visit_expression(&mut branch);
+        if visitor.replaced != 1 {
+            return Err(format!(
+                "Native chain replacement matched {} targets instead of one",
+                visitor.replaced
+            ));
         }
-        .visit_expression(&mut branch);
         Ok(self.print(&branch))
     }
 
-    fn method_replacement(&self, call: &CallExpression<'_>) -> Result<Option<String>, String> {
-        let Some((object, name)) = method_target(&call.callee) else {
-            return Ok(None);
-        };
-        let Some(replacement) = method_mapping(name) else {
-            return Ok(None);
-        };
+    fn method_replacement(&self, call: &CallExpression<'_>) -> Option<String> {
+        let (object, name) = method_target(&call.callee)?;
+        let replacement = method_mapping(name)?;
         let Some(name) = replacement else {
-            return Ok(Some(self.print(object)));
+            return Some(self.print(object));
         };
-        let arguments = call
-            .arguments
-            .iter()
-            .map(|argument| {
-                argument
-                    .as_expression()
-                    .map(|expression| self.print(expression))
-                    .ok_or("Spread arguments require upstream instrumentation")
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .join(", ");
-        let text = format!("({}).{name}({arguments})", self.print(object));
         let allocator = Allocator::default();
-        let expression = Parser::new(&allocator, &text, SourceType::mjs())
-            .parse_expression()
-            .map_err(|error| format!("Invalid method replacement: {error:?}"))?;
-        Ok(Some(self.print(&expression)))
+        let mut mutated = call.clone_in(&allocator);
+        let optional = match &call.callee {
+            Expression::StaticMemberExpression(member) => member.optional,
+            Expression::ComputedMemberExpression(member) => member.optional,
+            _ => unreachable!("method_target accepts only public members"),
+        };
+        // Upstream intentionally turns a computed Identifier into a static
+        // property on rename, preserving the member and call optional markers.
+        let builder = AstBuilder::new(&allocator);
+        mutated.callee = Expression::StaticMemberExpression(StaticMemberExpression::boxed(
+            call.callee.span(),
+            object.clone_in(&allocator),
+            IdentifierName::new(call.callee.span(), name, &builder),
+            optional,
+            &builder,
+        ));
+        Some(self.print(&Expression::CallExpression(ArenaBox::new_in(
+            mutated, &builder,
+        ))))
     }
 
     fn expression_inner(
@@ -944,6 +1023,7 @@ impl Emitter<'_, '_> {
             );
         }
         if let Expression::CallExpression(call) = node
+            && !optional_kind(node)
             && matches!(&call.callee, Expression::Identifier(identifier) if identifier.name == "Array")
         {
             self.collect(
@@ -1045,7 +1125,7 @@ impl Emitter<'_, '_> {
             self.collect(node.span(), text, "LogicalOperator", &mut switches);
         }
         if let Expression::CallExpression(call) = node
-            && let Some(replacement) = self.method_replacement(call)?
+            && let Some(replacement) = self.method_replacement(call)
         {
             self.collect(node.span(), replacement, "MethodExpression", &mut switches);
         }
@@ -1098,26 +1178,37 @@ impl Emitter<'_, '_> {
             }
         }
 
+        if own_optional(node) {
+            let replacement = self.changed(node, |node| match node {
+                Expression::CallExpression(call) => call.optional = false,
+                Expression::StaticMemberExpression(member) => member.optional = false,
+                Expression::ComputedMemberExpression(member) => member.optional = false,
+                _ => unreachable!("own_optional accepts only calls and public members"),
+            });
+            self.collect(node.span(), replacement, "OptionalChaining", &mut switches);
+        }
+
+        for switch in &mut switches {
+            switch.kind = chain_kind(node);
+        }
         pending.extend(switches);
         let mut edits = vec![];
         match node {
             Expression::Identifier(_) | Expression::BooleanLiteral(_) | Expression::NullLiteral(_) | Expression::ThisExpression(_) => {},
             Expression::CallExpression(call) => {
-                if call.optional || call.type_arguments.is_some() { return Err("Optional or typed calls require upstream instrumentation".into()); }
+                if call.type_arguments.is_some() { return Err("Typed calls require upstream instrumentation".into()); }
                 let child_context = Context { printed_ancestor: context.printed_ancestor, ..Context::default() };
                 edits.push((call.callee.span(), self.chain_child(&call.callee, child_context, pending)?));
-                let skip_string = matches!(&call.callee, Expression::Identifier(identifier) if matches!(identifier.name.as_str(), "require" | "Symbol"));
+                let skip_string = !optional_kind(node) && matches!(&call.callee, Expression::Identifier(identifier) if matches!(identifier.name.as_str(), "require" | "Symbol"));
                 for argument in &call.arguments {
                     let argument = argument.as_expression().ok_or("Spread arguments require upstream instrumentation")?;
                     edits.push((argument.span(), self.expression(argument, Context { skip_string, ..child_context })?));
                 }
             }
             Expression::StaticMemberExpression(member) => {
-                if member.optional { return Err("Optional members require upstream instrumentation".into()); }
                 edits.push((member.object.span(), self.chain_child(&member.object, Context { printed_ancestor: context.printed_ancestor, ..Context::default() }, pending)?));
             }
             Expression::ComputedMemberExpression(member) => {
-                if member.optional { return Err("Optional members require upstream instrumentation".into()); }
                 let child_context = Context { printed_ancestor: context.printed_ancestor, ..Context::default() };
                 edits.push((member.object.span(), self.chain_child(&member.object, child_context, pending)?));
                 edits.push((member.expression.span(), self.expression(&member.expression, child_context)?));
@@ -1207,7 +1298,7 @@ impl Emitter<'_, '_> {
                     }
                 }
             }
-            _ => return Err("Unsupported expression in native grammar (optional chains, private members, new, import, regex, classes, assignments, updates, and type syntax require upstream)".into()),
+            _ => return Err("Unsupported expression in native grammar (private members, new, import, regex, classes, assignments, updates, and type syntax require upstream)".into()),
         }
         Ok(self.apply(node.span(), edits))
     }
@@ -1468,12 +1559,12 @@ mod tests {
     #[test]
     fn rejects_batches_atomically_and_rejects_options() {
         for source in [
-            "function f(){ return call?.(); }",
+            "function f(){ return (obj?.call)(); }",
             "const o = {method(){ return 1; }};",
             "const x = a === 'string';",
             "const x = 1 /* Stryker disable all */ + 2;",
             "function f(x = 1) { return x; }",
-            "const x = a?.value;",
+            "const x = (a?.value).next;",
             "const stryCov_9fa48 = 1;",
             "const x = a + 0x10;",
             "const x = a + 1_000;",
@@ -1494,7 +1585,7 @@ mod tests {
             assert!(!run("const x = 1 + 2;", options).supported);
         }
         let response = instrument_batch(
-            r#"{"files":[{"name":"first.js","mutate":true,"content":"const x=1+2;"},{"name":"second.js","mutate":true,"content":"call?.();"}],"options":{}}"#,
+            r#"{"files":[{"name":"first.js","mutate":true,"content":"const x=1+2;"},{"name":"second.js","mutate":true,"content":"(call?.())();"}],"options":{}}"#,
         );
         assert!(!response.supported);
         assert!(response.result.is_none());
@@ -1584,6 +1675,53 @@ mod tests {
         );
         assert!(!result.files[0].content.contains("stryMutAct_9fa48(\"0\")"));
         assert!(!result.files[1].content.contains("stryMutAct_9fa48(\"3\")"));
+    }
+
+    #[test]
+    fn optional_chain_wrapper_collects_the_effective_if_test_once() {
+        let response = run("if (obj?.trim?.().length) ;", Value::Null);
+        assert!(response.supported, "{:?}", response.reason);
+        let result = response.result.unwrap();
+        assert_eq!(
+            result
+                .mutants
+                .iter()
+                .map(|m| (m.id.as_str(), m.mutator_name, m.replacement.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("0", "ConditionalExpression", "true"),
+                ("1", "ConditionalExpression", "false"),
+                ("2", "MethodExpression", "obj"),
+                ("3", "OptionalChaining", "obj?.trim()"),
+                ("4", "OptionalChaining", "obj.trim"),
+            ]
+        );
+        assert!(
+            result.files[0]
+                .content
+                .contains("stryCov_9fa48(\"0\", \"1\", \"2\", \"3\", \"4\")")
+        );
+    }
+
+    #[test]
+    fn interior_optional_replacement_preserves_the_continuous_chain() {
+        let response = run("const x = obj?.endsWith(\"x\").length;", Value::Null);
+        assert!(response.supported, "{:?}", response.reason);
+        let result = response.result.unwrap();
+        assert_eq!(result.mutants.len(), 3);
+        assert_eq!(result.mutants[0].replacement, "obj?.startsWith(\"x\")");
+        assert!(
+            result.files[0]
+                .content
+                .contains("? (obj?.startsWith(\"x\").length)")
+        );
+        assert!(
+            !result.files[0]
+                .content
+                .contains("(obj?.startsWith(\"x\")).length")
+        );
+        assert_eq!(result.mutants[1].replacement, "obj.endsWith");
+        assert_eq!(result.mutants[2].mutator_name, "StringLiteral");
     }
 
     #[test]

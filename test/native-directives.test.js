@@ -228,7 +228,7 @@ test('ambiguous attachments, printed comments, warnings and prior unsupported gr
     '// Stryker disable EmptyExpression\nconst a = true;',
     '"use strict";\n// ordinary\nconst a = true;',
     '#!/usr/bin/env node\nconst a = true;',
-    'const a = call?.();',
+    'const a = (call?.())();',
     'const a = x || [1, 2, 3];',
   ];
   for (const content of sources) {
