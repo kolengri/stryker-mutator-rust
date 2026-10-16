@@ -2,13 +2,14 @@
 
 A **preview** Rust-backed runner for StrykerJS 10.0.0, distributed as a precompiled
 Node-API addon. Existing Stryker configuration, test runners, reporters, coverage
-analysis and incremental behavior remain provided by the pinned StrykerJS core.
+collection and incremental diff remain provided by the pinned StrykerJS core.
 
 **This is not a completed Rust rewrite.** Native instrumentation currently supports
 a conservative JavaScript subset. An unsupported batch is delegated in full to
 StrykerJS rather than silently losing mutations. TypeScript, JSX, frameworks,
 complex expressions and arbitrary Babel plugins still use the compatibility path.
-The planner, sandbox and test-runner orchestration have not been ported to Rust.
+Rust also indexes coverage and calculates batched test-plan decisions. Node still
+owns incremental diff, plugins, sandbox, worker lifecycle and test execution.
 
 ## Build and install
 
@@ -58,13 +59,14 @@ import { Stryker, nativeStatus } from 'stryker-mutator-rust';
 console.log(nativeStatus());
 const stryker = new Stryker({ configFile: 'stryker.config.json' }, {
   engine: 'auto',
+  coreEngine: 'auto',
   cache: true,
 });
 await stryker.runMutationTest();
 ```
 
-`installAcceleration(options)` installs the process-wide instrumenter hook; its
-first call owns the settings for subsequent instances. `createInstrumenter(logger,
+`installAcceleration(options)` installs the process-wide instrumentation and core
+hooks; its first call owns the settings for subsequent instances. `createInstrumenter(logger,
 options)` creates an isolated instrumenter without a global hook. Importing the
 package alone does not install the hook.
 
@@ -72,6 +74,30 @@ package alone does not install the hook.
 UTF-16, zero-based, end-exclusive offsets can be used with JavaScript `slice`.
 It always reports `supported: false`: it is neither the production instrumenter
 nor a proof of full mutation parity.
+
+`coreEngine` independently selects `auto` (default), `upstream` (no core hooks),
+or `native` (reject unsupported core inputs without JavaScript fallback).
+`STRYKER_RUST_CORE_ENGINE` supplies the default when the option is omitted.
+`createInstrumenter` remains instrumentation-only. `nativeStatus()` reports
+`nativeCoverage` and `nativePlanning` separately from `nativeInstrumentation`.
+
+The core adapter targets exactly StrykerJS 10.0.0's internal `TestCoverage.from`
+and `MutantTestPlanner.prototype.makePlan`; it checks the pinned classes,
+descriptors and original helpers before installation. Rust receives ordered
+coverage pairs and one batch of post-diff planning inputs. Node retains original
+test/mutant objects, Map/Set order, constructor snapshots, test-filter aliases,
+warnings, reporter events and sandbox calls. Custom helpers, subclasses,
+accessors, proxies, coverage instances created outside the installed factory and
+values the JSON boundary cannot preserve use the original path in `auto` mode.
+After incremental diff, fallback plans the already-diffed
+mutants exactly once. Errors from diff, loggers, sandbox and reporters propagate.
+
+`installAcceleration()` returns the existing numeric `cache.stats` plus separate
+`cache.coreStats`: engine, actual `nativeCoreStages`, native coverage/planning
+batch counts, native planned-mutant count, JavaScript coverage/planning fallback
+counts and native errors (with a last fallback reason when applicable). CLI
+diagnostics retain every existing counter and add these under `core`.
+This slice makes no speed claim. Full Rust core replacement remains unfinished.
 
 ## Native boundary and compatibility
 

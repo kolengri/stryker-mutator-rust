@@ -3,23 +3,36 @@ import type { Instrumenter, InstrumenterOptions, InstrumentResult, File } from '
 import type { Logger } from '@stryker-mutator/api/logging';
 
 export interface AccelerationStats { hits: number; misses: number; bypasses: number; errors: number; nativeBatches: number; fallbackBatches: number; nativeErrors: number }
+export interface CoreStats {
+  engine: 'auto' | 'upstream' | 'native';
+  nativeCoreStages: ('coverage' | 'planning')[];
+  nativeCoverageBatches: number;
+  nativePlanningBatches: number;
+  nativePlannedMutants: number;
+  javascriptCoverageFallbacks: number;
+  javascriptPlanningFallbacks: number;
+  nativeErrors: number;
+  lastFallbackReason?: string;
+}
 export interface AccelerationOptions {
   cache?: boolean;
   engine?: 'auto' | 'upstream' | 'native';
+  coreEngine?: 'auto' | 'upstream' | 'native';
   cacheDir?: string;
   onEvent?: (event: { type: keyof AccelerationStats; reason?: string }) => void;
 }
 export interface Candidate { start: number; end: number; replacement: string; mutatorName: string }
 /** Experimental candidates only; supported is false until complete semantic parity. */
 export function analyze(source: string, fileName?: string): { supported: false; reason: string; mutants: Candidate[] };
-export function nativeStatus(): { available: boolean; target: string; nativeInstrumentation: boolean; napi?: number; candidateEngine?: string; error?: string };
+export function nativeStatus(): { available: boolean; target: string; nativeInstrumentation: boolean; nativeCoverage: boolean; nativePlanning: boolean; napi?: number; candidateEngine?: string; error?: string };
 export class InstrumentationCache {
   constructor(options?: AccelerationOptions);
   readonly stats: AccelerationStats;
+  readonly coreStats?: CoreStats;
   instrument(instrument: Instrumenter['instrument'], files: readonly File[], options: InstrumenterOptions): Promise<InstrumentResult>;
 }
 /** Process-wide; the first call sets options for all subsequent Stryker instances. */
-export function installAcceleration(options?: AccelerationOptions): InstrumentationCache;
+export function installAcceleration(options?: AccelerationOptions): InstrumentationCache & { readonly coreStats: CoreStats };
 export function createInstrumenter(logger: Logger, options?: AccelerationOptions): {
   instrument(files: readonly File[], options: InstrumenterOptions): Promise<InstrumentResult>;
   stats: AccelerationStats;

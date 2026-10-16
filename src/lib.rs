@@ -1,7 +1,9 @@
 use napi_derive::napi;
 
+mod coverage;
 mod instrument;
 mod mutations;
+mod planner;
 
 /// Hash UTF-8 input with BLAKE3, returning lowercase hexadecimal.
 #[napi(js_name = "cacheKey", strict)]
@@ -26,6 +28,18 @@ pub fn analyze(source: String, file_name: String) -> String {
 pub fn instrument_batch(input_json: String) -> String {
     serde_json::to_string(&instrument::instrument_batch(&input_json))
         .expect("instrumentation result contains only JSON-serializable values")
+}
+
+/// Index a complete ordered coverage batch without serializing test objects.
+#[napi(js_name = "coverageBatch", strict)]
+pub fn coverage_batch(input_json: String) -> String {
+    coverage::coverage_batch(&input_json).to_string()
+}
+
+/// Calculate a complete batch of pinned core planning decisions.
+#[napi(js_name = "planningBatch", strict)]
+pub fn planning_batch(input_json: String) -> String {
+    planner::planning_batch(&input_json).to_string()
 }
 
 #[cfg(test)]
