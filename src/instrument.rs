@@ -27,6 +27,7 @@ mod parallel;
 mod printed_arrows;
 mod regex_mutation;
 mod string_spelling;
+mod svelte;
 
 // Keep the protocol and caching behavior in sync with Stryker 10 syntax-helpers.
 // This includes truthy currentTestId selection, dynamic activeMutant checks, and
@@ -520,6 +521,16 @@ fn instrument_file_inner(
     if std::path::Path::new(&file.name)
         .extension()
         .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("svelte"))
+    {
+        if let Some(proven) = relocation_proven {
+            *proven = false;
+        }
+        return svelte::instrument(file, options, records, next_id);
+    }
+    if std::path::Path::new(&file.name)
+        .extension()
+        .and_then(|ext| ext.to_str())
         .is_some_and(|ext| {
             ext.eq_ignore_ascii_case("html")
                 || ext.eq_ignore_ascii_case("htm")
@@ -559,6 +570,33 @@ fn instrument_program(
     next_id: &mut usize,
     relocation_proven: Option<&mut bool>,
     html_raw_text: bool,
+) -> Result<String, String> {
+    instrument_program_inner(
+        file,
+        source,
+        source_type,
+        offset,
+        options,
+        records,
+        next_id,
+        relocation_proven,
+        html_raw_text,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn instrument_program_inner(
+    file: &File,
+    source: &str,
+    source_type: SourceType,
+    offset: Position,
+    options: &Options,
+    records: &mut Vec<ApiMutant>,
+    next_id: &mut usize,
+    relocation_proven: Option<&mut bool>,
+    html_raw_text: bool,
+    shared_header: Option<&mut bool>,
 ) -> Result<String, String> {
     #[cfg(test)]
     let parse_timer = parallel::diagnostic::Timer::start(0);
@@ -634,6 +672,23 @@ fn instrument_program(
     if bindings.found {
         return Err("Source shadows an instrumentation helper or runtime global".into());
     }
+    if shared_header.is_some() {
+        let mut guard = svelte::ScriptGuard::default();
+        guard.visit_program(&parsed.program);
+        // Valid JS can still fail Svelte's constant_assignment compiler check.
+        // Reuse this program's resolved references, including nested writes and
+        // shadowing; a property write is a read of its const receiver.
+        let scoping = semantics.semantic.scoping();
+        let constant_write = scoping.symbol_ids().any(|symbol| {
+            scoping.symbol_flags(symbol).is_const_variable()
+                && scoping
+                    .get_resolved_references(symbol)
+                    .any(|reference| reference.is_write())
+        });
+        if guard.unsupported || constant_write {
+            return Err("Svelte instance script requires compiler equivalence".into());
+        }
+    }
     if let Some(proven) = relocation_proven {
         // This parallel-only walk intentionally has none of ReservedBindings'
         // opaque TypeScript skips. Even an unexecuted helper reference prevents
@@ -679,6 +734,9 @@ fn instrument_program(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut output = emitter.apply(Span::new(0, source.len() as u32), edits);
+    if let Some(needed) = shared_header {
+        *needed |= emitter.placed != 0;
+    }
     if emitter.placed != 0 && !options.no_header {
         // Leave the parsed hashbang and first statement's comment preamble ahead
         // of the helpers. A statement after a hashbang necessarily follows a line

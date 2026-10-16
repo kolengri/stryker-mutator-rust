@@ -232,8 +232,24 @@ and unproved cloned replacement contexts trigger atomic fallback. Selected TSX
 scripts prove each raw-text closing sequence against the admitted JSX AST.
 Ambiguous markup, entities, other interpolation/ICU syntax, and unsupported script
 grammar trigger atomic fallback. HTML and Vue bypass
-result caching and use native serial recovery for parallel requests. Svelte
-remains outside native support.
+result caching and use native serial recovery for parallel requests.
+
+Native `.svelte` accepts one attribute-free top-level JavaScript instance script,
+explicitly balanced ordinary elements from a bounded lowercase set, static text
+and bare identifier mustaches (including Unicode). Empty/static templates are
+supported. The exact Git-pinned `rsvelte_core` parser validates typed nodes and
+original byte boundaries; deferred template expressions must resolve. Scripts
+are parsed once by the existing Oxc 0.154 engine, without transferring the
+parser's Oxc 0.149 AST. The shared emitter supplies one module header only when
+mutants are placed, including with `noHeader: true`, matching Stryker 10.
+Module/duplicate/nested scripts, attributes, styles, components, directives,
+blocks, entities, broader expressions, imports/exports, reactive labels, stores,
+runes, BOMs and recovery require atomic upstream fallback. Other six pinned
+Svelte resources remain fallback. Svelte bypasses result caching, observes live
+Babel/ignorer configuration, and uses serial recovery for parallel requests.
+The parser dependency has an unconditional compiler graph, duplicate Oxc
+versions and MPL-2.0 dependencies; see NOTICE. Parser qualification alone is not
+compiler or runtime proof. This adapter makes no performance claim.
 
 The accepted native grammar includes ordinary JS named function declarations,
 synchronous function expressions,

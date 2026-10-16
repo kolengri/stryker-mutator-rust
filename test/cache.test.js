@@ -17,17 +17,17 @@ async function context(t) {
   return { directory, sut: createInstrumenter(logger, { cacheDir: directory, engine: 'upstream' }) };
 }
 
-test('HTML and Vue native eligibility shares per-call parser checks while result caching stays ineligible', async (t) => {
+test('HTML Vue and Svelte native eligibility shares per-call parser checks while result caching stays ineligible', async (t) => {
   const { directory } = await context(t);
   const batch = [{ name: join(directory, 'source.html'), content: '<script>const flag=true;</script>', mutate: true }];
   assert.equal(await cacheEligibility(batch, options), false);
   assert.equal(await nativeEligibility(batch, options), true);
-  for (const extension of ['vue', 'VUE']) {
+  for (const extension of ['vue', 'VUE', 'svelte', 'SVELTE']) {
     const vue = [{ ...batch[0], name: join(directory, `source.${extension}`) }];
     assert.equal(await nativeEligibility(vue, options), true);
     assert.equal(await cacheEligibility(vue, options), false);
   }
-  for (const extension of ['svelte', 'astro']) {
+  for (const extension of ['astro']) {
     const framework = [{ ...batch[0], name: join(directory, `source.${extension}`) }];
     assert.equal(await nativeEligibility(framework, options), false);
     assert.equal(await cacheEligibility(framework, options), false);
@@ -37,8 +37,10 @@ test('HTML and Vue native eligibility shares per-call parser checks while result
   const config = join(directory, '.babelrc');
   await writeFile(config, '{}');
   assert.equal(await nativeEligibility(batch, options), false, 'observe newly created Babel configuration');
+  assert.equal(await nativeEligibility([{ ...batch[0], name: join(directory, 'source.svelte') }], options), false);
   await rm(config);
   assert.equal(await nativeEligibility(batch, options), true, 'observe removed Babel configuration without memoization');
+  assert.equal(await nativeEligibility([{ ...batch[0], name: join(directory, 'source.svelte') }], options), true);
   await writeFile(join(directory, 'package.json'), '{"babel":{}}');
   assert.equal(await nativeEligibility(batch, options), false);
   await writeFile(join(directory, 'package.json'), '{broken');
@@ -46,9 +48,9 @@ test('HTML and Vue native eligibility shares per-call parser checks while result
   assert.equal(await cacheEligibility(batch, options), false, 'HTML result-cache gate still exits before filesystem checks');
 });
 
-test('repeated HTML native calls bypass result caching with exact bytes counters and events', async (t) => {
+test('repeated HTML Vue Svelte native calls bypass result caching with exact bytes counters and events', async (t) => {
   const { directory } = await context(t);
-  for (const extension of ['html', 'htm', 'vue']) {
+  for (const extension of ['html', 'htm', 'vue', 'svelte']) {
     const batch = [{ name: `cache-source.${extension}`, content: '<script>function calc(){return 1+2;}</script>', mutate: true }];
     const events = [];
     const sut = createInstrumenter(logger, { cacheDir: directory, engine: 'native', onEvent: event => events.push(event) });
@@ -58,7 +60,7 @@ test('repeated HTML native calls bypass result caching with exact bytes counters
     assert.deepEqual(sut.stats, { hits: 0, misses: 0, bypasses: 2, errors: 0, nativeBatches: 2, fallbackBatches: 0, nativeErrors: 0 });
     assert.deepEqual(events, Array.from({ length: 2 }, () => ({ type: 'bypasses', reason: 'external parser configuration or ignorer' })));
   }
-  assert.deepEqual(await readdir(directory), [], 'HTML output never enters the result cache');
+  assert.deepEqual(await readdir(directory), [], 'container output never enters the result cache');
 });
 
 test('HTML auto fallback preserves dynamic Babel effects and custom ignorer invocations', async (t) => {
@@ -93,13 +95,13 @@ test('HTML auto fallback preserves dynamic Babel effects and custom ignorer invo
   assert.equal(ignored.stats.bypasses, 2);
 });
 
-test('Vue auto fallback preserves dynamic Babel effects and custom ignorer invocations', async (t) => {
+for (const extension of ['vue', 'svelte']) test(`${extension} auto fallback preserves dynamic Babel effects and custom ignorer invocations`, async (t) => {
   const { directory } = await context(t);
   const countFile = join(directory, 'count.txt');
   const configFile = join(directory, 'babel.config.cjs');
   await writeFile(join(directory, 'package.json'), '{"private":true}');
   await writeFile(configFile, `const fs=require('node:fs');module.exports=api=>{api.cache(false);fs.appendFileSync(${JSON.stringify(countFile)},'x');return {};};`);
-  const batch = [{ name: join(directory, 'source.vue'), content: '<script>const flag=true;</script>', mutate: true }];
+  const batch = [{ name: join(directory, `source.${extension}`), content: '<script>const flag=true;</script>', mutate: true }];
   const sut = createInstrumenter(logger, { cacheDir: join(directory, 'cache'), engine: 'auto' });
   const previousCwd = process.cwd();
   try {
