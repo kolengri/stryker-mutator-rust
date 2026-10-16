@@ -5,6 +5,8 @@
 //! the generated expression to obtain its exact output byte range. This never
 //! searches output text or identifies literals by their decoded value/source
 //! span (replacement subtrees can have overlapping, reparsed source spans).
+//! An immutable visit first compares parser-owned raw tokens with this pinned
+//! generator's literal spelling. If none differ, print the original AST directly.
 
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::{AssignmentTarget, Expression, StringLiteral};
@@ -16,6 +18,26 @@ use oxc_span::{SourceType, Span};
 const PREFIX: &str = "__stryker_raw_string_";
 const UNPROVEN: &str = "String literal spelling requires upstream replacement formatting: unproven generated literal ranges";
 
+fn literal_spelling(node: &StringLiteral<'_>) -> String {
+    let mut generator = Codegen::new();
+    // Gen preserves Oxc's lone-surrogate encoding; print_string(value) does not.
+    node.print(&mut generator, oxc_codegen::Context::empty());
+    generator.into_source_text()
+}
+
+#[derive(Default)]
+struct NeedsProtection(bool);
+
+impl<'a> Visit<'a> for NeedsProtection {
+    fn visit_string_literal(&mut self, node: &StringLiteral<'a>) {
+        if !self.0
+            && let Some(raw) = &node.raw
+        {
+            self.0 = literal_spelling(node) != raw.as_str();
+        }
+    }
+}
+
 struct Protect<'a> {
     allocator: &'a Allocator,
     spellings: Vec<String>,
@@ -23,14 +45,10 @@ struct Protect<'a> {
 
 impl<'a> VisitMut<'a> for Protect<'a> {
     fn visit_string_literal(&mut self, node: &mut StringLiteral<'a>) {
-        let spelling = node.raw.as_ref().map_or_else(
-            || {
-                let mut generator = Codegen::new();
-                node.print(&mut generator, oxc_codegen::Context::empty());
-                generator.into_source_text()
-            },
-            ToString::to_string,
-        );
+        let spelling = node
+            .raw
+            .as_ref()
+            .map_or_else(|| literal_spelling(node), ToString::to_string);
         let marker = format!("{PREFIX}{}__", self.spellings.len());
         self.spellings.push(spelling);
         node.value = self.allocator.alloc_str(&marker).into();
@@ -99,6 +117,13 @@ fn restore(code: String, spellings: Vec<String>) -> Result<String, String> {
 }
 
 pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, String> {
+    let mut needs_protection = NeedsProtection::default();
+    needs_protection.visit_expression(node);
+    if !needs_protection.0 {
+        let mut generator = Codegen::new().with_source_text(source);
+        generator.print_expression(node);
+        return Ok(generator.into_source_text());
+    }
     let allocator = Allocator::default();
     let mut cloned = node.clone_in(&allocator);
     let mut protect = Protect {
@@ -115,6 +140,13 @@ pub(super) fn assignment_target(
     node: &AssignmentTarget<'_>,
     source: &str,
 ) -> Result<String, String> {
+    let mut needs_protection = NeedsProtection::default();
+    needs_protection.visit_assignment_target(node);
+    if !needs_protection.0 {
+        let mut generator = Codegen::new().with_source_text(source);
+        node.print(&mut generator, oxc_codegen::Context::empty());
+        return Ok(generator.into_source_text());
+    }
     let allocator = Allocator::default();
     let mut cloned = node.clone_in(&allocator);
     let mut protect = Protect {
@@ -142,7 +174,90 @@ mod tests {
             None,
             &builder,
         ));
+        let mut needs_protection = NeedsProtection::default();
+        needs_protection.visit_expression(&expression);
+        assert!(!needs_protection.0);
         assert_eq!(super::expression(&expression, "").unwrap(), "\"generated\"");
+    }
+
+    #[test]
+    fn direct_print_requires_every_raw_literal_to_match_codegen() {
+        for source in [
+            "a + b * c",
+            r#"a.startsWith("x") && b === "y""#,
+            r#"f("a\\b", "say \"yes\"", "\ud800", "\udfff", "\\ud800", "�", "😀é")"#,
+            r#"value as "type""#,
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::mjs().with_typescript(true))
+                .parse_expression()
+                .unwrap();
+            let mut needs_protection = NeedsProtection::default();
+            needs_protection.visit_expression(&node);
+            assert!(!needs_protection.0, "{source}");
+            let mut generator = Codegen::new().with_source_text(source);
+            generator.print_expression(&node);
+            assert_eq!(
+                super::expression(&node, source).unwrap(),
+                generator.into_source_text()
+            );
+        }
+        for source in [
+            r#"f("a", 'a')"#,
+            r#"f("a", "\x61")"#,
+            r#"f("a", "\u0061")"#,
+            r#"f("a", "\uD800")"#,
+            "value as 'type'",
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::mjs().with_typescript(true))
+                .parse_expression()
+                .unwrap();
+            let mut needs_protection = NeedsProtection::default();
+            needs_protection.visit_expression(&node);
+            assert!(needs_protection.0, "{source}");
+            assert_eq!(super::expression(&node, source).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn assignment_targets_use_the_same_raw_spelling_proof() {
+        for (source, protected) in [(r#"obj["x"] = 1"#, false), ("obj['x'] = 1", true)] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::mjs())
+                .parse_expression()
+                .unwrap();
+            let Expression::AssignmentExpression(node) = node else {
+                panic!("assignment")
+            };
+            let mut needs_protection = NeedsProtection::default();
+            needs_protection.visit_assignment_target(&node.left);
+            assert_eq!(needs_protection.0, protected);
+            assert_eq!(
+                assignment_target(&node.left, source).unwrap(),
+                source.strip_suffix(" = 1").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn one_raw_mismatch_still_protects_generated_and_canonical_marker_values() {
+        let source = r#"f('__stryker_raw_string_0__', 'a', "a")"#;
+        let allocator = Allocator::default();
+        let mut node = Parser::new(&allocator, source, SourceType::mjs())
+            .parse_expression()
+            .unwrap();
+        let Expression::CallExpression(call) = &mut node else {
+            panic!("call")
+        };
+        let oxc_ast::ast::Argument::StringLiteral(generated) = &mut call.arguments[0] else {
+            panic!("string")
+        };
+        generated.raw = None;
+        assert_eq!(
+            super::expression(&node, source).unwrap(),
+            r#"f("__stryker_raw_string_0__", 'a', "a")"#
+        );
     }
 
     #[test]

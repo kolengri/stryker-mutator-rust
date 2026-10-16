@@ -63,6 +63,7 @@ function runtime(pair, setup, observation = '[calc(),calc()]') {
 
 const receive = 'function receive(...args){events.push(args);return args[0];}';
 const cases = [
+  ['canonical double quotes, backslashes and escaped lone surrogates', String.raw`function calc(){return receive("x", "a\\b", "say \"yes\"", "\ud800", "\udfff", "\\ud800", "�", "😀é").startsWith("x");}`, receive],
   ['mixed repeated values and escapes', String.raw`function calc(){return receive(' a ', "a", '\x61', "\u0061", '\u{61}', 'it\'s', "say \"yes\"", '\\', '\0', '\t', '\uD800', '\udfff', '�', '😀é').trim('single quoted').startsWith('\x61');}`, receive],
   ['operators and nested logical clones', String.raw`function calc(){return (receive('x', "\x78") === '\u0078') && (receive(false) || 'fallback');}`, receive],
   ['assignments and updates through computed method spines', String.raw`function calc(){obj[choose(' key ', "\x6bey").trim('unused')].value += receive('2', "\u0032"); return obj[choose("key", '\u006bey')].value++;}`, receive + 'const obj={key:{value:3}};function choose(...args){events.push(args);return args[0];}'],
@@ -83,6 +84,28 @@ for (const [name, content, setup, extension] of cases) {
     runtime(await compare([file(content, extension)]), setup);
   });
 }
+
+test('canonical method/operator/logical clones preserve all records and runtime', async () => {
+  const content = 'function calc(a="x",b="y"){return a.startsWith("x") && b === "y";}';
+  runtime(await compare([file(content)]), '', '[calc(),calc("z","y"),calc("x","z")]');
+});
+
+test('canonical, protected and string-free printers coexist across execution modes', async () => {
+  const files = [
+    file('function canonical(a,b){return a.startsWith("x") && b === "y";}', 'canonical.js'),
+    file(String.raw`function protectedRaw(a,b){return a.startsWith('\x78') && b === 'y';}`, 'raw.js'),
+    file('function numeric(a,b){return a+b;}', 'numeric.js'),
+  ];
+  const pair = await compare(files);
+  const serial = raw(files, 1);
+  assert.equal(serial.supported, true, serial.reason);
+  for (let repeat = 0; repeat < 3; repeat++) for (const threads of [1, 4, undefined]) {
+    const response = raw(files, threads);
+    assert.equal(response.supported, true, response.reason);
+    assert.equal(JSON.stringify(response.result), JSON.stringify(serial.result));
+  }
+  runtime(pair, '', '[canonical("x","y"),protectedRaw("x","y"),numeric(3,2)]');
+});
 
 test('raw clones retain their own spelling while generated string mutants use double quotes', async () => {
   const content = String.raw`function calc(){return receive('', "", '\x61', "\u0061", 'a').startsWith('a') || (flag && '');}`;
