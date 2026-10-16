@@ -222,7 +222,7 @@ test('original offset projection selection and directive ownership exclusions no
 });
 
 const unsupported = [
-  '<script context="module">const name="world";</script>',
+  '<script context="module">export const name="world";</script>',
   '<script module>const name="world";</script>',
   '<script lang="js">let name="world";</script>',
   '<script lang="ts">let name:string="world";</script>',
@@ -265,9 +265,8 @@ const unsupported = [
   '<script>function calc(){return receiver.tag`x`;}</script>',
 ];
 
-// Exact other six upstream resources remain independently unproved.
+// Exact other five upstream resources remain independently unproved.
 const retainedFixtures = {
-  "svelte-module-script-tag.svelte": "<script context=\"module\">\n\tlet name = 'world';\n</script>\n\n<h1>Hello {name}!</h1>",
   "svelte-multiple-script-tags.svelte": "<script context=\"module\">\n\tlet name = 'test';\n</script>\n\n<script>\n\tlet name = 'world';\n</script>\n\n<div>\n\t<script>\n\t\tlet name = 'teun'\n\t</script>\n\t<h1>\n\t\t{name}\n\t</h1>\n</div>",
   "svelte-only-template-script-tags.svelte": "<div>\n\t<script>\n\t\tlet name = 'teun'\n\t</script>\n\t<script>\n\t\tlet test = 'test'\n\t</script>\n</div>",
   "svelte-template-call-expression.svelte": "<script>\n  export function sum(a, b) {\n    return a + b;\n  }\n</script>\n\n<main>\n  <p>1 + 2 = {sum(1, 2)}</p>\n</main>\n",
@@ -275,8 +274,8 @@ const retainedFixtures = {
   "svelte-ts.svelte": "<script lang=\"ts\" context=\"module\">\n    function add(a: number, b: number) {\n        return a + b;\n    }\n</script>\n\n<script lang=\"ts\">\n    import type { Athlete } from './athlete.js';\n\n    const athletes: Athlete[] = [\n      { sport: \"Athletics\", name: \"Alice\", age: 16 },\n      { sport: \"Swimming\", name: \"Bob\", age: 18 },\n      { sport: \"Tennis\", name: \"Charlie\", age: 20 },\n    ];\n  \n    let a = 0;\n    let b = 0;\n    $: count = a + b;\n</script>\n\n<main>\n   <script lang=\"ts\">\n    function subtract(a: number, b: number) {\n        return a - b;\n    }\n   </script>\n</main>\n  "
 };
 
-test('other six pinned Svelte fixtures and unsupported mixed batches retain atomic fallback and exact upstream errors', async () => {
-  assert.equal(Object.keys(retainedFixtures).length, 6);
+test('other five pinned Svelte fixtures and unsupported mixed batches retain atomic fallback and exact upstream errors', async () => {
+  assert.equal(Object.keys(retainedFixtures).length, 5);
   const ledger = [];
   for (const [name, content] of [...Object.entries(retainedFixtures), ...unsupported.map((source, index) => [`unsupported-${index}.svelte`, source])]) {
     const files = [file('const before=true;', 'before.js'), file(sample, 'positive.svelte'), file(content, name)];

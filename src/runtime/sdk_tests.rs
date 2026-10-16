@@ -194,13 +194,15 @@ async fn vitest_explicit_test_files_bound_all_selected_plans_without_losing_stat
             ).unwrap();
             let response = execute(
                 directory.path(),
-                json!({"testRunner":"vitest","vitest":{"related":related},"coverageAnalysis":coverage,"testFiles":["test/math.test.js"],"concurrency":1}),
+                json!({"testRunner":"vitest","vitest":{"related":related},"coverageAnalysis":coverage,"testFiles":["test/math.test.js"],"concurrency":1,"timeoutMS":5000}),
             ).await.unwrap();
             assert_eq!(
                 response["supported"], true,
                 "{related} {coverage}: {response}"
             );
             let records = mutants(&response);
+            assert_eq!(records.len(), 6, "{related} {coverage}: {response}");
+            assert_eq!(response["stats"]["timeouts"], 0, "{response}");
             let startup = records
                 .iter()
                 .find(|mutant| mutant["mutatorName"] == "BooleanLiteral")

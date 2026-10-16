@@ -234,19 +234,28 @@ Ambiguous markup, entities, other interpolation/ICU syntax, and unsupported scri
 grammar trigger atomic fallback. HTML and Vue bypass
 result caching and use native serial recovery for parallel requests.
 
-Native `.svelte` accepts one attribute-free top-level JavaScript instance script,
-explicitly balanced ordinary elements from a bounded lowercase set, static text
-and bare identifier mustaches (including Unicode). Empty/static templates are
-supported. The exact Git-pinned `rsvelte_core` parser validates typed nodes and
-original byte boundaries; deferred template expressions must resolve. Scripts
-are parsed once by the existing Oxc 0.154 engine, without transferring the
-parser's Oxc 0.149 AST. The shared emitter supplies one module header only when
-mutants are placed, including with `noHeader: true`, matching Stryker 10.
-Module/duplicate/nested scripts, attributes, styles, components, directives,
-blocks, entities, broader expressions, imports/exports, reactive labels, stores,
-runes, BOMs and recovery require atomic upstream fallback. Other six pinned
-Svelte resources remain fallback. Svelte bypasses result caching, observes live
-Babel/ignorer configuration, and uses serial recovery for parallel requests.
+Native `.svelte` accepts an optional canonical `<script context="module">`
+JavaScript module script and an optional attribute-free top-level JavaScript
+instance script (at least one is required), explicitly balanced ordinary
+elements from a bounded lowercase set, static text and bare identifier
+mustaches (including Unicode). Empty scripts/static templates are supported.
+The exact Git-pinned `rsvelte_core` parser validates typed nodes and original
+byte boundaries; deferred template expressions must resolve. Scripts are
+parsed once by the existing Oxc 0.154 engine, without transferring the parser's
+Oxc 0.149 AST. Module mutations precede instance mutations regardless of source
+order. One shared header goes inside the existing module script, or a new
+module script, only when mutants are placed, including with `noHeader: true`.
+Module constants cannot be written through unresolved instance references;
+local shadowing and property writes retain their existing semantics.
+Duplicate/nested scripts, other attributes/module spellings, styles,
+components, directives, blocks, entities, broader expressions, imports/exports,
+reactive labels, stores, runes, embedded hashbangs, BOMs and recovery require atomic upstream
+fallback. The unchanged hello-world and module-script upstream fixtures are
+native; the other five pinned Svelte resources remain fallback. Nested scripts
+are HTML script text in SSR and execute in document scope on the client, where
+component-module mutation helpers are unavailable; their runtime equivalence
+is not established. Svelte bypasses result caching, observes live Babel/ignorer
+configuration, and uses serial recovery for parallel requests.
 The parser dependency has an unconditional compiler graph, duplicate Oxc
 versions and MPL-2.0 dependencies; see NOTICE. Parser qualification alone is not
 compiler or runtime proof. This adapter makes no performance claim.

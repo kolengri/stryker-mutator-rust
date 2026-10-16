@@ -596,7 +596,7 @@ fn instrument_program_inner(
     next_id: &mut usize,
     relocation_proven: Option<&mut bool>,
     html_raw_text: bool,
-    shared_header: Option<&mut bool>,
+    mut shared_header: Option<&mut svelte::ScriptState>,
 ) -> Result<String, String> {
     #[cfg(test)]
     let parse_timer = parallel::diagnostic::Timer::start(0);
@@ -672,7 +672,7 @@ fn instrument_program_inner(
     if bindings.found {
         return Err("Source shadows an instrumentation helper or runtime global".into());
     }
-    if shared_header.is_some() {
+    if let Some(state) = shared_header.as_mut() {
         let mut guard = svelte::ScriptGuard::default();
         guard.visit_program(&parsed.program);
         // Valid JS can still fail Svelte's constant_assignment compiler check.
@@ -685,8 +685,33 @@ fn instrument_program_inner(
                     .get_resolved_references(symbol)
                     .any(|reference| reference.is_write())
         });
-        if guard.unsupported || constant_write {
-            return Err("Svelte instance script requires compiler equivalence".into());
+        let module_constant_write =
+            scoping
+                .root_unresolved_references()
+                .iter()
+                .any(|(name, references)| {
+                    state.module_constants.contains(name.as_str())
+                        && references
+                            .iter()
+                            .any(|&id| scoping.get_reference(id).is_write())
+                });
+        if parsed.program.hashbang.is_some()
+            || guard.unsupported
+            || constant_write
+            || module_constant_write
+        {
+            return Err("Svelte script requires compiler equivalence".into());
+        }
+        if state.module {
+            state.module_constants.extend(
+                scoping
+                    .symbol_ids()
+                    .filter(|&symbol| {
+                        scoping.symbol_flags(symbol).is_const_variable()
+                            && scoping.symbol_scope_id(symbol) == scoping.root_scope_id()
+                    })
+                    .map(|symbol| scoping.symbol_name(symbol).to_owned()),
+            );
         }
     }
     if let Some(proven) = relocation_proven {
@@ -735,7 +760,7 @@ fn instrument_program_inner(
         .collect::<Result<Vec<_>, _>>()?;
     let mut output = emitter.apply(Span::new(0, source.len() as u32), edits);
     if let Some(needed) = shared_header {
-        *needed |= emitter.placed != 0;
+        needed.needed |= emitter.placed != 0;
     }
     if emitter.placed != 0 && !options.no_header {
         // Leave the parsed hashbang and first statement's comment preamble ahead

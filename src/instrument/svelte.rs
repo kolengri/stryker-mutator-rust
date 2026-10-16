@@ -3,7 +3,7 @@
 //! Only ranges cross into our Oxc 0.154 engine. The parser's Oxc 0.149 AST never
 //! does, and deferred scripts are parsed exactly once by the existing engine.
 
-use std::ops::Range;
+use std::{collections::HashSet, ops::Range};
 
 use oxc_ast::ast::{BindingIdentifier, IdentifierReference, Statement};
 use oxc_ast_visit::{Visit, walk};
@@ -19,46 +19,75 @@ pub(super) fn instrument(
     records: &mut Vec<ApiMutant>,
     next_id: &mut usize,
 ) -> Result<String, String> {
-    let script = script_range(&file.content)?;
-    // Svelte suppresses every child header, including when noHeader is false,
-    // and then places ONE module header if any child placed a mutant. Its outer
-    // transformer intentionally does this even when noHeader itself is true.
+    let scripts = script_ranges(&file.content)?;
+    // Transform the module FIRST, independently of source order, without
+    // resetting global IDs. Printing below restores original source order.
     let child_options = Options {
         no_header: true,
         excluded: options.excluded.clone(),
     };
-    let mut needed = false;
-    let printed = instrument_program_inner(
-        file,
-        &file.content[script.clone()],
-        SourceType::mjs(),
-        // Svelte uses PositionConverter on ORIGINAL text (line-relative UTF-16
-        // columns), unlike Angular's absolute-offset column contract for HTML.
-        Positions::new(&file.content).at(script.start as u32),
-        &child_options,
-        records,
-        next_id,
-        None,
-        true,
-        Some(&mut needed),
-    )?;
+    let mut state = ScriptState::default();
+    let mut replacements = Vec::new();
+    for (range, module) in scripts
+        .module
+        .iter()
+        .map(|range| (range, true))
+        .chain(scripts.instance.iter().map(|range| (range, false)))
+    {
+        state.module = module;
+        let printed = instrument_program_inner(
+            file,
+            &file.content[range.clone()],
+            SourceType::mjs(),
+            // Svelte projects ORIGINAL text into line-relative UTF-16 columns.
+            Positions::new(&file.content).at(range.start as u32),
+            &child_options,
+            records,
+            next_id,
+            None,
+            true,
+            Some(&mut state),
+        )?;
+        replacements.push((range, printed));
+    }
+    // Svelte places ONE shared header only for actually placed mutants, even
+    // with outer noHeader:true. Ignored records alone never require a header.
+    if state.needed && scripts.module.is_some() {
+        replacements[0].1.insert_str(0, HEADER);
+    }
+    replacements.sort_unstable_by_key(|(range, _)| range.start);
     let mut output = String::new();
-    if needed {
+    if state.needed && scripts.module.is_none() {
         output.push_str("<script context=\"module\">\n");
         output.push_str(HEADER);
         output.push_str("\n</script>\n");
     }
-    output.push_str(&file.content[..script.start]);
-    output.push('\n');
-    output.push_str(&printed);
-    output.push('\n');
-    output.push_str(&file.content[script.end..]);
-    // All admitted expressions are bare identifiers: upstream's program print
-    // plus final-semicolon removal leaves those original bytes unchanged.
+    let mut cursor = 0;
+    for (range, printed) in replacements {
+        output.push_str(&file.content[cursor..range.start]);
+        output.push('\n');
+        output.push_str(&printed);
+        output.push('\n');
+        cursor = range.end;
+    }
+    output.push_str(&file.content[cursor..]);
+    // Bare identifier expressions retain their original bytes upstream too.
     Ok(output)
 }
 
-fn script_range(source: &str) -> Result<Range<usize>, String> {
+#[derive(Default)]
+pub(super) struct ScriptState {
+    pub(super) needed: bool,
+    pub(super) module: bool,
+    pub(super) module_constants: HashSet<String>,
+}
+
+struct Scripts {
+    module: Option<Range<usize>>,
+    instance: Option<Range<usize>>,
+}
+
+fn script_ranges(source: &str) -> Result<Scripts, String> {
     if source.len() > u32::MAX as usize || source.contains('\u{feff}') {
         return Err(UNSUPPORTED.into());
     }
@@ -74,8 +103,7 @@ fn script_range(source: &str) -> Result<Range<usize>, String> {
     )
     // Rust parser diagnostics are not the pinned JS compiler's diagnostics.
     .map_err(|_| UNSUPPORTED)?;
-    if root.module.is_some()
-        || root.css.is_some()
+    if root.css.is_some()
         || root.options.is_some()
         || !root.parse_warnings.is_empty()
         || !root.unclosed_ancestors.is_empty()
@@ -87,16 +115,17 @@ fn script_range(source: &str) -> Result<Range<usize>, String> {
     if resolve_lazy_expressions(&mut root, source).is_some() {
         return Err(UNSUPPORTED.into());
     }
-    let script = root.instance.as_ref().ok_or(UNSUPPORTED)?;
-    let range =
-        script.content_offset as usize..script.content_offset as usize + script.raw_content.len();
-    if !script.attributes.is_empty()
-        || script.is_typescript
-        || script.context != ScriptContext::Default
-        || source.get(script.start as usize..range.start) != Some("<script>")
-        || source.get(range.clone()) != Some(script.raw_content)
-        || source.get(range.end..script.end as usize) != Some("</script>")
-    {
+    let module = root
+        .module
+        .as_ref()
+        .map(|script| prove_script(source, script, true))
+        .transpose()?;
+    let instance = root
+        .instance
+        .as_ref()
+        .map(|script| prove_script(source, script, false))
+        .transpose()?;
+    if module.is_none() && instance.is_none() {
         return Err(UNSUPPORTED.into());
     }
     let mut items: Vec<_> = root
@@ -108,7 +137,9 @@ fn script_range(source: &str) -> Result<Range<usize>, String> {
             (start as usize, end as usize, Some(node))
         })
         .collect();
-    items.push((script.start as usize, script.end as usize, None));
+    for script in root.module.iter().chain(root.instance.iter()) {
+        items.push((script.start as usize, script.end as usize, None));
+    }
     items.sort_unstable_by_key(|item| item.0);
     let mut cursor = 0;
     for (start, end, node) in items {
@@ -121,7 +152,7 @@ fn script_range(source: &str) -> Result<Range<usize>, String> {
             return Err(UNSUPPORTED.into());
         }
         if let Some(node) = node {
-            prove_node(source, node, 0)?;
+            prove_node(source, node, 0, module.is_some() && instance.is_some())?;
         }
         cursor = end;
     }
@@ -131,10 +162,41 @@ fn script_range(source: &str) -> Result<Range<usize>, String> {
     {
         return Err(UNSUPPORTED.into());
     }
+    Ok(Scripts { module, instance })
+}
+
+fn prove_script(source: &str, script: &Script<'_>, module: bool) -> Result<Range<usize>, String> {
+    let range =
+        script.content_offset as usize..script.content_offset as usize + script.raw_content.len();
+    let (context, opening) = if module {
+        (ScriptContext::Module, "<script context=\"module\">")
+    } else {
+        (ScriptContext::Default, "<script>")
+    };
+    // The typed context AND complete original delimiters must agree. Other
+    // attribute spellings/values, TS and the `module` shorthand stay fallback.
+    if script.is_typescript
+        || script.context != context
+        || if module {
+            script.attributes.len() != 1 || script.attributes[0].name != "context"
+        } else {
+            !script.attributes.is_empty()
+        }
+        || source.get(script.start as usize..range.start) != Some(opening)
+        || source.get(range.clone()) != Some(script.raw_content)
+        || source.get(range.end..script.end as usize) != Some("</script>")
+    {
+        return Err(UNSUPPORTED.into());
+    }
     Ok(range)
 }
 
-fn prove_node(source: &str, node: &TemplateNode<'_>, depth: usize) -> Result<(), String> {
+fn prove_node(
+    source: &str,
+    node: &TemplateNode<'_>,
+    depth: usize,
+    second_script: bool,
+) -> Result<(), String> {
     if depth > 128 {
         return Err(UNSUPPORTED.into());
     }
@@ -152,10 +214,10 @@ fn prove_node(source: &str, node: &TemplateNode<'_>, depth: usize) -> Result<(),
             let name = tag.expression.identifier_name().ok_or(UNSUPPORTED)?;
             let start = tag.expression.start().ok_or(UNSUPPORTED)? as usize;
             let end = tag.expression.end().ok_or(UNSUPPORTED)? as usize;
-            // Upstream maps script0 back to script content even when that
-            // placeholder occurs as a template identifier. Its range remapping
-            // is unproved in this collision case, so reject the whole batch.
+            // Upstream remaps actual scriptN placeholders even inside bare
+            // identifier mustaches. This bounded adapter has at most two scripts.
             if name == "script0"
+                || (second_script && name == "script1")
                 || forbidden_identifier(name)
                 || source.get(start..end) != Some(name)
                 || source
@@ -220,7 +282,7 @@ fn prove_node(source: &str, node: &TemplateNode<'_>, depth: usize) -> Result<(),
                 if start as usize != cursor || end < start {
                     return Err(UNSUPPORTED.into());
                 }
-                prove_node(source, child, depth + 1)?;
+                prove_node(source, child, depth + 1, second_script)?;
                 cursor = end as usize;
             }
             if cursor != element.end as usize - close.len() {
@@ -242,7 +304,7 @@ fn forbidden_identifier(name: &str) -> bool {
 
 // Run on the SAME parsed current-version program as the mutation engine. Svelte
 // has additional compiler semantics for runes/stores, reactive labels, imports
-// and exports. These are outside this first capability, even if valid JS.
+// and exports. These are outside this capability, even if valid JS.
 #[derive(Default)]
 pub(super) struct ScriptGuard {
     pub(super) unsupported: bool,
@@ -281,10 +343,12 @@ mod tests {
         for source in [
             "<script>let name='world';</script><h1>Hello {name}</h1>",
             "<script></script>",
+            "<script context=\"module\">const name='world';</script>",
+            "<script>let n=1;</script><div>{n}</div><script context=\"module\">let n=2;</script>",
             " <script>const café=1;</script>\r\n<div>😀 { café }</div> ",
             "<div><span>text</span></div><script>let n=1;</script>",
         ] {
-            assert!(script_range(source).is_ok(), "{source}");
+            assert!(script_ranges(source).is_ok(), "{source}");
         }
     }
 
@@ -292,6 +356,11 @@ mod tests {
     fn unproved_syntax_recovery_and_delimiters_reject() {
         for source in [
             "<script/>",
+            "<script module>let n=1;</script>",
+            "<script context='module'>let n=1;</script>",
+            "<script context=\"module\" lang=\"js\">let n=1;</script>",
+            "<script context=\"module\">let n=1;</script><script context=\"module\"></script>",
+            "<script context=\"module\"></script><script></script><p>{script1}</p>",
             "<script>let n=1;</script><p>open",
             "<script>let n=1;</script><p><div>x</div></p>",
             "<script>let n=1;</script><div>{n+1}</div>",
@@ -302,7 +371,7 @@ mod tests {
             "<script>let n=1;</script><script></script>",
             "<script>let n=1;</script><div><script></script></div>",
         ] {
-            assert!(script_range(source).is_err(), "{source}");
+            assert!(script_ranges(source).is_err(), "{source}");
         }
     }
 }
