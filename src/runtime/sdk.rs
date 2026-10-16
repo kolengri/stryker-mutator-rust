@@ -1,4 +1,4 @@
-//! Rust schedules SDK calls; the Node process owns only the Mocha plugin instance.
+//! Rust schedules SDK calls; the Node process owns only the explicitly selected SDK plugin instance.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -86,7 +86,7 @@ pub(super) async fn prepare(
     let metadata = metadata.map_err(error_string)?;
     if metadata["sdkVersion"] != "10.0.0" {
         return Ok(Err(
-            "Native Mocha requires the pinned Stryker SDK 10.0.0".into()
+            "Native SDK runner requires the pinned Stryker SDK 10.0.0".into(),
         ));
     }
     let contributions = metadata["schemaContributions"]
@@ -219,7 +219,7 @@ impl Worker {
                 .collect();
         }
         let initialized = async {
-            self.call("initialize", json!({"cwd":self.directory,"options":options,"fileDescriptions":*self.descriptions,"modules":self.config.modules,"plugin":{"kind":"TestRunner","name":"mocha"}}), LIFECYCLE).await?;
+            self.call("initialize", json!({"cwd":self.directory,"options":options,"fileDescriptions":*self.descriptions,"modules":self.config.modules,"plugin":{"kind":"TestRunner","name":self.config.runner.sdk().expect("SDK runner").name()}}), LIFECYCLE).await?;
             self.call("runner.init", Value::Null, LIFECYCLE).await?;
             Ok::<_, BridgeError>(())
         }.await;
@@ -272,7 +272,7 @@ impl Worker {
             .call("runner.capabilities", Value::Null, LIFECYCLE)
             .await?;
         let capable = value["reloadEnvironment"].as_bool().ok_or_else(|| {
-            BridgeError::Protocol("Mocha capabilities omitted reloadEnvironment".into())
+            BridgeError::Protocol("SDK runner capabilities omitted reloadEnvironment".into())
         })?;
         self.can_reload = Some(capable);
         Ok(capable)
@@ -486,6 +486,16 @@ fn plans(
         let mut options = json!({"activeMutant":{"id":mutant["id"],"fileName":config.cwd.join(mutant["fileName"].as_str().expect("native file")),"location":mutant["location"],"mutatorName":mutant["mutatorName"],"replacement":mutant["replacement"]},"mutantActivation":decision["mutantActivation"],"timeout":decision["timeout"],"disableBail":config.options["disableBail"],"reloadEnvironment":decision["reloadEnvironment"]});
         if covered_filter {
             options["testFilter"] = covered.into();
+        } else if config.runner.sdk() == Some(config::SdkRunner::Vitest)
+            && !project.test_files.is_empty()
+        {
+            // Vitest consumes explicit files only in dryRun. Bound its subsequent
+            // all-selected runs to baseline IDs, without changing the planner's
+            // static activation/reload decision merely because a filter is sent.
+            options["testFilter"] = unique_tests
+                .iter()
+                .map(|&index| tests[index]["id"].clone())
+                .collect();
         }
         if !decision["hitLimit"].is_null() {
             options["hitLimit"] = decision["hitLimit"].clone();
@@ -541,13 +551,18 @@ pub(super) async fn run(
         first.start().await?;
         workers.push(first);
         let timeout = config.options["dryRunTimeoutMinutes"].as_f64().expect("validated dry run timeout") * 60_000.0;
-        let baseline_options = json!({"timeout":timeout,"coverageAnalysis":config.options["coverageAnalysis"],"disableBail":config.options["disableBail"],"files":project.files.iter().map(|file| sandboxes[0].path.join(file)).collect::<Vec<_>>()});
+        let mut baseline_options = json!({"timeout":timeout,"coverageAnalysis":config.options["coverageAnalysis"],"disableBail":config.options["disableBail"],"files":project.originals.keys().map(|file| sandboxes[0].path.join(file)).collect::<Vec<_>>()});
+        // Core 10 passes only filesToMutate, and omits testFiles when empty.
+        // Vitest uses these separate inputs for related-file selection.
+        if !test_files.is_empty() {
+            baseline_options["testFiles"] = test_files.iter().map(|file| json!(sandboxes[0].path.join(file))).collect();
+        }
         let started = Instant::now();
         let mut baseline = workers[0].run("runner.dryRun", baseline_options).await?;
         let gross = started.elapsed().as_secs_f64() * 1000.0;
         workers[0].capabilities().await.map_err(error_string)?;
-        if baseline["status"] != "complete" { return Err(format!("Initial Mocha run failed: {baseline}")); }
-        let tests = baseline["tests"].as_array_mut().ok_or("Initial Mocha run omitted tests")?;
+        if baseline["status"] != "complete" { return Err(format!("Initial SDK run failed: {baseline}")); }
+        let tests = baseline["tests"].as_array_mut().ok_or("Initial SDK run omitted tests")?;
         if tests.iter().any(|test| test["status"] == 1) { return Err(format!("One or more tests failed in the initial test run: {}", Value::Array(tests.clone()))); }
         if tests.is_empty() {
             if config.options["allowEmpty"] != true { return Err("No tests were executed in the initial test run; set allowEmpty to continue".into()); }
@@ -619,7 +634,7 @@ pub(super) async fn run(
                     match outcome { Ok(mut mutants) => results.append(&mut mutants), Err(error) => errors.push(error) }
                     if let Err(error) = cleanup { errors.push(error); }
                 }
-                Err(error) => { cancellation.send_replace(true); errors.push(format!("Native Mocha task failed: {error}")); }
+                Err(error) => { cancellation.send_replace(true); errors.push(format!("Native SDK runner task failed: {error}")); }
             }
         }
         if !errors.is_empty() {
@@ -630,7 +645,7 @@ pub(super) async fn run(
         results.sort_by_key(|mutant| mutant["id"].as_str().and_then(|id| id.parse::<u64>().ok()).unwrap_or(0));
         let completed = results.into_iter().map(|mutant| report::complete(mutant, None, &config.cwd)).collect::<Vec<_>>();
         let tests = baseline["tests"].as_array().expect("validated tests");
-        let report = report::assemble_mocha(&config, &project, &completed, tests, &test_slots)?;
+        let report = report::assemble_sdk(&config, &project, &completed, tests, &test_slots)?;
         report::write(&config, &report)?;
         let exit_code = report::exit_code(&config, &completed);
         for sandbox in &mut sandboxes { sandbox.finish(&config); }

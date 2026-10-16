@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { access, cp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { createRequire } from 'node:module';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { normalizeBunReport } from './bun-report.js';
+import { normalizeBunReport, reassembleUpstreamBunReport } from './bun-report.js';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const require = createRequire(import.meta.url);
@@ -75,6 +75,65 @@ const config = JSON.parse(await readFile(configPath, 'utf8'));
 config.commandRunner.command = `${quote(bun)} --no-env-file test ./test/calculator.test.${extension}`;
 await writeFile(configPath, JSON.stringify(config, null, 2));
 const projectHashes = await inputHashes(project);
+const upstream = resolve(require.resolve('@stryker-mutator/core/package.json'), '../bin/stryker.js');
+const commandRunnerSource = resolve(upstream, '../../dist/src/test-runner/command-test-runner.js');
+const commandRunnerHash = hash(await readFile(commandRunnerSource));
+const apiUrl = pathToFileURL(require.resolve('@stryker-mutator/api/core')).href;
+const { INSTRUMENTER_CONSTANTS } = await import(apiUrl);
+const captureDirectory = join(artifacts, 'upstream-chunks');
+await rm(captureDirectory, { recursive: true, force: true });
+await mkdir(captureDirectory);
+const captureTap = join(artifacts, 'capture-upstream-chunks.mjs');
+await writeFile(captureTap, `// Evidence tap only: preserve exec return values, events and upstream source.
+if (!process.versions.bun) {
+  const { default: childProcess } = await import('node:child_process');
+  const { syncBuiltinESMExports } = await import('node:module');
+  const { writeFileSync } = await import('node:fs');
+  const { isAbsolute, join, relative, resolve } = await import('node:path');
+  const { createHash } = await import('node:crypto');
+  const { INSTRUMENTER_CONSTANTS } = await import(${JSON.stringify(apiUrl)});
+  const command = ${JSON.stringify(config.commandRunner.command)};
+  const temporary = ${JSON.stringify(resolve(project, config.tempDirName ?? '.stryker-tmp'))};
+  const directory = ${JSON.stringify(captureDirectory)};
+  const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+  const originalExec = childProcess.exec;
+  let sequence = 0;
+  childProcess.exec = function (actualCommand, ...args) {
+    const options = args[0];
+    const cwd = typeof options?.cwd === 'string' ? resolve(options.cwd) : '';
+    const observed = actualCommand === command && isAbsolute(cwd)
+      && /^sandbox-[A-Za-z0-9]+$/.test(relative(temporary, cwd));
+    const child = Reflect.apply(originalExec, this, [actualCommand, ...args]);
+    if (!observed) return child;
+    const environment = options.env ?? process.env;
+    const variable = INSTRUMENTER_CONSTANTS.ACTIVE_MUTANT_ENV_VARIABLE;
+    const chunks = [];
+    const stdout = (chunk) => chunks.push({ stream: 'stdout', text: chunk.toString() });
+    const stderr = (chunk) => chunks.push({ stream: 'stderr', text: chunk.toString() });
+    child.stdout.on('data', stdout);
+    child.stderr.on('data', stderr);
+    // CommandTestRunner removes data listeners on exit, not close. Observe that same window.
+    child.once('exit', (code, signal) => {
+      child.stdout.off('data', stdout);
+      child.stderr.off('data', stderr);
+      writeFileSync(join(directory, process.pid + '-' + child.pid + '-' + sequence++ + '.json'), JSON.stringify({
+        version: 1, command: actualCommand, cwd,
+        activeMutantVariable: variable, activeMutantId: environment[variable] ?? null,
+        node: { executable: process.execPath, entry: process.argv[1], argvSha256: digest(process.argv) },
+        // Record environment identity without storing any unrelated environment values.
+        environmentKeysSha256: digest(Object.keys(environment).sort()),
+        spawnargs: child.spawnargs, parentPid: process.pid, pid: child.pid,
+        chunks, exit: { code, signal },
+      }), { flag: 'wx' });
+    });
+    return child;
+  };
+  syncBuiltinESMExports();
+}
+`);
+async function captureSnapshot() {
+  return Promise.all((await readdir(captureDirectory)).sort().map(async (name) => ({ name, sha256: hash(await readFile(join(captureDirectory, name))) })));
+}
 const importGuard = join(artifacts, 'forbid-upstream.mjs');
 await writeFile(importGuard, `// Bun executes only the explicit fixture command; Node coordinators/descendants are guarded.
 if (!process.versions.bun) {
@@ -89,7 +148,8 @@ if (!process.versions.bun) {
 `);
 const reports = [];
 let nativeProof;
-const upstream = resolve(require.resolve('@stryker-mutator/core/package.json'), '../bin/stryker.js');
+let upstreamCaptures;
+let upstreamCaptureSnapshot;
 for (const [name, entry, native] of [
   ['upstream', upstream, false],
   ['native', join(root, 'bin/stryker-rust.js'), true],
@@ -101,7 +161,7 @@ for (const [name, entry, native] of [
       ...process.env,
       STRYKER_RUST_COORDINATOR_ENGINE: native ? 'native' : 'upstream',
       STRYKER_RUST_DIAGNOSTICS: '1',
-      NODE_OPTIONS: native ? `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(importGuard).href}`.trim() : process.env.NODE_OPTIONS,
+      NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --import=${pathToFileURL(native ? importGuard : captureTap).href}`.trim(),
     },
   });
   await Promise.all([
@@ -114,12 +174,22 @@ for (const [name, entry, native] of [
   const bytes = await readFile(join(project, 'reports/mutation.json'));
   await writeFile(join(artifacts, `${name}.json`), bytes);
   const report = JSON.parse(bytes);
-  const normalized = normalizeBunReport(report);
+  let corrected = report;
+  if (!native) {
+    upstreamCaptureSnapshot = await captureSnapshot();
+    upstreamCaptures = await Promise.all(upstreamCaptureSnapshot.map(async ({ name }) => JSON.parse(await readFile(join(captureDirectory, name), 'utf8'))));
+    corrected = reassembleUpstreamBunReport(report, upstreamCaptures, { activeMutantVariable: INSTRUMENTER_CONSTANTS.ACTIVE_MUTANT_ENV_VARIABLE });
+    await writeFile(join(artifacts, 'upstream.corrected.json'), JSON.stringify(corrected, null, 2));
+  } else {
+    assert.deepEqual(await captureSnapshot(), upstreamCaptureSnapshot, 'Native arm must not produce or change upstream chunk captures');
+  }
+  const normalized = normalizeBunReport(corrected);
   await writeFile(join(artifacts, `${name}.normalized.json`), JSON.stringify(normalized, null, 2));
   reports.push(normalized);
   assert.deepEqual(await inputHashes(project), projectHashes, `${name} changed an original project input`);
   assert.deepEqual(await inputHashes(original), originalHashes, `${name} changed the repository fixture`);
   await assert.rejects(access(join(project, '.stryker-tmp')), { code: 'ENOENT' }, `${name} left a sandbox`);
+  assert.equal(hash(await readFile(commandRunnerSource)), commandRunnerHash, `${name} changed installed upstream CommandTestRunner source`);
   if (native) {
     const match = result.output.match(/\[stryker-rust\] (\{[^\n]+\})/);
     assert.ok(match, 'Native Rust stage proof is required');
@@ -144,7 +214,17 @@ const receipt = {
   bun: { executable: bun, binaryResolution, version: version.stdout.trim(), sha256: bunHash },
   reportsEqual: true,
   comparison: 'Every report field retained, including statusReason; outer mutant completion order sorted',
-  diagnosticNormalizations: ['SGR color sequences', 'known fixture pass/fail elapsed suffixes without separator whitespace', 'Bun Ran summary elapsed suffix', 'random sandbox leaf only in owned stack paths', 'repeated newlines from upstream chunk joining'],
+  diagnosticNormalizations: ['SGR color sequences', 'known fixture pass/fail elapsed suffixes without separator whitespace', 'Bun Ran summary elapsed suffix', 'random sandbox leaf only in owned stack and GitHub annotation paths'],
+  upstreamChunkCorrection: {
+    rawReasonsExactlyMatched: true,
+    captures: upstreamCaptureSnapshot,
+    commands: upstreamCaptures.length,
+    correctedKilledReasons: mutants.filter((mutant) => mutant.status === 'Killed').length,
+    nativeCaptureChanges: 0,
+    activeMutantVariable: INSTRUMENTER_CONSTANTS.ACTIVE_MUTANT_ENV_VARIABLE,
+    commandRunnerSource: { path: commandRunnerSource, sha256: commandRunnerHash, unchanged: true },
+    method: 'For every Killed reason verify chunks.join(os.EOL) exactly, then compare chunks.join(\'\') without changing any original chunk characters',
+  },
   rawReportsAndStreamsRetained: true,
   mutants: mutants.length,
   statuses: Object.fromEntries([...new Set(mutants.map((mutant) => mutant.status))].map((status) => [status, mutants.filter((mutant) => mutant.status === status).length])),

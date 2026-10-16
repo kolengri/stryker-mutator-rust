@@ -18,11 +18,12 @@ runner. `STRYKER_RUST_COORDINATOR_ENGINE=native stryker-rust run` selects it wit
 an upstream coordinator fallback. Its current scope includes JSON and
 [data-shaped caller-executed JS/MJS/CJS configuration](docs/native-caller-config.md),
 the built-in command runner executing `bun test` with coverage off, or existing
-Mocha projects through the pinned
-`@stryker-mutator/mocha-runner` plugin. Checker plugins are not yet supported;
+Mocha or Vitest projects through the explicitly selected pinned 10.0.0
+`@stryker-mutator/mocha-runner` or `@stryker-mutator/vitest-runner` plugin.
+Checker plugins are not yet supported;
 reporters are limited to JSON or none. Rust owns file selection, instrumentation,
 coverage indexing, test planning, sandboxes, process scheduling, deadlines,
-cancellation, cleanup, and report assembly. Node workers retain the actual Mocha
+cancellation, cleanup, and report assembly. Node workers retain the selected SDK
 plugin and test framework. Unsupported configuration exits before starting a
 mutation run. This scope does not establish full compatibility; performance must
 be measured for the chosen runner and workload.

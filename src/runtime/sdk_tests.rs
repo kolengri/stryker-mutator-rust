@@ -37,12 +37,26 @@ fn fixture(source: &str, test: &str) -> tempfile::TempDir {
 }
 
 fn request(cwd: &Path, overrides: Value) -> String {
-    let mut options = json!({"testRunner":"mocha","plugins":["@stryker-mutator/mocha-runner"],"mutate":["src/**/*.js"],"reporters":[],"coverageAnalysis":"perTest","concurrency":2,"timeoutMS":300,"timeoutFactor":2,"cleanTempDir":"always","logLevel":"off","mochaOptions":{"spec":["test/**/*.test.js"],"no-config":true,"no-package":true}});
+    let runner = overrides["testRunner"].as_str().unwrap_or("mocha");
+    let mut options = json!({"testRunner":runner,"plugins":[format!("@stryker-mutator/{runner}-runner")],"mutate":["src/**/*.js"],"reporters":[],"coverageAnalysis":"perTest","concurrency":2,"timeoutMS":300,"timeoutFactor":2,"cleanTempDir":"always","logLevel":"off"});
+    if runner == "mocha" {
+        options["mochaOptions"] =
+            json!({"spec":["test/**/*.test.js"],"no-config":true,"no-package":true});
+    }
     options
         .as_object_mut()
         .unwrap()
         .extend(overrides.as_object().unwrap().clone());
     json!({"version":1,"cwd":cwd.canonicalize().unwrap(),"args":[],"overrides":options,"nodeExecutable":node(),"bridgeModule":Path::new(env!("CARGO_MANIFEST_DIR")).join("lib/compat/worker.js")}).to_string()
+}
+
+fn runner_fixture(runner: &str, source: &str, test: &str) -> tempfile::TempDir {
+    let imports = if runner == "vitest" {
+        "import {it,describe,beforeEach,afterEach} from 'vitest';\n"
+    } else {
+        ""
+    };
+    fixture(source, &format!("{imports}{test}"))
 }
 
 async fn execute(cwd: &Path, overrides: Value) -> Result<Value, String> {
@@ -105,76 +119,198 @@ async fn actual_mocha_uses_native_coverage_plans_real_tests_and_preserves_source
 
 #[tokio::test]
 async fn selected_test_files_execute_without_filename_as_title_filter_for_off_and_static_runs() {
-    let source = "export const startup = true;\nexport function add(a,b) { return a+b; }\n";
-    let directory = fixture(
-        source,
-        "import assert from 'node:assert/strict'; import {startup,add} from '../src/math.js'; describe('selected suite',()=>{it('has an unrelated title',()=>{assert.equal(startup,true);assert.equal(add(2,3),5);});});",
-    );
-    fs::write(
-        directory.path().join("test/nonselected.test.js"),
-        "throw Error('NONSELECTED FILE EXECUTED');",
-    )
-    .unwrap();
-    for coverage in ["off", "perTest"] {
-        let response = execute(
+    for runner in ["mocha", "vitest"] {
+        let source = "export const startup = true;\nexport function add(a,b) { return a+b; }\n";
+        let directory = runner_fixture(
+            runner,
+            source,
+            "import assert from 'node:assert/strict'; import {startup,add} from '../src/math.js'; describe('selected # suite',()=>{it('has an unrelated # title',()=>{assert.equal(startup,true);assert.equal(add(2,3),5);});});",
+        );
+        fs::write(
+            directory.path().join("test/nonselected.test.js"),
+            "throw Error('NONSELECTED FILE EXECUTED');",
+        )
+        .unwrap();
+        for coverage in ["off", "perTest"] {
+            let response = execute(
             directory.path(),
-            json!({"coverageAnalysis":coverage,"testFiles":["test/math.test.js"]}),
+            json!({"testRunner":runner,"coverageAnalysis":coverage,"testFiles":["test/math.test.js"]}),
         )
         .await
         .unwrap();
-        assert_eq!(response["supported"], true, "{response}");
-        let records = mutants(&response);
-        let startup = records
-            .iter()
-            .find(|mutant| mutant["mutatorName"] == "BooleanLiteral")
-            .unwrap();
-        assert_eq!(startup["status"], "Killed", "{response}");
-        assert_eq!(startup["testsCompleted"], 1);
-        if coverage == "perTest" {
-            assert_eq!(startup["static"], true);
+            assert_eq!(response["supported"], true, "{response}");
+            let records = mutants(&response);
+            let startup = records
+                .iter()
+                .find(|mutant| mutant["mutatorName"] == "BooleanLiteral")
+                .unwrap();
+            assert_eq!(startup["status"], "Killed", "{response}");
+            assert_eq!(startup["testsCompleted"], 1);
+            if coverage == "perTest" {
+                assert_eq!(startup["static"], true);
+            }
+            assert!(
+                records.iter().all(|mutant| mutant["status"] == "Killed"),
+                "{records:?}"
+            );
+            assert_eq!(
+                response["report"]["testFiles"].as_object().unwrap().len(),
+                1
+            );
+            assert!(!directory.path().join(".stryker-tmp").exists());
         }
-        assert!(
-            records.iter().all(|mutant| mutant["status"] == "Killed"),
-            "{records:?}"
-        );
-        assert_eq!(
-            response["report"]["testFiles"].as_object().unwrap().len(),
-            1
-        );
-        assert!(!directory.path().join(".stryker-tmp").exists());
     }
 }
 
 #[tokio::test]
-async fn plugin_schema_defaults_are_rust_normalized_and_invalid_options_have_no_run_effects() {
-    let directory = fixture(
-        "export const ok=true;",
-        "import assert from 'node:assert/strict'; import {ok} from '../src/math.js'; it('ok',()=>assert.equal(ok,true));",
+async fn vitest_explicit_test_files_bound_all_selected_plans_without_losing_static_activation() {
+    for related in [true, false] {
+        for coverage in ["off", "perTest"] {
+            let source = "export const startup=true;export const label='ready';export function add(a,b){return a+b;}export function unused(v){return v*2;}";
+            let directory = runner_fixture(
+                "vitest",
+                source,
+                "import assert from 'node:assert/strict';import {startup,label,add} from '../src/math.js';describe('selected # suite',()=>{it('selected # title',()=>{assert.equal(startup,true);assert.equal(typeof label,'string');assert.equal(add(2,3),5);});});",
+            );
+            fs::write(
+                directory.path().join("test/unselected.test.js"),
+                "import {it} from 'vitest';import {startup} from '../src/math.js';it('UNSELECTED THROWING TEST',()=>{void startup;throw Error('UNSELECTED RELATED TEST EXECUTED');});",
+            ).unwrap();
+            let response = execute(
+                directory.path(),
+                json!({"testRunner":"vitest","vitest":{"related":related},"coverageAnalysis":coverage,"testFiles":["test/math.test.js"],"concurrency":1}),
+            ).await.unwrap();
+            assert_eq!(
+                response["supported"], true,
+                "{related} {coverage}: {response}"
+            );
+            let records = mutants(&response);
+            let startup = records
+                .iter()
+                .find(|mutant| mutant["mutatorName"] == "BooleanLiteral")
+                .unwrap();
+            assert_eq!(
+                startup["status"], "Killed",
+                "{related} {coverage}: {response}"
+            );
+            assert_eq!(startup["static"], true, "{related} {coverage}: {response}");
+            let label = records
+                .iter()
+                .find(|mutant| mutant["mutatorName"] == "StringLiteral")
+                .unwrap();
+            assert_eq!(
+                label["status"], "Survived",
+                "{related} {coverage}: {response}"
+            );
+            assert_eq!(label["static"], true, "{related} {coverage}: {response}");
+            let tests = &response["report"]["testFiles"];
+            assert_eq!(
+                tests.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ["test/math.test.js"]
+            );
+            assert_eq!(
+                tests["test/math.test.js"]["tests"],
+                json!([{"id":"0","name":"selected # suite selected # title"}])
+            );
+            for mutant in records {
+                for key in ["killedBy", "coveredBy"] {
+                    if let Some(ids) = mutant[key].as_array() {
+                        assert!(
+                            ids.iter().all(|id| id == "0"),
+                            "Unmapped test IDs for {related} {coverage}: {mutant}"
+                        );
+                    }
+                }
+                assert!(
+                    !mutant["statusReason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.contains("UNSELECTED")),
+                    "{related} {coverage}: {mutant}"
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(directory.path().join("src/math.js")).unwrap(),
+                source
+            );
+            assert!(!directory.path().join(".stryker-tmp").exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn vitest_related_selection_uses_mutation_inputs_including_files_without_mutants() {
+    let directory = runner_fixture(
+        "vitest",
+        "export function add(a,b){return a+b;}",
+        "import {add} from '../src/math.js'; it('adds # opaque / title',()=>{if(add(2,3)!==5)throw Error('wrong sum');});",
     );
-    let invalid = execute(
+    fs::write(
+        directory.path().join("src/constant.js"),
+        "export {readFile} from 'node:fs';",
+    )
+    .unwrap();
+    fs::write(directory.path().join("test/constant.test.js"), "import {it} from 'vitest'; import '../src/constant.js'; it('selected without mutants',()=>{});").unwrap();
+    fs::write(
+        directory.path().join("src/unselected.js"),
+        "export const value=true;",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("test/unselected.test.js"),
+        "import '../src/unselected.js'; throw Error('UNRELATED TEST FILE EXECUTED');",
+    )
+    .unwrap();
+    let response = execute(
         directory.path(),
-        json!({"mochaOptions":{"unknownOption":true}}),
+        json!({"testRunner":"vitest","mutate":["src/math.js","src/constant.js"]}),
     )
     .await
     .unwrap();
-    assert_eq!(invalid["supported"], false, "{invalid}");
+    assert_eq!(response["supported"], true, "{response}");
+    let test_files = response["report"]["testFiles"].as_object().unwrap();
+    assert_eq!(test_files.len(), 2, "{response}");
+    assert!(test_files.contains_key("test/math.test.js"));
+    assert!(test_files.contains_key("test/constant.test.js"));
     assert!(
-        invalid["reason"]
-            .as_str()
-            .unwrap()
-            .contains("plugin options")
+        mutants(&response)
+            .iter()
+            .all(|mutant| mutant["status"] == "Killed"),
+        "{response}"
     );
     assert!(!directory.path().join(".stryker-tmp").exists());
-    let mut request: Value = serde_json::from_str(&request(directory.path(), json!({}))).unwrap();
-    request["overrides"]
-        .as_object_mut()
-        .unwrap()
-        .remove("mochaOptions");
-    let response = super::run(&request.to_string(), watch::channel(false).0)
-        .await
-        .unwrap();
-    assert_eq!(response["supported"], true, "{response}");
-    assert_eq!(response["report"]["config"]["mochaOptions"], json!({}));
+}
+
+#[tokio::test]
+async fn plugin_schema_defaults_are_rust_normalized_and_invalid_options_have_no_run_effects() {
+    for (runner, key, default) in [
+        ("mocha", "mochaOptions", json!({})),
+        ("vitest", "vitest", json!({"related":true})),
+    ] {
+        let directory = runner_fixture(
+            runner,
+            "export const ok=true;",
+            "import assert from 'node:assert/strict'; import {ok} from '../src/math.js'; it('ok',()=>assert.equal(ok,true));",
+        );
+        let mut overrides = json!({"testRunner":runner});
+        overrides[key] = json!({"unknownOption":true});
+        let invalid = execute(directory.path(), overrides).await.unwrap();
+        assert_eq!(invalid["supported"], false, "{invalid}");
+        assert!(
+            invalid["reason"]
+                .as_str()
+                .unwrap()
+                .contains("plugin options")
+        );
+        assert!(!directory.path().join(".stryker-tmp").exists());
+        let mut request: Value =
+            serde_json::from_str(&request(directory.path(), json!({"testRunner":runner}))).unwrap();
+        request["overrides"].as_object_mut().unwrap().remove(key);
+        let response = super::run(&request.to_string(), watch::channel(false).0)
+            .await
+            .unwrap();
+        assert_eq!(response["supported"], true, "{response}");
+        assert_eq!(response["report"]["config"][key], default);
+    }
 }
 
 #[tokio::test]
@@ -365,7 +501,8 @@ async fn timeout_replacement_stays_pristine_for_the_next_static_mutant() {
         "export const startup=true;export const label='ok';",
         "import assert from 'node:assert/strict';import {startup,label} from '../src/math.js';it('initialization',async()=>{if(!startup)await new Promise(()=>{});assert.equal(label,'ok');});",
     );
-    let response = execute(directory.path(), json!({"concurrency":1,"timeoutMS":60}))
+    // Keep the infinite mutant bounded while allowing the replacement's static import under CI load.
+    let response = execute(directory.path(), json!({"concurrency":1,"timeoutMS":1000}))
         .await
         .unwrap();
     assert_eq!(response["supported"], true, "{response}");
@@ -450,17 +587,11 @@ impl HeldSpareStartup {
         fs::write(
             directory.path().join("control.mjs"),
             r#"
-import { existsSync, watch } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync } from 'node:fs';
+import { setTimeout } from 'node:timers/promises';
 export async function waitFor(file) {
-  if (existsSync(file)) return;
-  await new Promise((resolve, reject) => {
-    const watcher = watch(dirname(file), () => {
-      if (existsSync(file)) { watcher.close(); resolve(); }
-    });
-    watcher.on('error', reject);
-    if (existsSync(file)) { watcher.close(); resolve(); }
-  });
+  // The file is the barrier; filesystem notification delivery is not part of this test.
+  while (!existsSync(file)) await setTimeout(5);
 }
 "#,
         )

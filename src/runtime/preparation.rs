@@ -368,7 +368,7 @@ impl NativePreparation {
             if actual_cwd()? != config.cwd { return Err("Unsupported executable configuration capability: process.chdir during caller metadata import".into()); }
             let metadata: serde_json::Value = serde_json::from_str(&caller_metadata).map_err(|error| error.to_string())?;
             pinned_core(&metadata["core"])?;
-            let expected = if config.runner == config::Runner::Mocha { vec![serde_json::from_str::<serde_json::Value>(include_str!("mocha-schema.json")).expect("pinned Mocha schema")] } else { vec![] };
+            let expected = config.runner.sdk().map(|runner| vec![runner.schema()]).unwrap_or_default();
             if !ordered_equal(&metadata["plugins"], &serde_json::json!(expected)) { return Err("Unsupported executable configuration capability: caller plugin schema differs from pinned 10.0.0".into()); }
             config.options = serde_json::from_str(&imported_json).map_err(|error| format!("Unsupported configuration transport: {error}"))?;
             if !config.options.is_object() { return Err("Configuration must be a JSON object".into()); }

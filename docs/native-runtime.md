@@ -13,7 +13,8 @@ report assembly. Existing native instrumentation/coverage/planning modules are r
 The Node adapter owns only operations requiring JavaScript execution or plugin objects.
 Built-in command tests are spawned directly by Rust; there is no Node pool around them.
 Bun is the primary new execution target through this command path; see the
-[Bun contract](bun.md). Mocha remains an adapter for existing projects.
+[Bun contract](bun.md). Mocha and Vitest are compatibility adapters for existing
+projects, sharing one Rust SDK coordinator.
 
 Upstream defects and unnecessary work may be corrected. A correction must identify
 the original behavior, intended behavior, and a regression oracle. Preserve public
@@ -80,14 +81,45 @@ the configured cleanup policy on completion, failure, timeout, and cancellation.
 
 The current vertical slice supports JSON and a bounded plain-data executable
 configuration handshake, the built-in `command` runner with coverage off, and
-the pinned Mocha plugin with SDK coverage
+the explicitly selected pinned 10.0.0 Mocha or Vitest SDK plugin with coverage
 collection. Rust discovers and instruments selected files, preprocesses its
 supported JSONC tsconfig subset, creates isolated persistent worker sandboxes,
 runs baseline and mutants, indexes coverage, plans tests and assembles the full
-JSON report. Mocha itself executes in Node through its actual SDK plugin.
+JSON report. The selected framework executes in Node through its actual SDK plugin.
 Checker plugins, arbitrary executable object graphs and other reporters are not
 yet wired into this coordinator. Unsupported syntax and options are rejected explicitly;
 the existing legacy entry remains available independently.
+
+SDK runner admission requires exactly one corresponding plugin module in
+`plugins`; default/wildcard discovery, extra plugins, checkers, custom Node
+arguments, build/incremental/in-place execution and arbitrary caller object
+graphs remain unsupported. Vitest acceptance uses `@stryker-mutator/vitest-runner`
+10.0.0 with Vitest 4.1.12. This does not establish arbitrary third-party runner
+support or a performance result. CLI defaults and the direct Bun command path
+are unchanged.
+
+The SDK dry run receives only selected mutation input files, including selected
+files without mutants, as sandbox paths in `files`. A nonempty ordered explicit
+test selection is forwarded as sandbox paths in `testFiles`, both at runner
+initialization (needed by Mocha) and in `dryRun` (needed by Vitest). Test IDs remain
+opaque throughout native coverage/planning and are mapped to numeric report IDs
+using the baseline test index. The plugin owns interpretation of its test filters.
+
+For explicit Vitest selections, all-selected-test plans also pass the opaque
+selected baseline IDs to `mutantRun`; init/dry-run file selection alone does not
+constrain Vitest's later discovery. Covered plans retain their coverage filter,
+and runs without an explicit resolved file selection retain the plugin's
+unfiltered behavior. Supplying these IDs does not change static activation or
+reload decisions. This intentionally corrects pinned core 10.0.0's filename-based
+global filter, which activates static mutants at runtime and can report them as
+survivors. The SDK regression exercises selected and unselected tests importing
+the same source with coverage off/perTest and Vitest related mode on/off.
+
+`node scripts/native-runtime-integration.js vitest` compares complete upstream CLI
+and native JSON reports, canonicalizing only outer mutant completion order. The
+smoke requires native instrumentation, coverage and planning diagnostics, killed,
+uncovered and static mutants, preserved sources, sandbox cleanup, and a guard
+against upstream coordinator imports. Existing `command` and `mocha` cases remain.
 
 ### Windows candidate boundary
 

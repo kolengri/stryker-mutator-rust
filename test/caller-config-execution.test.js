@@ -14,7 +14,7 @@ const core = join(dirname(require.resolve('@stryker-mutator/core/package.json'))
 const artifacts = join(root, 'artifacts/caller-config-handshake');
 const canonical = (report) => ({ ...report, files: Object.fromEntries(Object.entries(report.files).map(([name, file]) => [name, { ...file, mutants: [...file.mutants].sort((a, b) => a.id.localeCompare(b.id)) }])) });
 
-for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'native']]) {
+for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'native'], ['vitest', 'vitest']]) {
   test(`executable ${runner} CLI matches actual upstream full report and inherits caller env effects`, { timeout: 60000 }, async (t) => {
     await mkdir(artifacts, { recursive: true });
     const cwd = await mkdtemp(join(artifacts, `${runner}-execution-`));
@@ -50,7 +50,7 @@ for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'nativ
   });
 }
 
-for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'native']]) {
+for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'native'], ['vitest', 'vitest']]) {
   test(`worker caller ${runner} env set/delete and metadata effects reach descendants without changing main env`, { timeout: 60000 }, async (t) => {
     const evidence = join(artifacts, 'windows-followup');
     await mkdir(evidence, { recursive: true });
@@ -62,7 +62,7 @@ for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'nativ
     const testFile = join(cwd, 'test/calculator.test.js');
     const required = ['HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'PATH', 'SYSTEMDRIVE', 'SYSTEMROOT', 'TEMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR'];
     const requiredProbe = `JSON.stringify(Object.entries(process.env).filter(([key])=>${JSON.stringify(required)}.includes(key.toUpperCase())))`;
-    const check = `if(process.env.CCE_VALUE !== process.env.CCE_RUN || 'CCE_DELETE' in process.env ${runner === 'mocha' ? "|| process.env.CCE_META !== process.env.CCE_RUN" : ''}) throw new Error('caller worker env was lost');
+    const check = `if(process.env.CCE_VALUE !== process.env.CCE_RUN || 'CCE_DELETE' in process.env ${runner !== 'command' ? "|| process.env.CCE_META !== process.env.CCE_RUN" : ''}) throw new Error('caller worker env was lost');
 if(process.platform==='win32' && ${requiredProbe} !== process.env.CCE_REQUIRED_EXPECTED) throw new Error('libuv required env differs from actual caller child_process oracle');`;
     await writeFile(testFile, `import {spawnSync} from 'node:child_process';
 ${check}
@@ -97,7 +97,7 @@ if(process.platform==='win32') {
 registerHooks({resolve(specifier,context,next){
   if(workerData.native && (specifier==='@stryker-mutator/core'||specifier.startsWith('@stryker-mutator/core/'))) throw new Error('Forbidden native upstream import');
   return next(specifier,context);
-},load(url,context,next){const result=next(url,context); if(url.endsWith('/@stryker-mutator/mocha-runner/dist/src/index.js')) return {...result,source:'process.env.CCE_META=process.env.CCE_RUN;'+result.source}; return result;}});
+},load(url,context,next){const result=next(url,context); if(url.endsWith('/@stryker-mutator/${runner}-runner/dist/src/index.js')) return {...result,source:'process.env.CCE_META=process.env.CCE_RUN;'+result.source}; return result;}});
 try {
   const reports=[];
   for(let i=0;i<2;i++) {
@@ -127,11 +127,11 @@ const mainBefore=JSON.stringify(Object.entries(process.env));
 const receipts=[];
 for(const id of ['worker-a','worker-b']) {
   const worker=new Worker(new URL('./worker.mjs',import.meta.url),{workerData:{native:process.argv[2]==='native',systemRoot:process.env.SystemRoot},env:{...process.env,CCE_RUN:id}});
-  const [message]=await once(worker,'message');
-  await once(worker,'exit');
+  const [[message],[exitCode]]=await Promise.all([once(worker,'message'),once(worker,'exit')]);
+  assert.equal(exitCode,0);
   if(message.error) throw new Error(message.error);
   assert.equal(message.env.value,id); assert.equal(message.env.deleted,false);
-  ${runner === 'mocha' ? 'assert.equal(message.env.meta,id);' : ''}
+  ${runner !== 'command' ? 'assert.equal(message.env.meta,id);' : ''}
   assert.equal(process.env.CCE_VALUE,'main-value'); assert.equal(process.env.CCE_DELETE,'main-delete'); assert.equal(process.env.CCE_META,undefined);
   assert.equal(JSON.stringify(Object.entries(process.env)),mainBefore,'caller worker/native changed main env');
   receipts.push(message);

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -8,8 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const require = createRequire(import.meta.url);
 const fixture = process.argv[2] ?? 'command';
-const fixtures = { command: 'native-command', mocha: 'native' };
-if (!Object.hasOwn(fixtures, fixture)) throw new Error('Use command or mocha');
+const fixtures = { command: 'native-command', mocha: 'native', vitest: 'vitest' };
+if (!Object.hasOwn(fixtures, fixture)) throw new Error('Use command, mocha or vitest');
 const artifacts = resolve(root, process.env.STRYKER_RUST_NATIVE_ARTIFACTS ?? `artifacts/native-runtime/integration${fixture === 'command' ? '' : `-${fixture}`}`);
 const project = join(artifacts, 'project');
 await mkdir(artifacts, { recursive: true });
@@ -67,6 +67,7 @@ for (const [name, entry, native] of [
   await writeFile(join(artifacts, `${name}.json`), JSON.stringify(report, null, 2));
   reports.push(canonical(report));
   assert.equal(await readFile(sourcePath, 'utf8'), source, 'The original source must remain unchanged');
+  await assert.rejects(access(join(project, '.stryker-tmp')), { code: 'ENOENT' }, 'Owned sandboxes must be cleaned');
   if (native) {
     const match = output.match(/\[stryker-rust\] (\{[^\n]+\})/);
     assert.ok(match, 'Native coordinator diagnostics are required');
@@ -88,6 +89,7 @@ if (fixture === 'command') {
 } else {
   assert.equal(nativeProof[0].nativeCoverageBatches, 1);
   assert.ok(nativeProof[0].compatibilityCalls > 0);
+  assert.ok(mutants.some((mutant) => mutant.static === true && mutant.status === 'Killed'), 'Static mutants must execute');
 }
 if (fixture === 'command') {
   assert.ok(nativeProof[0].maximumConcurrency > 1, 'The command fixture must exercise concurrent scheduling');
@@ -105,6 +107,7 @@ const receipt = {
   nativeProof,
   upstreamCoreImportGuard: true,
   sourcePreserved: true,
+  sandboxesCleaned: true,
   timingClaim: 'None: these are functional smoke runs, not a benchmark',
 };
 await writeFile(join(artifacts, 'receipt.json'), JSON.stringify(receipt, null, 2));

@@ -337,6 +337,12 @@ impl<'s> CommentBoundaries<'s> {
 }
 
 impl<'a> Visit<'a> for CommentBoundaries<'_> {
+    fn visit_decorator(&mut self, node: &Decorator<'a>) {
+        // Babel never enters descendants of a Decorator, so their comments
+        // cannot attach mutation directives to the surrounding class body.
+        self.gaps.push((node.span, None));
+    }
+
     fn visit_program(&mut self, node: &Program<'a>) {
         self.list(node.span.start, node.span.end, &node.body);
         walk::walk_program(self, node);
@@ -1110,7 +1116,7 @@ struct Emitter<'s, 'r> {
     placed: usize,
     printed_statement: bool,
     // Babel pushes filter state before path.skip(), whose exit never runs.
-    // Within this grammar, a skipped TS descendant hides the enclosing
+    // Within this grammar, a skipped TS or decorator descendant hides the enclosing
     // statement-call candidate from its exit filter. This is not a general
     // emulation of Babel's traversal stack.
     ts_skip_generation: usize,
@@ -1124,6 +1130,15 @@ impl Emitter<'_, '_> {
             self.ts_skip_generation += 1;
         }
         self.scope(span, false, |emitter| Ok(emitter.text(span).into()))
+    }
+
+    fn decorators(&mut self, decorators: &[Decorator<'_>]) {
+        // Upstream skips the entire Decorator path, including expressions and
+        // directives below it. Its filter-stack effect matches skipped TS nodes.
+        // Leave the original bytes in the enclosing class/member replacement.
+        if !self.pruned {
+            self.ts_skip_generation += decorators.len();
+        }
     }
 
     fn location(&self, span: Span) -> Location {
@@ -2057,13 +2072,12 @@ impl Emitter<'_, '_> {
     }
 
     fn class(&mut self, class: &Class<'_>) -> Result<String, String> {
-        if self.printed_statement
-            || class.r#abstract
-            || class.declare
-            || !class.decorators.is_empty()
-        {
-            return Err("Decorated, abstract, ambient, or whole-for classes require upstream instrumentation".into());
+        if self.printed_statement || class.r#abstract || class.declare {
+            return Err(
+                "Abstract, ambient, or whole-for classes require upstream instrumentation".into(),
+            );
         }
+        self.decorators(&class.decorators);
         let mut edits = vec![];
         if let Some(parameters) = &class.type_parameters {
             self.skip_ts(parameters.span)?;
@@ -2096,10 +2110,10 @@ impl Emitter<'_, '_> {
                 let mut edits = vec![];
                 match element {
                     ClassElement::PropertyDefinition(field) => {
-                        if !field.decorators.is_empty() || field.declare
+                        if field.declare
                             || field.r#type != PropertyDefinitionType::PropertyDefinition
                         {
-                            return Err("Decorated, ambient, or abstract fields require upstream instrumentation".into());
+                            return Err("Ambient or abstract fields require upstream instrumentation".into());
                         }
                         if field.computed {
                             return Err("Computed class field keys require upstream placement".into());
@@ -2109,6 +2123,7 @@ impl Emitter<'_, '_> {
                         }
                         // Public quoted keys are deliberately not StringLiteral
                         // mutation sites. Erasable annotations precede values.
+                        emitter.decorators(&field.decorators);
                         if let Some(annotation) = &field.type_annotation {
                             emitter.skip_ts(annotation.span)?;
                         }
@@ -2117,14 +2132,15 @@ impl Emitter<'_, '_> {
                         }
                     }
                     ClassElement::MethodDefinition(method) => {
-                        if !method.decorators.is_empty() || method.computed
+                        if method.computed
                             || !matches!(method.key, PropertyKey::StaticIdentifier(_))
                             || method.r#type != MethodDefinitionType::MethodDefinition
                             || method.value.declare || method.value.body.is_none()
                         {
-                            return Err("Decorated, computed, quoted, private, or ambient methods require upstream instrumentation".into());
+                            return Err("Computed, quoted, private, or ambient methods require upstream instrumentation".into());
                         }
                         let body = method.value.body.as_ref().ok_or("Method without body")?;
+                        emitter.decorators(&method.decorators);
                         let constructor = method.kind == MethodDefinitionKind::Constructor;
                         let mut super_call = DirectSuperCall::default();
                         if constructor && (initialized_public || method.value.params.items.iter().any(is_parameter_property)) {

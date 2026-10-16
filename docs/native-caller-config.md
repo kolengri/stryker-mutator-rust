@@ -29,7 +29,7 @@ Rust then merges CLI/overrides, inserts schema defaults, validates options and
 selects supported modules. Only those Rust-selected modules are imported in the
 caller for schema extraction, after core validation. The actual caller core
 schema is checked before core normalization and again after those imports.
-Caller core and built-in Mocha schema changes, including property reordering,
+Caller core and selected pinned Mocha/Vitest schema changes, including property reordering,
 are rejected against pinned snapshots. Node does not validate or merge options.
 Rust retains project preparation, SDK bridge scheduling, execution and reporting.
 Core and plugin validation are separate synchronous native preparation phases.

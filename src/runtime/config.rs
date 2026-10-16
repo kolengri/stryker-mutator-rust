@@ -39,7 +39,53 @@ pub(super) struct Config {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Runner {
     Command,
+    Sdk(SdkRunner),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SdkRunner {
     Mocha,
+    Vitest,
+}
+
+impl Runner {
+    pub fn sdk(self) -> Option<SdkRunner> {
+        match self {
+            Self::Command => None,
+            Self::Sdk(runner) => Some(runner),
+        }
+    }
+}
+
+impl SdkRunner {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mocha => "mocha",
+            Self::Vitest => "vitest",
+        }
+    }
+
+    pub fn module(self) -> &'static str {
+        match self {
+            Self::Mocha => "@stryker-mutator/mocha-runner",
+            Self::Vitest => "@stryker-mutator/vitest-runner",
+        }
+    }
+
+    fn option_key(self) -> &'static str {
+        match self {
+            Self::Mocha => "mochaOptions",
+            Self::Vitest => "vitest",
+        }
+    }
+
+    pub fn schema(self) -> Value {
+        serde_json::from_str(match self {
+            Self::Mocha => include_str!("mocha-schema.json"),
+            Self::Vitest => include_str!("vitest-schema.json"),
+        })
+        .expect("pinned SDK runner schema")
+    }
 }
 
 pub(super) fn defaults() -> Value {
@@ -552,12 +598,26 @@ fn finalize(
     bridge_module: Option<PathBuf>,
 ) -> Result<Config, String> {
     let schema: Value = serde_json::from_str(include_str!("schema.json")).expect("pinned schema");
-    let requested_mocha = options["testRunner"]
+    let runner = match options["testRunner"]
         .as_str()
-        .is_some_and(|value| value.eq_ignore_ascii_case("mocha"));
+        .map(str::to_lowercase)
+        .as_deref()
+    {
+        Some("command") => Runner::Command,
+        Some("mocha") => Runner::Sdk(SdkRunner::Mocha),
+        Some("vitest") => Runner::Sdk(SdkRunner::Vitest),
+        _ => {
+            return Err(
+                "Native runtime currently supports only command, Mocha and Vitest test runners"
+                    .into(),
+            );
+        }
+    };
     for key in options.as_object().expect("object").keys() {
         if schema["properties"].get(key).is_none()
-            && !(requested_mocha && key == "mochaOptions")
+            && !runner
+                .sdk()
+                .is_some_and(|runner| key == runner.option_key())
             && !matches!(key.as_str(), "$schema" | "configFile")
             && !key.ends_with("_comment")
         {
@@ -579,19 +639,6 @@ fn finalize(
             return Err(format!("Unsupported native command option: {key}"));
         }
     }
-    let runner = match options["testRunner"]
-        .as_str()
-        .map(str::to_lowercase)
-        .as_deref()
-    {
-        Some("command") => Runner::Command,
-        Some("mocha") => Runner::Mocha,
-        _ => {
-            return Err(
-                "Native runtime currently supports only command and Mocha test runners".into(),
-            );
-        }
-    };
     if runner == Runner::Command && options["coverageAnalysis"] != "off" {
         return Err("Native command runtime requires coverageAnalysis: off".into());
     }
@@ -619,12 +666,16 @@ fn finalize(
         if options["maxTestRunnerReuse"] != original["maxTestRunnerReuse"] {
             return Err("Unsupported native command option: maxTestRunnerReuse".into());
         }
-    } else {
-        if options["plugins"] != json!(["@stryker-mutator/mocha-runner"]) {
-            return Err("Native Mocha currently requires only the built-in @stryker-mutator/mocha-runner plugin".into());
+    } else if let Some(runner) = runner.sdk() {
+        if options["plugins"] != json!([runner.module()]) {
+            return Err(format!(
+                "Native {} currently requires only the explicit {} plugin",
+                runner.name(),
+                runner.module()
+            ));
         }
         if node_executable.is_none() || bridge_module.is_none() {
-            return Err("Native Mocha requires nodeExecutable and bridgeModule".into());
+            return Err("Native SDK runner requires nodeExecutable and bridgeModule".into());
         }
         if options["maxTestRunnerReuse"].as_u64().is_none() {
             return Err("maxTestRunnerReuse must be a nonnegative integer".into());

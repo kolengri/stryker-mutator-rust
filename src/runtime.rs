@@ -16,11 +16,11 @@ mod bridge;
 #[cfg(all(test, unix))]
 mod bridge_tests;
 mod config;
-mod mocha;
-#[cfg(all(test, unix))]
-mod mocha_tests;
 mod preparation;
 mod process;
+mod sdk;
+#[cfg(all(test, unix))]
+mod sdk_tests;
 pub use preparation::NativePreparation;
 mod project;
 mod report;
@@ -162,8 +162,8 @@ async fn run_config(
         Ok(config) => config,
         Err(reason) => return Ok(unsupported(reason)),
     };
-    if config.runner == config::Runner::Mocha
-        && let Err(error) = mocha::prepare(&mut config, cancellation.subscribe()).await?
+    if config.runner.sdk().is_some()
+        && let Err(error) = sdk::prepare(&mut config, cancellation.subscribe()).await?
     {
         return Ok(unsupported(error));
     }
@@ -171,8 +171,8 @@ async fn run_config(
         Ok(project) => project,
         Err(reason) => return Ok(unsupported(reason)),
     };
-    if config.runner == config::Runner::Mocha {
-        return mocha::run(config, project, cancellation).await;
+    if config.runner.sdk().is_some() {
+        return sdk::run(config, project, cancellation).await;
     }
     // The complete input/source eligibility decision precedes sandbox or report
     // writes. Cancellation queued before compute also has no run effects.

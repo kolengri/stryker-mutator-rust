@@ -256,17 +256,20 @@ test('original caller load hooks observe the exact requested file URL', async (t
   try { await success({ args: ['hooked.mjs'] }); assert.equal(loads, 1); } finally { hook.deregister(); }
 });
 
-test('caller Mocha schema mutations are rejected before isolated plugin validation', async (t) => {
-  await fixture(t, { 'mocha-schema.mjs': `import {strykerValidationSchema} from '@stryker-mutator/mocha-runner'; strykerValidationSchema.properties.mochaOptions.default = {timeout:123}; export default ${JSON.stringify({ ...base, testRunner:'mocha', coverageAnalysis:'perTest', plugins:['@stryker-mutator/mocha-runner'] })};` });
-  const { strykerValidationSchema } = await import('@stryker-mutator/mocha-runner');
-  const original = strykerValidationSchema.properties.mochaOptions.default;
-  try {
-    const result = await runNativeMutationTest({ args: ['mocha-schema.mjs'] });
-    assert.equal(result.supported, false); assert.match(result.reason, /caller plugin schema/);
-  } finally { strykerValidationSchema.properties.mochaOptions.default = original; }
-  await writeFile('good-after-schema.mjs', esm());
-  await success({ args: ['good-after-schema.mjs'] });
-});
+for (const [runner, key] of [['mocha', 'mochaOptions'], ['vitest', 'vitest']]) {
+  test(`caller ${runner} schema mutations are rejected before isolated plugin validation`, async (t) => {
+    const module = `@stryker-mutator/${runner}-runner`;
+    await fixture(t, { 'runner-schema.mjs': `import {strykerValidationSchema} from '${module}'; strykerValidationSchema.properties.${key}.default = {unmodeled:true}; export default ${JSON.stringify({ ...base, testRunner:runner, coverageAnalysis:'perTest', plugins:[module] })};` });
+    const { strykerValidationSchema } = await import(module);
+    const original = strykerValidationSchema.properties[key].default;
+    try {
+      const result = await runNativeMutationTest({ args: ['runner-schema.mjs'] });
+      assert.equal(result.supported, false); assert.match(result.reason, /caller plugin schema/);
+    } finally { strykerValidationSchema.properties[key].default = original; }
+    await writeFile('good-after-schema.mjs', esm());
+    await success({ args: ['good-after-schema.mjs'] });
+  });
+}
 
 test('JSON leases block executable evaluation but allow overlapping JSON preparations', async (t) => {
   const cwd = await fixture(t, { 'effect.mjs': `globalThis.conflictingImport = true; export default ${JSON.stringify(base)};`, 'stryker.config.json': JSON.stringify(base) });
@@ -406,12 +409,14 @@ test('cached exports retain pinned nested merge/default/deprecation effects, ord
   }
 });
 
-test('plugin defaults and failed validation happen before project work and preserve cached writable originals', async (t) => {
+for (const [runner, key, invalidKey] of [['mocha', 'mochaOptions', 'grep'], ['vitest', 'vitest', 'related']]) {
+  const module = `@stryker-mutator/${runner}-runner`;
+test(`${runner} defaults and failed validation happen before project work and preserve cached writable originals`, async (t) => {
   await fixture(t);
-  const { strykerValidationSchema } = await import('@stryker-mutator/mocha-runner');
+  const { strykerValidationSchema } = await import(module);
   const schema = { ...strykerCoreSchema, properties: { ...strykerCoreSchema.properties, ...strykerValidationSchema.properties }, definitions: { ...strykerCoreSchema.definitions, ...strykerValidationSchema.definitions } };
   for (const invalid of [false, true]) {
-    const options = { ...base, testRunner: 'mocha', plugins: ['@stryker-mutator/mocha-runner'], thresholds: { high: 95 }, ...(invalid ? { mochaOptions: { grep: 42 } } : {}) };
+    const options = { ...base, testRunner: runner, plugins: [module], thresholds: { high: 95 }, ...(invalid ? { [key]: { [invalidKey]: 42 } } : {}) };
     for (const mode of ['oracle', 'native']) await writeFile(`plugin-${invalid}-${mode}.mjs`, `export default ${JSON.stringify(options)};`);
     const oracleExport = (await import(pathToFileURL(resolve(`plugin-${invalid}-oracle.mjs`)))).default;
     const nativeExport = (await import(pathToFileURL(resolve(`plugin-${invalid}-native.mjs`)))).default;
@@ -432,16 +437,18 @@ test('plugin defaults and failed validation happen before project work and prese
     assert.equal(Object.isFrozen(thresholds), false);
     assert.equal(Object.isExtensible(thresholds), true);
     thresholds.proof = 1; delete thresholds.proof;
-    assert.equal('mochaOptions' in nativeExport, invalid, 'root plugin default must not mutate original export');
+    assert.equal(key in nativeExport, invalid, 'root plugin default must not mutate original export');
     // The cached export stays admissible on repetition after native preparation.
     if (invalid) assert.match((await runNativeMutationTest({ args: [`plugin-${invalid}-native.mjs`] })).reason, /Invalid plugin options/);
   }
 });
+}
 
-
-test('selected actual Mocha evaluation observes core effects; plugin failure retains subsequent defaults', async (t) => {
+for (const [runner, key, invalidKey] of [['mocha', 'mochaOptions', 'grep'], ['vitest', 'vitest', 'related']]) {
+  const module = `@stryker-mutator/${runner}-runner`;
+test(`selected actual ${runner} evaluation observes core effects; plugin failure retains subsequent defaults`, async (t) => {
   const cwd = await fixture(t);
-  const options = { ...base, testRunner: 'mocha', plugins: ['@stryker-mutator/mocha-runner'], thresholds: { high: 95 }, mochaOptions: { grep: 42 } };
+  const options = { ...base, testRunner: runner, plugins: [module], thresholds: { high: 95 }, [key]: { [invalidKey]: 42 } };
   await writeFile('observed.mjs', `const options = ${JSON.stringify(options)}; globalThis.cachedExport = options; export default options;`);
   await writeFile('observe.mjs', `
 import {registerHooks} from 'node:module';
@@ -453,7 +460,7 @@ registerHooks({resolve(specifier, context, next) {
   return next(specifier, context);
 }, load(url, context, next) {
   const loaded = next(url, context);
-  if (url.endsWith('/@stryker-mutator/mocha-runner/dist/src/index.js')) return {...loaded, source:
+  if (url.endsWith('/@stryker-mutator/${runner}-runner/dist/src/index.js')) return {...loaded, source:
     'globalThis.beforePlugin = JSON.stringify(globalThis.cachedExport.thresholds); delete globalThis.cachedExport.thresholds.low;'  + loaded.source};
   return loaded;
 }});
@@ -469,7 +476,7 @@ if (native) {
   const {strykerCoreSchema} = await import('@stryker-mutator/api/core');
   const {noopLogger, deepFreeze} = await import('@stryker-mutator/util');
   const options = await new ConfigReader(noopLogger,new OptionsValidator(strykerCoreSchema,noopLogger)).readConfig({configFile:'observed.mjs',thresholds:{low:25}});
-  const {strykerValidationSchema: plugin} = await import('@stryker-mutator/mocha-runner');
+  const {strykerValidationSchema: plugin} = await import('${module}');
   const schema = {...strykerCoreSchema,properties:{...strykerCoreSchema.properties,...plugin.properties},definitions:{...strykerCoreSchema.definitions,...plugin.definitions}};
   try {new OptionsValidator(schema,noopLogger).validate(options,true);deepFreeze(options);} catch {failure=true;}
 }
@@ -482,7 +489,7 @@ console.log(JSON.stringify({failure,beforePlugin:globalThis.beforePlugin,thresho
     const child = spawn(process.execPath, ['observe.mjs', mode], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let output = ''; child.stdout.on('data', data => output += data); child.stderr.on('data', data => output += data);
     const [code, signal] = await once(child, 'close');
-    await writeFile(join(artifacts, 'caller-effects', `plugin-order-${mode}.log`), output);
+    await writeFile(join(artifacts, 'caller-effects', `plugin-order-${runner}-${mode}.log`), output);
     assert.equal(code, 0, output); assert.equal(signal, null);
     receipts.push(JSON.parse(output.trim()));
   }
@@ -490,6 +497,8 @@ console.log(JSON.stringify({failure,beforePlugin:globalThis.beforePlugin,thresho
   assert.equal(receipts[1].beforePlugin, '{"high":95,"low":25,"break":null}');
   assert.deepEqual(receipts[1].keys, ['high', 'break', 'low']);
 });
+}
+
 
 test('null-prototype records retain identity and deprecated coercion failures preserve preceding effects', async (t) => {
   await fixture(t);

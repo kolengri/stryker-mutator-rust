@@ -253,7 +253,7 @@ fn nested_mutant_and_test_report_keys_preserve_sources_and_identifier_mappings()
     let tests = vec![
         json!({"id":"original-test", "name":"flag", "fileName":config.cwd.join("test/nested/flag.test.js"), "startPosition":{"line":0,"column":0}}),
     ];
-    let assembled = report::assemble_mocha(&config, &project, &mutants, &tests, &[0]).unwrap();
+    let assembled = report::assemble_sdk(&config, &project, &mutants, &tests, &[0]).unwrap();
     assert_eq!(
         assembled["files"]
             .as_object()

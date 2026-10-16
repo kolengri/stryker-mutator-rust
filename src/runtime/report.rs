@@ -107,7 +107,7 @@ pub(super) fn assemble(config: &Config, project: &Project, mutants: &[Value]) ->
         "config":config.options,"framework": framework})
 }
 
-pub(super) fn assemble_mocha(
+pub(super) fn assemble_sdk(
     config: &Config,
     project: &Project,
     mutants: &[Value],
