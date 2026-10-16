@@ -149,11 +149,17 @@ remain opaque, matching upstream's skipped subtree. Generic calls retain type
 arguments in original code and drop them only in the replacements reconstructed
 by upstream. Statement-call filtering preserves the pinned TS skip behavior.
 `.ts`, `.mts`, `.cts` and their declaration extensions use the same runtime
-parsing policy as the reference instrumenter. Non-null assertions, `satisfies`,
+parsing policy as the reference instrumenter. `satisfies`,
 angle-bracket assertions, typed updates/iteration targets, runtime namespaces,
 TSX and unproven typed replacement printing still require fallback.
 Plain `=` targets wrapped in `as` remain opaque; compound cast assignments and
 unproven printed ancestors still require fallback.
+Non-null assertions participate in ordinary public call/member chains without
+changing syntactic mutator recognition. Arguments and computed keys keep local
+placement. Public member `delete` preserves the reference by placing spine
+mutations around the whole delete expression; optional short-circuiting and key
+evaluation follow upstream. Non-null assignment/update/iteration targets remain
+on fallback, including the pinned upstream invalid-update error.
 
 Bounded class declarations and expressions support public instance/static fields,
 private fields, ordinary identifier-keyed methods, getters/setters, constructors,
@@ -176,6 +182,8 @@ instrumentation identically; they do not transpile before mutation.
 
 Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
+Non-null private/super combinations and unsupported delete argument shapes also
+require fallback.
 Private methods/accessors, optional private members, decorators, auto-accessors,
 unsupported parameter-property forms, computed/quoted method keys, computed fields,
 mapped super calls, dynamic imports, regex (including literal-first `new RegExp`),
@@ -184,7 +192,9 @@ accessors/spread, complex computed keys, destructuring targets,
 async/generators, `for-await`, directive prologues and hashbangs trigger whole-batch fallback.
 Noncanonical number spellings and incompatible raw string/template spellings
 inside printed mutation replacements also fall back, as do objects and arrays
-with more than two elements inside those replacements. See `src/instrument.rs`
+with more than two elements inside those replacements. One guarded logical-clone
+case preserves a sole, simple ASCII single-quoted RHS; mixed quotes, escapes,
+raw Unicode and enclosing replacement clones keep the general fallback. See `src/instrument.rs`
 for the definitive acceptance checks. The native engine does not claim the
 broader preview's scope.
 
