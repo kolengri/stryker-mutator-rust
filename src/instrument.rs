@@ -2084,7 +2084,7 @@ impl Emitter<'_, '_> {
                     }
                     ClassElement::StaticBlock(block) => {
                         for statement in &block.body {
-                            edits.push((statement.span(), emitter.statement(statement, false)?));
+                            edits.push((statement.span(), emitter.statement(statement, true)?));
                         }
                     }
                     _ => return Err("Auto-accessors and class index signatures require upstream instrumentation".into()),
@@ -2175,7 +2175,7 @@ impl Emitter<'_, '_> {
         let edits = statements
             .iter()
             .map(|statement| {
-                self.statement(statement, false)
+                self.statement(statement, true)
                     .map(|output| (statement.span(), output))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2191,6 +2191,30 @@ impl Emitter<'_, '_> {
             "{{ if (stryMutAct_9fa48(\"{}\")) {{ {{}} }} else {{ stryCov_9fa48(\"{}\"); {inner} }} }}",
             switch.id, switch.id
         ))
+    }
+
+    fn catch_clause(&mut self, clause: &CatchClause<'_>) -> Result<String, String> {
+        self.scope(clause.span, false, |emitter| {
+            if let Some(parameter) = &clause.param {
+                if !matches!(parameter.pattern, BindingPattern::BindingIdentifier(_)) {
+                    return Err(
+                        "Destructured catch bindings require upstream instrumentation".into(),
+                    );
+                }
+                // Babel's Identifier includes its annotation. Keep that range
+                // boundary and visit the real TS node before the catch body:
+                // its skip event affects enclosing statement-call filtering.
+                emitter.scope(parameter.span, false, |emitter| {
+                    if let Some(annotation) = &parameter.type_annotation {
+                        emitter.skip_ts(annotation.span)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            let body = &clause.body;
+            let rendered = emitter.block(body.span, &body.body)?;
+            Ok(emitter.apply(clause.span, vec![(body.span, rendered)]))
+        })
     }
 
     fn declaration(&mut self, node: &Declaration<'_>) -> Result<String, String> {
@@ -2264,7 +2288,7 @@ impl Emitter<'_, '_> {
             let head = emitter.apply(Span::new(node.span.start, first.span().start), edits);
             let mut edits = vec![];
             for statement in &node.consequent {
-                edits.push((statement.span(), emitter.statement(statement, false)?));
+                edits.push((statement.span(), emitter.statement(statement, true)?));
             }
             let body = emitter.apply(Span::new(first.span().start, node.span.end), edits);
             Ok(if let Some(switch) = switches.first() {
@@ -2545,17 +2569,21 @@ impl Emitter<'_, '_> {
         })
     }
 
-    fn statement(&mut self, node: &Statement<'_>, top_level: bool) -> Result<String, String> {
+    fn statement(&mut self, node: &Statement<'_>, statement_list: bool) -> Result<String, String> {
         self.scope(node.span(), true, |emitter| {
-            emitter.statement_inner(node, top_level)
+            emitter.statement_inner(node, statement_list)
         })
     }
 
-    fn statement_inner(&mut self, node: &Statement<'_>, top_level: bool) -> Result<String, String> {
+    fn statement_inner(
+        &mut self,
+        node: &Statement<'_>,
+        statement_list: bool,
+    ) -> Result<String, String> {
         let mut edits = vec![];
         match node {
             Statement::FunctionDeclaration(function) => {
-                if !top_level && function.body.is_some() && !function.declare { return Err("Nested function declarations require upstream hoisting semantics".into()); }
+                if !statement_list { return Err("Unbraced or labelled function declarations require upstream instrumentation".into()); }
                 return self.function(function);
             }
             Statement::VariableDeclaration(variables) => return self.variables(variables),
@@ -2565,6 +2593,15 @@ impl Emitter<'_, '_> {
             Statement::TSNamespaceDeclaration(module) if module.declare => return self.skip_ts(node.span()),
             Statement::TSGlobalDeclaration(module) if module.declare => return self.skip_ts(node.span()),
             Statement::BlockStatement(block) => return self.block(block.span, &block.body),
+            Statement::TryStatement(statement) => {
+                edits.push((statement.block.span, self.block(statement.block.span, &statement.block.body)?));
+                if let Some(handler) = &statement.handler {
+                    edits.push((handler.span, self.catch_clause(handler)?));
+                }
+                if let Some(finalizer) = &statement.finalizer {
+                    edits.push((finalizer.span, self.block(finalizer.span, &finalizer.body)?));
+                }
+            }
             Statement::ReturnStatement(statement) => if let Some(expression) = &statement.argument { edits.push((expression.span(), self.expression(expression, Context::default())?)); },
             Statement::ExpressionStatement(statement) => {
                 let deletion = matches!(&statement.expression, Expression::CallExpression(call) if !matches!(call.callee, Expression::Super(_)));
@@ -2676,7 +2713,7 @@ impl Emitter<'_, '_> {
                 if import.phase.is_some() || import.with_clause.is_some() { return Err("Import phases and attributes require upstream instrumentation".into()); }
             }
             Statement::EmptyStatement(_) => {},
-            _ => return Err("Unsupported statement in native grammar (try, default exports, and control-flow extensions require upstream)".into()),
+            _ => return Err("Unsupported statement in native grammar (default exports and control-flow extensions require upstream)".into()),
         }
         let output = self.apply(node.span(), edits);
         Ok(
