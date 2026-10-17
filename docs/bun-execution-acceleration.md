@@ -110,6 +110,26 @@ native or detached processes outside its contract.
 
 ## Companion consumer changes
 
+Core's `TimeoutDecorator` wraps the entire `mutantRun` call, including preparation.
+An adapter must reserve an adequate outer budget before collecting coverage there;
+the collection budget does not extend Core's timer. The repaired saved consumer
+requires a finite actual call budget of at least 1,200,000 ms and explicit scope
+qualification. Smaller caller/CLI budgets use the existing full-suite path without
+new coverage preparation. No timeout setting is increased. The collection budget
+is explicitly 60 seconds. Source-bound bounds and actual Core lifecycle witnesses
+are under `artifacts/bun-execution-acceleration/review-repairs-r1/`.
+
+When coverage generates a narrower filter, its inactive baseline validates the
+subset but must not shorten the active mutant's deadline. Preserve the original
+full-scope timeout policy. Existing caller-provided narrower filters keep their
+previous policy. This preserves the budget calculation, not arbitrary timing-based
+status equivalence.
+
+The caller must still prove process and pipe completion. A runner result of
+`Survived` alone is insufficient: the pinned runner can also settle after an
+exit/grace path with incomplete output. The saved project qualification sets stay
+empty pending a trustworthy completion boundary and real-scope qualification.
+
 The regex checker implements Stryker 10's public `group` hook, returning the
 current buffer as one group. `check` and invalid-regex classification are unchanged.
 Do not delete this checker: deferred invalid regex constructors would change
