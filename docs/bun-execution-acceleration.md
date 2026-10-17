@@ -18,9 +18,36 @@ provided files through the existing runner with no active mutant (`id: ''`), no
 hit limit, `disableBail: true`, and a timeout bounded by the second callback argument (`remainingMs`).
 The collection budget defaults to 60 seconds (maximum 300 seconds), across all
 files. Budget exhaustion discards the entire proof and stops subsequent launches.
-Its promise must
-settle only after the process and output pipes close, including timeout or
-cancellation cleanup. Call `select(id, { staticMutation })` for each actual mutant;
+Configure `completion: { bunPath: 'bun', runnerModule }`, where SDK adapters supply
+the resolved `@hughescr/stryker-bun-runner` entry path. Completion support is initially
+limited to macOS arm64, Node 26.10.0 or Bun 1.4.3 hosts, direct Bun 1.4.3 test
+launches, and SDK 1.6.0's pinned source when supplied. Missing configuration, exec
+wrappers, other runtime/SDK versions and changed spawn descriptors fail closed.
+This is separate from independent-file and synchronous-child qualification.
+In the pinned adapter, override `executeMutantRun(...args)` to call
+`session.assertProducerLaunch()` immediately before `super.executeMutantRun(...args)`.
+This is the SDK's synchronous spawn boundary after its metadata awaits. The guard
+rejects cancelled async continuations even after temporary interception has ended;
+ordinary runs have no collection scope and pass through. A different adapter must
+establish an equivalent launch/cancellation boundary before qualification.
+
+The collector temporarily observes the host's guarded `ChildProcess.prototype.spawn`
+while the callback runs. A private async scope and the exact session environment
+bind one detached producer's real handle and stdout/stderr to the collection.
+Rust requires matching preload PID, successful exit, both actual stream EOFs,
+process close, then the unchanged callback result. A result arriving before owned
+close cannot authorize selection, even if the pipes eventually drain. The callback
+result and output bytes are never rewritten. Legitimate late output before SDK
+completion drains normally; the exit/grace `outputIncomplete` path remains fallback.
+
+`completion.drainTimeoutMs` defaults to 5 seconds after root exit (maximum 60 seconds),
+within the collection budget. Deadline, cancellation or callback failure kills the
+owned process group and bounds cleanup to 2 seconds; stream destruction never counts
+as EOF. The temporary descriptor/listeners are restored after every run. Passing
+`{ signal }` as collect's third argument or invalidating the session cancels ownership.
+Unknown, escaping/native launchers are outside this owned process-group contract.
+
+Call `select(id, { staticMutation })` for each actual mutant;
 `files: undefined` means the full suite. The optional `staticMutation` flag means
 a proven source classification. Core uses its global file filter in off mode when `testFiles` is configured;
 activation can be runtime or static according to that filter. Neither lifecycle
@@ -30,10 +57,12 @@ baseline and full-suite retry on a failed selected-file baseline, as in the
 Dealyv adapter. Actual mutant runs retain the existing runner's process isolation,
 activation, output parsing, timeout, and result classification.
 
-The repaired task-local consumer patch is
-`artifacts/bun-execution-acceleration/review-repairs-r1/consumer/combined.patch`;
+The current task-local consumer patch is
+`artifacts/bun-execution-acceleration/completion-boundary/consumer/combined.patch`;
 its executable qualification is under
-`artifacts/bun-execution-acceleration/review-repairs-r1/fixture/`.
+`artifacts/bun-execution-acceleration/completion-boundary/fixture/`.
+The previous timeout-repaired patch and its receipts remain under
+`artifacts/bun-execution-acceleration/review-repairs-r1/`.
 The earlier `artifacts/bun-execution-acceleration/consumer/` and `fixture/`
 directories contain historical V1 evidence, superseded by the repaired patch.
 These ignored, parent-applied artifacts are outside the npm package. No Dealyv
@@ -130,10 +159,10 @@ full-scope timeout policy. Existing caller-provided narrower filters keep their
 previous policy. This preserves the budget calculation, not arbitrary timing-based
 status equivalence.
 
-The caller must still prove process and pipe completion. A runner result of
-`Survived` alone is insufficient: the pinned runner can also settle after an
-exit/grace path with incomplete output. The saved project qualification sets stay
-empty pending a trustworthy completion boundary and real-scope qualification.
+The saved consumer now supplies the owned completion configuration; a runner result
+of `Survived` alone remains insufficient. Native coverage ABI 2 rejects older or
+missing completion evidence. The saved project qualification sets stay empty pending
+real-scope source, identity, independent-file and child-boundary qualification.
 
 The regex checker implements Stryker 10's public `group` hook, returning the
 current buffer as one group. `check` and invalid-regex classification are unchanged.
@@ -167,7 +196,7 @@ whole-batch support; no instrumentation syntax or safety guard changed.
 ## Evidence and remaining acceptance
 
 Run the focused Rust `execution_coverage` tests and the Node tests
-`bun-execution`, `bun-core-admission`, `native-core`, and `native-core-modes` with
+`bun-completion`, `bun-execution`, `bun-core-admission`, `native-core`, and `native-core-modes` with
 one runner at a time. The saved copied-runner fixture exercises the exact consumer
 patch with only its qualification set changed to admit `fixture`; it preserves
 both raw full-suite and candidate results, including `nrOfTests` differences.

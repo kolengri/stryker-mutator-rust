@@ -11,20 +11,23 @@ const qualification = 'independent-files-bun-sync-v1';
 const artifactRoot = resolve(process.env.STRYKER_RUST_ACCELERATION_ARTIFACT_DIR ?? 'artifacts/bun-execution-acceleration');
 mkdirSync(artifactRoot, { recursive: true });
 const bunAvailable = spawnSync('bun', ['--version'], { encoding: 'utf8', timeout: 2000 }).stdout?.trim() === '1.4.3';
-const bunTest = (name, fn) => test(name, { skip: !bunAvailable && 'Bun 1.4.3 required' }, fn);
+const completionHost = process.platform === 'darwin' && process.arch === 'arm64'
+  && (process.versions.bun ? process.versions.bun === '1.4.3' : process.version === 'v26.10.0');
+const bunTest = (name, fn) => test(name, { skip: (!bunAvailable || !completionHost) && 'Qualified completion host and Bun 1.4.3 required' }, fn);
 
-test('oversized journals fail closed before native decoding, including the aggregate budget', async () => {
+test('oversized journals fail closed before native decoding, including the aggregate budget', { skip: !bunAvailable || !completionHost }, async () => {
   const directory = mkdtempSync(join(artifactRoot, 'size-'));
   const files = [0, 1, 2].map((i) => join(directory, `${i}.test.js`));
-  for (const file of files) writeFileSync(file, '// synthetic metadata fixture');
+  for (const file of files) writeFileSync(file, "import {test} from 'bun:test';test('metadata',()=>{});");
   try {
     for (const [bytes, selectedFiles, reason] of [
       [4 * 1024 * 1024 + 1, files.slice(0, 1), 'Coverage receipt exceeds 4 MiB'],
       [3 * 1024 * 1024, files, 'Coverage evidence exceeds 8 MiB'],
     ]) {
-      const session = new BunFileCoverageSession({ files: selectedFiles, identityFiles: files, qualification });
+      const session = new BunFileCoverageSession({ files: selectedFiles, identityFiles: files, qualification, completion: { bunPath: 'bun' } });
       // This unit callback supplies malformed sparse evidence, not execution proof.
-      await session.collect(async () => {
+      await session.collect(async (files) => {
+        await run(files, session.env);
         const { directory } = JSON.parse(session.env.STRYKER_RUST_FILE_COVERAGE);
         const journal = join(directory, 'root.ndjson');
         writeFileSync(journal, ''); truncateSync(journal, bytes);
@@ -94,7 +97,7 @@ function fixture() {
   `);
   writeFileSync(files[1], "import { test, expect } from 'bun:test'; import { b } from './b.js'; test('b dynamic', () => expect(b(3)).toBeGreaterThan(0));");
   return { directory, files, sources: names.map((n) => join(directory, n)), mutants: response.result.mutants, instrumented: response.result,
-    session: () => new BunFileCoverageSession({ files, identityFiles: [...names.map((n) => join(directory, n)), childEntry], qualification }) };
+    session: () => new BunFileCoverageSession({ files, identityFiles: [...names.map((n) => join(directory, n)), childEntry], qualification, completion: { bunPath: 'bun' } }) };
 }
 
 bunTest('public file session selects actual fresh Bun tests, includes settled children, and preserves ordered mutant outcomes', async () => {
@@ -113,6 +116,7 @@ bunTest('public file session selects actual fresh Bun tests, includes settled ch
     }, baseline);
     assert.equal(session.reason, 'Complete owned receipts');
     assert.equal(session.stats.participants, 5);
+    assert.equal(session.stats.ownedRoots, 2);
     const witness = [];
     for (const mutant of f.mutants) {
       const selection = session.select(mutant.id);
@@ -145,7 +149,7 @@ bunTest('unknown boundaries, process exit, baseline failures, crashes and cancel
     await failed.collect(async () => { calls++; }, { status: 'killed' });
     assert.equal(calls, 0);
     assert.equal(failed.select('0').reason, 'Exhaustive inactive baseline failed');
-    const budget = new BunFileCoverageSession({ files: f.files, identityFiles: f.sources, qualification, collectionBudgetMs: 10 });
+    const budget = new BunFileCoverageSession({ files: f.files, identityFiles: f.sources, qualification, collectionBudgetMs: 10, completion: { bunPath: 'bun' } });
     let budgetCalls = 0;
     await budget.collect(async (_files, remainingMs) => {
       budgetCalls++; assert.ok(remainingMs <= 10);

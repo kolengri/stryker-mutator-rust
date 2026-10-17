@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use napi_derive::napi;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 #[derive(Deserialize)]
@@ -22,6 +22,7 @@ struct Run {
     session: String,
     baseline: String,
     receipts: Vec<String>,
+    completion: String,
 }
 
 #[derive(Deserialize)]
@@ -33,6 +34,7 @@ enum Event {
         file: String,
         id: String,
         parent: Option<String>,
+        pid: u32,
     },
     Hit {
         mutant: String,
@@ -67,12 +69,13 @@ struct Receipt {
     file: String,
     id: String,
     parent: Option<String>,
+    pid: u32,
     children: Vec<String>,
     hits: Vec<(String, bool)>,
 }
 
 // Every hit is synchronously appended before execution continues. Root completion
-// is established by the consumer's exhaustive process result/EOF; each child's
+// is established by the owned host completion journal, not a runner status; each child's
 // completion is established by its parent's settled event after spawnSync EOF.
 fn receipt(raw: &str) -> Result<Receipt, String> {
     if !raw.ends_with('\n') {
@@ -87,6 +90,7 @@ fn receipt(raw: &str) -> Result<Receipt, String> {
         file,
         id,
         parent,
+        pid,
     } = first
     else {
         return Err("Missing participant start".into());
@@ -97,6 +101,7 @@ fn receipt(raw: &str) -> Result<Receipt, String> {
         file,
         id,
         parent,
+        pid,
         children: Vec::new(),
         hits: Vec::new(),
     };
@@ -137,12 +142,118 @@ fn receipt(raw: &str) -> Result<Receipt, String> {
     Ok(result)
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+enum Completion {
+    Spawn {
+        version: u32,
+        session: String,
+        file: String,
+        pid: u32,
+    },
+    Exit {
+        pid: u32,
+        code: i32,
+        signal: serde_json::Value,
+    },
+    Eof {
+        pid: u32,
+        fd: u8,
+    },
+    Close {
+        pid: u32,
+        code: i32,
+        signal: serde_json::Value,
+    },
+    Result {
+        pid: u32,
+    },
+}
+
+#[derive(Serialize)]
+struct Root {
+    file: String,
+    session: String,
+    pid: u32,
+}
+
+fn completion(raw: &str, file: &str, session: &str, pid: u32) -> Result<Root, String> {
+    if raw.len() > 64 * 1024 || !raw.ends_with('\n') || pid == 0 {
+        return Err("Missing or excessive owned completion journal".into());
+    }
+    let events: Vec<Completion> = raw
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .map_err(|error| error.to_string())?;
+    let mut spawned = false;
+    let mut exited = false;
+    let mut pipes = [false; 2];
+    let mut closed = false;
+    let mut result = false;
+    for event in events {
+        if result {
+            return Err("Late owned completion evidence".into());
+        }
+        match event {
+            Completion::Spawn {
+                version,
+                session: observed_session,
+                file: observed_file,
+                pid: observed,
+            } if !spawned
+                && version == 2
+                && observed == pid
+                && observed_file == file
+                && observed_session == session =>
+            {
+                spawned = true
+            }
+            Completion::Exit {
+                pid: observed,
+                code: 0,
+                signal,
+            } if spawned && !exited && !closed && observed == pid && signal.is_null() => {
+                exited = true
+            }
+            Completion::Eof {
+                pid: observed,
+                fd: fd @ (1 | 2),
+            } if spawned && !closed && observed == pid => {
+                let pipe = &mut pipes[usize::from(fd - 1)];
+                if *pipe {
+                    return Err("Duplicate owned pipe EOF".into());
+                }
+                *pipe = true;
+            }
+            Completion::Close {
+                pid: observed,
+                code: 0,
+                signal,
+            } if exited && pipes == [true; 2] && !closed && observed == pid && signal.is_null() => {
+                closed = true
+            }
+            Completion::Result { pid: observed } if closed && observed == pid => result = true,
+            _ => return Err("Missing, mismatched or premature owned completion".into()),
+        }
+    }
+    if !result {
+        return Err("Missing owned producer close/result".into());
+    }
+    Ok(Root {
+        file: file.into(),
+        session: session.into(),
+        pid,
+    })
+}
+
 #[derive(Default)]
 struct Index {
     files: Vec<String>,
     by_mutant: HashMap<String, BTreeSet<usize>>,
     static_mutants: HashSet<String>,
     participants: usize,
+    roots: Vec<Root>,
 }
 
 fn index(input: &str) -> Result<Index, String> {
@@ -150,7 +261,7 @@ fn index(input: &str) -> Result<Index, String> {
         return Err("Coverage evidence exceeds 16 MiB".into());
     }
     let input: Input = serde_json::from_str(input).map_err(|e| e.to_string())?;
-    if input.version != 1 || !input.qualified || input.files.is_empty() {
+    if input.version != 2 || !input.qualified || input.files.is_empty() {
         return Err("Unqualified file isolation or coverage ABI".into());
     }
     let files: HashSet<_> = input.files.iter().collect();
@@ -176,10 +287,11 @@ fn index(input: &str) -> Result<Index, String> {
         let mut participants = HashMap::new();
         for raw in run.receipts {
             let receipt = receipt(&raw)?;
-            if receipt.version != 1
+            if receipt.version != 2
                 || receipt.session != run.session
                 || receipt.file != run.file
                 || receipt.id.is_empty()
+                || receipt.pid == 0
                 || participants.contains_key(&receipt.id)
             {
                 return Err("Incomplete, corrupt or unsuccessful participant receipt".into());
@@ -193,6 +305,12 @@ fn index(input: &str) -> Result<Index, String> {
         if roots.len() != 1 || roots[0].id != "root" {
             return Err("Missing or ambiguous root completion".into());
         }
+        result.roots.push(completion(
+            &run.completion,
+            &run.file,
+            &run.session,
+            roots[0].pid,
+        )?);
         let mut visited = HashSet::new();
         let mut pending = vec!["root".to_owned()];
         while let Some(id) = pending.pop() {
@@ -254,7 +372,8 @@ impl ExecutionCoverage {
     pub fn summary(&self) -> String {
         json!({"complete": self.index.is_some(), "reason": self.reason,
             "files": self.index.as_ref().map_or(0, |i| i.files.len()),
-            "participants": self.index.as_ref().map_or(0, |i| i.participants)})
+            "participants": self.index.as_ref().map_or(0, |i| i.participants),
+            "roots": self.index.as_ref().map(|i| &i.roots)})
         .to_string()
     }
 
@@ -284,12 +403,29 @@ mod tests {
     use serde_json::Value;
 
     fn journal(file: &str, id: &str, parent: Value, events: &[Value]) -> String {
-        let start =
-            json!({"type":"start","version":1,"session":file,"file":file,"id":id,"parent":parent});
+        let pid = if file == "a" {
+            if id == "root" { 100 } else { 101 }
+        } else {
+            200
+        };
+        let start = json!({"type":"start","version":2,"session":file,"file":file,"id":id,"parent":parent,"pid":pid});
         std::iter::once(start)
             .chain(events.iter().cloned())
             .map(|e| format!("{e}\n"))
             .collect()
+    }
+    fn owned(file: &str, pid: u32) -> String {
+        [
+            json!({"type":"spawn","version":2,"session":file,"file":file,"pid":pid}),
+            json!({"type":"exit","pid":pid,"code":0,"signal":null}),
+            json!({"type":"eof","pid":pid,"fd":1}),
+            json!({"type":"eof","pid":pid,"fd":2}),
+            json!({"type":"close","pid":pid,"code":0,"signal":null}),
+            json!({"type":"result","pid":pid}),
+        ]
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect()
     }
     fn input() -> Value {
         let a = journal(
@@ -310,9 +446,81 @@ mod tests {
             &[json!({"type":"hit","mutant":"c","phase":"static"})],
         );
         let b = journal("b", "root", Value::Null, &[]);
-        json!({"version":1,"qualified":true,"files":["a","b"],"runs":[
-            {"file":"a","session":"a","baseline":"survived","receipts":[a,c]},
-            {"file":"b","session":"b","baseline":"survived","receipts":[b]}]})
+        json!({"version":2,"qualified":true,"files":["a","b"],"runs":[
+            {"file":"a","session":"a","baseline":"survived","receipts":[a,c],"completion":owned("a",100)},
+            {"file":"b","session":"b","baseline":"survived","receipts":[b],"completion":owned("b",200)}]})
+    }
+    #[test]
+    fn owned_completion_requires_matching_process_and_both_eofs_before_result() {
+        let valid = owned("a", 100);
+        let events: Vec<Value> = valid
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut bun_order = events.clone();
+        bun_order.swap(1, 3);
+        assert!(completion(&valid, "a", "a", 100).is_ok());
+        assert!(
+            completion(
+                &bun_order
+                    .iter()
+                    .map(|event| format!("{event}\n"))
+                    .collect::<String>(),
+                "a",
+                "a",
+                100
+            )
+            .is_ok()
+        );
+        for case in 0..18 {
+            let mut input = input();
+            let mut broken = events.clone();
+            match case {
+                0 => {
+                    input["runs"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("completion");
+                }
+                1 => input["version"] = json!(1),
+                2 => broken[0]["pid"] = json!(999),
+                3 => {
+                    broken.remove(2);
+                }
+                4 => {
+                    broken.remove(3);
+                }
+                5 => broken.swap(4, 5),
+                6 => {
+                    broken.remove(1);
+                }
+                7 => broken[1]["code"] = json!(1),
+                8 => broken[4]["signal"] = json!("SIGTERM"),
+                9 => broken.push(json!({"type":"eof","pid":100,"fd":1})),
+                10 => broken[3]["fd"] = json!(1),
+                11 => broken[0]["session"] = json!("other"),
+                12 => broken[0]["file"] = json!("other"),
+                13 => broken[2]["unknown"] = json!(true),
+                14 => {
+                    broken[4].as_object_mut().unwrap().remove("signal");
+                }
+                15 => broken[0]["pid"] = json!(0),
+                16 => input["runs"][0]["completion"] = json!(valid.trim_end()),
+                _ => input["runs"][0]["completion"] = json!(" ".repeat(65537)),
+            }
+            if (2..16).contains(&case) {
+                input["runs"][0]["completion"] = json!(
+                    broken
+                        .iter()
+                        .map(|event| format!("{event}\n"))
+                        .collect::<String>()
+                );
+            }
+            assert!(
+                ExecutionCoverage::new(input.to_string()).index.is_none(),
+                "completion case {case}"
+            );
+        }
     }
     #[test]
     fn execution_coverage_positive_selection_and_safe_fallbacks() {
