@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { resolve, join, relative } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { CampaignEta } from '../../lib/eta.js';
 import { createHash } from 'node:crypto';
@@ -50,7 +50,8 @@ assert.ok(mutants.length >= 2 && mutants.length <= 5, `unexpected fixture plan: 
 const report = JSON.parse(await readFile(join(cwd, 'mutation.json'), 'utf8'));
 const reportMutants = Object.values(report.files).flatMap((file) => file.mutants);
 assert.equal(reportMutants.length, mutants.length);
-const identities = mutants.map(({ id, location, mutatorName, replacement, status }) => ({ id, location, mutatorName, replacement, status })).sort((a,b) => a.id.localeCompare(b.id));
+const orderedIdentities = mutants.map(({ id, fileName, location, mutatorName, replacement, status }) => ({ id, fileName: relative(cwd, fileName).replaceAll('\\', '/'), location, mutatorName, replacement, status }));
+const identities = [...orderedIdentities].sort((a,b) => a.id.localeCompare(b.id));
 if (etaEnabled) {
   assert.equal(estimates[0].state, 'unknown');
   assert.equal(estimates.at(-1).state, 'complete');
@@ -60,4 +61,4 @@ if (etaEnabled) {
 }
 const inputs = {};
 for (const file of ['add.js', 'test.mjs', 'sdk.test.mjs', 'stryker.config.json']) inputs[file] = createHash('sha256').update(await readFile(join(cwd,file))).digest('hex');
-console.log(`ETA_FIXTURE:${JSON.stringify({ mode, enabled, runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.version}`, inputs, coreStats, identities, estimates })}`);
+console.log(`ETA_FIXTURE:${JSON.stringify({ mode, enabled, runtime: process.versions.bun ? `bun ${process.versions.bun}` : `node ${process.version}`, inputs, coreStats, orderedIdentities, identities, estimates })}`);

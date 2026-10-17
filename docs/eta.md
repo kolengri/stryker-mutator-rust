@@ -34,7 +34,11 @@ all retry, restart and reload time. Effective runners initially exclude checker
 resources and expand only as workers initialize after checker release. It allows
 one active ETA reporter per process. An incompatible seam fails when importing
 the opt-in module; the default package entry does not load or patch this module.
-Dispose a programmatically created reporter with `wrapUp()` after a failed run.
+The built-in plugin registers idempotent cleanup with its Stryker injector owner,
+including failed baselines and other exceptional exits. Dispose a manually
+created reporter with `dispose()` or `wrapUp()` when its run ends or fails.
+Observer callback failures are isolated from their first invocation; invalid
+configuration and campaign state still fail normally.
 
 ## Native coordinator
 

@@ -17,5 +17,5 @@ export function createEtaReporter(options?: {
   /** Numeric events include Rust-measured durationMs; useful for consumer-owned IPC. */
   onEvent?: (event: EtaEvent & { atMs: number }) => void;
   write?: (line: string) => void;
-}): Reporter;
+}): Reporter & { dispose(): void };
 export const strykerPlugins: Plugin<PluginKind.Reporter>[];

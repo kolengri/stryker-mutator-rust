@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { mkdir, cp, readFile, writeFile, rm, access, readdir, chmod } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 import { targets } from './targets.js';
 import { platformTarget } from '../lib/native.js';
@@ -18,7 +18,10 @@ for (const target of selected) await access(join(root, `native/stryker-rust.${ta
 const stage = join(output, 'stage');
 await rm(stage, { recursive: true, force: true });
 await mkdir(stage, { recursive: true });
-for (const path of ['lib', 'bin', 'LICENSE', 'NOTICE', 'README.md']) await cp(join(root, path), join(stage, path), { recursive: true });
+for (const path of ['lib', 'bin', 'docs/eta.md', 'LICENSE', 'NOTICE', 'README.md']) {
+  await mkdir(dirname(join(stage, path)), { recursive: true });
+  await cp(join(root, path), join(stage, path), { recursive: true });
+}
 const manifest = { ...pkg };
 delete manifest.devDependencies;
 delete manifest.napi;
@@ -42,6 +45,7 @@ const pack = async (directory) => {
   // npm <= 11 emits an array; npm 12 keys pack results by package name.
   const info = Array.isArray(report) ? report[0] : report[pkg.name] ?? Object.values(report)[0];
   if (!info?.filename || !Array.isArray(info.files)) throw new Error('Unexpected npm pack JSON response');
+  if (directory === stage && !info.files.some((file) => file.path === 'docs/eta.md')) throw new Error('Package archive omitted the linked ETA documentation');
   const archive = join(output, info.filename);
   const sha256 = createHash('sha256').update(await readFile(archive)).digest('hex');
   packages.push({ file: info.filename, sha256, size: info.size, files: info.files.map((f) => f.path) });

@@ -15,6 +15,7 @@ const reporter: Reporter = createEtaReporter({ campaign, scopeId: 's', beginScop
   if (event.type === 'finish') event.durationMs?.toFixed();
 } });
 reporter.wrapUp?.();
+createEtaReporter().dispose();
 strykerPlugins[0]?.name;
 void runNativeMutationTest({}, { eta: { campaign, scopeId: 's', beginScope: false, onEstimate: (e) => { formatEta(e); } } });
 // @ts-expect-error Event discriminators are part of the supported contract.
