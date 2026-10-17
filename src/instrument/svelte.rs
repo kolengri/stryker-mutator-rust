@@ -7,7 +7,11 @@ use std::{collections::HashSet, ops::Range};
 
 use oxc_ast::ast::{BindingIdentifier, IdentifierReference, Statement};
 use oxc_ast_visit::{Visit, walk};
-use rsvelte_core::{Allocator, ParseOptions, ast::*, parse, resolve_lazy_expressions};
+use rsvelte_core::{
+    Allocator, ParseOptions,
+    ast::{arena::ParseArena, js::Expression as TemplateExpression, typed_expr::JsNode, *},
+    parse, resolve_lazy_expressions,
+};
 
 use super::{ApiMutant, File, HEADER, Options, Positions, SourceType, instrument_program_inner};
 
@@ -158,6 +162,7 @@ fn script_ranges(source: &str) -> Result<Scripts, String> {
         .transpose()?;
     let mut proof = TemplateProof {
         source,
+        arena: &root.arena,
         nested: vec![],
         expressions: vec![],
         names: vec![],
@@ -247,6 +252,7 @@ fn prove_script(source: &str, script: &Script<'_>, module: bool) -> Result<Range
 
 struct TemplateProof<'s> {
     source: &'s str,
+    arena: &'s ParseArena,
     nested: Vec<Range<usize>>,
     expressions: Vec<Range<usize>>,
     names: Vec<String>,
@@ -254,6 +260,129 @@ struct TemplateProof<'s> {
 }
 
 impl TemplateProof<'_> {
+    fn identifier(&mut self, expression: &TemplateExpression<'_>) -> Result<(), String> {
+        let name = expression.identifier_name().ok_or(UNSUPPORTED)?;
+        let start = expression.start().ok_or(UNSUPPORTED)? as usize;
+        let end = expression.end().ok_or(UNSUPPORTED)? as usize;
+        if forbidden_identifier(name) || self.source.get(start..end) != Some(name) {
+            return Err(UNSUPPORTED.into());
+        }
+        self.names.push(name.to_owned());
+        Ok(())
+    }
+
+    fn expression(&mut self, expression: &TemplateExpression<'_>) -> Result<Range<usize>, String> {
+        let range = expression.start().ok_or(UNSUPPORTED)? as usize
+            ..expression.end().ok_or(UNSUPPORTED)? as usize;
+        if self.source.get(range.clone()).is_none() {
+            return Err(UNSUPPORTED.into());
+        }
+        if expression.node_type() == Some("Identifier") {
+            self.identifier(expression)?;
+        }
+        // Stay within unparenthesized ordinary binary operands. In particular,
+        // JS `choose<string>(n)` is a relational tree, not a typed call; its
+        // right-operand delimiter must not silently broaden the old boundary.
+        if let JsNode::BinaryExpression {
+            left,
+            right,
+            operator,
+            ..
+        } = expression.as_node_ref()
+        {
+            let left = self.arena.get_js_node(*left);
+            let right = self.arena.get_js_node(*right);
+            if !self
+                .source
+                .get(
+                    left.end().ok_or(UNSUPPORTED)? as usize
+                        ..right.start().ok_or(UNSUPPORTED)? as usize,
+                )
+                .is_some_and(|s| s.trim_matches(super::js_whitespace) == operator.as_str())
+            {
+                return Err(UNSUPPORTED.into());
+            }
+        }
+        self.expressions.push(range.clone());
+        Ok(range)
+    }
+
+    fn delimited(
+        &self,
+        start: usize,
+        end: usize,
+        range: &Range<usize>,
+        prefix: &str,
+        suffix: &str,
+    ) -> Result<(), String> {
+        if !self
+            .source
+            .get(start..range.start)
+            .is_some_and(|s| s.strip_prefix(prefix).is_some_and(whitespace))
+            || !self
+                .source
+                .get(range.end..end)
+                .is_some_and(|s| s.strip_suffix(suffix).is_some_and(whitespace))
+        {
+            return Err(UNSUPPORTED.into());
+        }
+        Ok(())
+    }
+
+    fn fragment(
+        &mut self,
+        fragment: &Fragment<'_>,
+        depth: usize,
+        const_tags: bool,
+    ) -> Result<(), String> {
+        let mut end = None;
+        for node in &fragment.nodes {
+            let span = node.span();
+            if end.is_some_and(|end| end != span.0) {
+                return Err(UNSUPPORTED.into());
+            }
+            if let TemplateNode::ConstTag(tag) = node {
+                if !const_tags {
+                    return Err(UNSUPPORTED.into());
+                }
+                // Modern rsvelte stores a declaration. Upstream's legacy AST
+                // instruments the single declarator as an AssignmentExpression,
+                // excluding the `const` keyword and retaining its original span.
+                let JsNode::VariableDeclaration {
+                    declarations, kind, ..
+                } = tag.declaration.as_node_ref()
+                else {
+                    return Err(UNSUPPORTED.into());
+                };
+                let [
+                    JsNode::VariableDeclarator {
+                        id,
+                        init: Some(init),
+                        ..
+                    },
+                ] = self.arena.get_js_children(*declarations)
+                else {
+                    return Err(UNSUPPORTED.into());
+                };
+                let binding = self.arena.get_js_node(*id);
+                let initializer = self.arena.get_js_node(*init);
+                let name = binding.identifier_name().ok_or(UNSUPPORTED)?;
+                if kind != "const" || forbidden_identifier(name) {
+                    return Err(UNSUPPORTED.into());
+                }
+                let range = binding.start().ok_or(UNSUPPORTED)? as usize
+                    ..initializer.end().ok_or(UNSUPPORTED)? as usize;
+                self.delimited(tag.start as usize, tag.end as usize, &range, "{@const", "}")?;
+                self.names.push(name.to_owned());
+                self.expressions.push(range);
+            } else {
+                self.node(node, depth)?;
+            }
+            end = Some(span.1);
+        }
+        Ok(())
+    }
+
     fn node(&mut self, node: &TemplateNode<'_>, depth: usize) -> Result<(), String> {
         if depth > 128 {
             return Err(UNSUPPORTED.into());
@@ -270,38 +399,50 @@ impl TemplateProof<'_> {
                 Ok(())
             }
             TemplateNode::ExpressionTag(tag) => {
-                // Bare identifiers and ordinary calls are the compiler-qualified
-                // template slice. Other root expressions remain atomic fallback.
                 if !matches!(
                     tag.expression.node_type(),
-                    Some("Identifier" | "CallExpression")
+                    Some(
+                        "Identifier"
+                            | "CallExpression"
+                            | "BinaryExpression"
+                            | "ConditionalExpression"
+                            | "MemberExpression"
+                    )
                 ) {
                     return Err(UNSUPPORTED.into());
                 }
-                let name = tag.expression.identifier_name();
-                let start = tag.expression.start().ok_or(UNSUPPORTED)? as usize;
-                let end = tag.expression.end().ok_or(UNSUPPORTED)? as usize;
-                // Upstream remaps actual scriptN placeholders even inside bare
-                // identifier mustaches. Validate against the final script count.
-                if name.is_some_and(forbidden_identifier)
-                    || name.is_some_and(|name| source.get(start..end) != Some(name))
-                    || source
-                        .get(tag.start as usize..start)
-                        .and_then(|s| s.strip_prefix('{'))
-                        .is_none_or(|s| !s.chars().all(super::js_whitespace))
-                    || source
-                        .get(end..tag.end as usize)
-                        .and_then(|s| s.strip_suffix('}'))
-                        .is_none_or(|s| !s.chars().all(super::js_whitespace))
+                let range = self.expression(&tag.expression)?;
+                self.delimited(tag.start as usize, tag.end as usize, &range, "{", "}")
+            }
+            TemplateNode::IfBlock(block) => {
+                let range = self.expression(&block.test)?;
+                let prefix = if block.elseif { "{:else if" } else { "{#if" };
+                if !source
+                    .get(block.start as usize..range.start)
+                    .is_some_and(|s| s.strip_prefix(prefix).is_some_and(whitespace))
                 {
                     return Err(UNSUPPORTED.into());
                 }
-                if let Some(name) = name {
-                    self.names.push(name.to_owned());
+                self.fragment(&block.consequent, depth + 1, false)?;
+                if let Some(alternate) = &block.alternate {
+                    self.fragment(alternate, depth + 1, false)?;
                 }
-                self.expressions.push(start..end);
                 Ok(())
             }
+            TemplateNode::EachBlock(block) => {
+                let context = block.context.as_ref().ok_or(UNSUPPORTED)?;
+                if block.index.is_some()
+                    || block.key.is_some()
+                    || block.fallback.is_some()
+                    || context.node_type() != Some("Identifier")
+                {
+                    return Err(UNSUPPORTED.into());
+                }
+                self.expression(&block.expression)?;
+                self.identifier(context)?;
+                self.fragment(&block.body, depth + 1, true)
+            }
+            TemplateNode::ConstTag(_) => Err(UNSUPPORTED.into()),
             TemplateNode::RegularElement(element) if element.name == "script" && depth > 0 => {
                 let typed = raw.starts_with("<script lang=\"ts\">");
                 let opening = if typed {
@@ -367,19 +508,87 @@ impl TemplateProof<'_> {
                         | "code"
                         | "pre"
                         | "blockquote"
-                ) || !element.attributes.is_empty()
+                        | "button"
+                        | "table"
+                        | "tbody"
+                        | "tr"
+                        | "td"
+                ) {
+                    return Err(UNSUPPORTED.into());
+                }
+                let mut opening_end = element.start as usize + element.name.len() + 1;
+                if source.get(element.start as usize..opening_end)
+                    != Some(&format!("<{}", element.name))
                 {
                     return Err(UNSUPPORTED.into());
                 }
-                let open = format!("<{}>", element.name);
+                for attribute in &element.attributes {
+                    let (start, end) = attribute.span();
+                    if element.name != "button"
+                        || !source
+                            .get(opening_end..start as usize)
+                            .is_some_and(|s| !s.is_empty() && whitespace(s))
+                    {
+                        return Err(UNSUPPORTED.into());
+                    }
+                    match attribute {
+                        Attribute::OnDirective(on)
+                            if on.name == "click" && on.modifiers.is_empty() =>
+                        {
+                            let expression = on.expression.as_ref().ok_or(UNSUPPORTED)?;
+                            if expression.node_type() != Some("ArrowFunctionExpression") {
+                                return Err(UNSUPPORTED.into());
+                            }
+                            let range = self.expression(expression)?;
+                            self.delimited(
+                                start as usize,
+                                end as usize,
+                                &range,
+                                "on:click={",
+                                "}",
+                            )?;
+                        }
+                        Attribute::Attribute(attribute) if attribute.name == "disabled" => {
+                            let tag = match &attribute.value {
+                                AttributeValue::Expression(tag) => tag,
+                                AttributeValue::Sequence(parts) => match parts.as_slice() {
+                                    [AttributeValuePart::ExpressionTag(tag)] => tag,
+                                    _ => return Err(UNSUPPORTED.into()),
+                                },
+                                _ => return Err(UNSUPPORTED.into()),
+                            };
+                            let range = self.expression(&tag.expression)?;
+                            self.delimited(
+                                start as usize,
+                                end as usize,
+                                &range,
+                                "disabled={",
+                                "}",
+                            )?;
+                        }
+                        _ => return Err(UNSUPPORTED.into()),
+                    }
+                    opening_end = end as usize;
+                }
+                // The typed child span starts immediately after the complete opening.
+                let child_start = element
+                    .fragment
+                    .nodes
+                    .first()
+                    .map_or(element.end as usize - element.name.len() - 3, |node| {
+                        node.span().0 as usize
+                    });
+                if !source
+                    .get(opening_end..child_start)
+                    .is_some_and(|s| s.strip_suffix('>').is_some_and(whitespace))
+                {
+                    return Err(UNSUPPORTED.into());
+                }
                 let close = format!("</{}>", element.name);
-                if !raw.starts_with(&open)
-                    || !raw.ends_with(&close)
-                    || raw.len() < open.len() + close.len()
-                {
+                if !raw.ends_with(&close) || child_start > element.end as usize - close.len() {
                     return Err(UNSUPPORTED.into());
                 }
-                let mut cursor = element.start as usize + open.len();
+                let mut cursor = child_start;
                 for child in &element.fragment.nodes {
                     let (start, end) = child.span();
                     if start as usize != cursor || end < start {
@@ -412,6 +621,7 @@ pub(super) struct ScriptGuard {
     pub(super) component: bool,
     pub(super) expression: bool,
     reactive: HashSet<u32>,
+    call_depth: usize,
     typescript: bool,
 }
 
@@ -503,7 +713,28 @@ impl<'a> Visit<'a> for ScriptGuard {
                     | E::BooleanLiteral(_)
                     | E::BinaryExpression(_)
                     | E::CallExpression(_)
+                    | E::ConditionalExpression(_)
+                    | E::StaticMemberExpression(_)
+                    | E::ArrowFunctionExpression(_)
+                    | E::AssignmentExpression(_)
             );
+            self.unsupported |= self.call_depth > 0
+                && matches!(
+                    node,
+                    E::ConditionalExpression(_)
+                        | E::StaticMemberExpression(_)
+                        | E::ArrowFunctionExpression(_)
+                        | E::AssignmentExpression(_)
+                );
+            if let E::StaticMemberExpression(member) = node {
+                self.unsupported |= member.optional;
+            }
+            if let E::ArrowFunctionExpression(arrow) = node {
+                self.unsupported |= arrow.r#async
+                    || matches!(arrow.body, oxc_ast::ast::ArrowFunctionBody::FunctionBody(_))
+                    || !arrow.params.items.is_empty()
+                    || arrow.params.rest.is_some();
+            }
             if let E::CallExpression(call) = node {
                 self.unsupported |= call.optional
                     || !matches!(call.callee, E::Identifier(_))
@@ -511,6 +742,12 @@ impl<'a> Visit<'a> for ScriptGuard {
             }
         }
         walk::walk_expression(self, node);
+    }
+
+    fn visit_call_expression(&mut self, node: &oxc_ast::ast::CallExpression<'a>) {
+        self.call_depth += 1;
+        walk::walk_call_expression(self, node);
+        self.call_depth -= 1;
     }
 
     fn visit_ts_type(&mut self, node: &oxc_ast::ast::TSType<'a>) {
@@ -575,7 +812,7 @@ mod tests {
             "<script context=\"module\"></script><script></script><p>{script1}</p>",
             "<script>let n=1;</script><p>open",
             "<script>let n=1;</script><p><div>x</div></p>",
-            "<script>let n=1;</script><div>{n+1}</div>",
+            "<script>let n=1;</script><div>{n?.value}</div>",
             "<script>let n=1;</script><div>{(n)}</div>",
             "<script>let n=1;</script><div>{\\u006e}</div>",
             "<script>let n=1;</script><style></style>",

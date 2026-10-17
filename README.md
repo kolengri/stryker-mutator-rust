@@ -243,7 +243,10 @@ slice, including simple type annotations and instance `import type` declarations
 Instance exported functions and top-level `$:` identifier assignments are supported.
 At least one script is required. Static text, bare identifier mustaches (including
 Unicode), and ordinary identifier-call mustaches with bounded expression arguments
-are supported. Template calls use Stryker's expression-context `void 0` mutation
+are supported. The bounded template slice also admits ordinary binary, conditional
+and member expressions, button click arrows and disabled expressions, if/else-if/else
+blocks, unkeyed each blocks with a single identifier binding, and direct each-body
+const tags. Callback scope, contextual bindings and Svelte reactivity are retained. Template calls use Stryker's expression-context `void 0` mutation
 and subtree filtering, preserving global IDs even when candidates are filtered.
 
 The exact Git-pinned `rsvelte_core` parser validates typed nodes, complete
@@ -264,14 +267,16 @@ unselected and otherwise inert nested scripts add no helpers. SSR emits nested
 script text without executing it. Nested `lang="ts"` text is preserved with its
 natural browser syntax errors, without transpiling it into executable document JS.
 
-The unchanged hello-world, module-script, two nested-script, template-call and
-TypeScript upstream fixtures are native. The unchanged template-expressions
-fixture remains atomic fallback: Svelte 5.57.2 rejects its direct `<table><tr>`
-structure with `node_invalid_placement` for both server and client compilation.
-It cannot satisfy compiler/runtime qualification by parser acceptance alone.
+The unchanged hello-world, module-script, two nested-script, template-call,
+TypeScript and template-expressions upstream fixtures are native. The last fixture
+retains its invalid direct `<table><tr>` structure: original, upstream and native
+outputs all fail Svelte 5.57.2 server and client compilation with the same
+`node_invalid_placement` class/code/message. Generated diagnostic positions and
+frames differ. Runtime qualification uses a separately recorded companion with
+explicit `<tbody>` tags; the pinned fixture bytes are never repaired.
 
 Duplicate top-level scripts, other attributes/module spellings, styles,
-components, directives, blocks, entities, broader expressions, runtime imports,
+components, other directives/blocks, entities, broader expressions, runtime imports,
 other exports/reactive statements, non-erasable or broader TypeScript, stores,
 runes, embedded hashbangs, helper collisions, BOMs and recovery require atomic
 upstream fallback. Svelte bypasses result caching, observes live Babel/ignorer

@@ -238,7 +238,7 @@ const unsupported = [
   '<div><script>let n=true;</script></div><p>{stryCov_9fa48}</p>',
   '<div><script>let n=true;</script></div><p>{script0}</p>',
   '<script>let n=true;</script><div><script>let x=true;</script></div><p>{script1}</p>',
-  '<div><script>let n=true;</script><span>open</div>', '<div><script>let n=true;</script></div><p>{n+1}</p>',
+  '<div><script>let n=true;</script><span>open</div>', '<div><script>let n=true;</script></div><p>{n?.value}</p>',
   '<div><script>let n=true;</script></div><style></style>', '<div><script>let n=true;</script></div><!--comment-->',
 ];
 test('unsupported nested syntax config guards and mixed batches remain atomic with serial recovery', async () => {

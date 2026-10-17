@@ -230,9 +230,9 @@ const unsupported = [
   '<script>let name="world";</script><Component/>',
   '<script>let name="world";</script><p class="x">{name}</p>',
   '<script>let name="world";</script><p class:x={name}>{name}</p>',
-  '<script>let name="world";</script>{#if name}<p>{name}</p>{/if}',
+  '<script>let name="world";</script>{#key name}<p>{name}</p>{/key}',
   '<script>let name="world";</script>{@html name}',
-  '<script>let name="world";</script><p>{name+1}</p>',
+  '<script>let name="world";</script><p>{name?.length}</p>',
   '<script>let name="world";</script><p>{(name)}</p>',
   '<script>let name="world";</script><p>{\\u006eame}</p>',
   '<script>let script0="world";</script><p>{script0}</p>',
@@ -270,10 +270,10 @@ const retainedFixtures = {
   "svelte-ts.svelte": "<script lang=\"ts\" context=\"module\">\n    function add(a: number, b: number) {\n        return a + b;\n    }\n</script>\n\n<script lang=\"ts\">\n    import type { Athlete } from './athlete.js';\n\n    const athletes: Athlete[] = [\n      { sport: \"Athletics\", name: \"Alice\", age: 16 },\n      { sport: \"Swimming\", name: \"Bob\", age: 18 },\n      { sport: \"Tennis\", name: \"Charlie\", age: 20 },\n    ];\n  \n    let a = 0;\n    let b = 0;\n    $: count = a + b;\n</script>\n\n<main>\n   <script lang=\"ts\">\n    function subtract(a: number, b: number) {\n        return a - b;\n    }\n   </script>\n</main>\n  "
 };
 
-test('compiler-unqualified pinned Svelte fixture and unsupported mixed batches retain atomic fallback and exact upstream errors', async () => {
+test('unproved Svelte grammar and unsupported mixed batches retain atomic fallback and exact upstream errors', async () => {
   assert.equal(Object.keys(retainedFixtures).length, 5);
   const ledger = [];
-  for (const [name, content] of [...Object.entries(retainedFixtures).filter(([name]) => name === 'svelte-template-expressions.svelte'), ...unsupported.map((source, index) => [`unsupported-${index}.svelte`, source])]) {
+  for (const [name, content] of unsupported.map((source, index) => [`unsupported-${index}.svelte`, source])) {
     const files = [file('const before=true;', 'before.js'), file(sample, 'positive.svelte'), file(content, name)];
     const direct = raw(files);
     assert.equal(direct.supported, false, content);

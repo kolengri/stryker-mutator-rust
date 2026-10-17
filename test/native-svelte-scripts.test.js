@@ -261,7 +261,7 @@ const unsupported = [
   '<script context="module">let name="world";</script><script>let name="first";</script><script>let name="second";</script>',
   '<script context="module">let name="world";</script><p><div>x</div></p>',
   '<script context="module">let name="world";</script><p>open',
-  '<script context="module">let name="world";</script><p>{name+1}</p>',
+  '<script context="module">let name="world";</script><p>{name?.length}</p>',
   '<script context="module">let $name="world";</script><p>{$name}</p>',
   '<script context="module">let name="world";$:name="reactive";</script>',
 ];

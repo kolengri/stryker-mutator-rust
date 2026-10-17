@@ -183,14 +183,15 @@ test('mixed JS Svelte serial four auto recovery inactive empty unsupported and c
   await receipt('modes', { files, result: baseline.result, rows });
 });
 
-test('unchanged expressions resource remains atomic fallback because the genuine compiler rejects its original table structure', async () => {
+test('unchanged expressions resource is native with all 31 records and preserves its genuine compiler-invalid structure', async () => {
   const name = 'svelte-template-expressions.svelte', source = fixtures[name];
   await resource(name, source);
   assert.equal(VERSION, '5.57.2');
-  const files = [file(source, name)], expected = plain(await new Instrumenter(logger).instrument(files, options));
+  const files = [file(source, name)], pair = await compare(files), expected = pair.expected;
+  assert.equal(pair.actual.mutants.length, 31);
   assert.equal(expected.mutants.length, 31);
   const errors = [];
-  for (const [engine, content] of [['original', source], ['upstream', expected.files[0].content]]) for (const generate of ['server', 'client']) {
+  for (const [engine, content] of [['original', source], ['upstream', expected.files[0].content], ['native', pair.actual.files[0].content]]) for (const generate of ['server', 'client']) {
     let failure;
     try { compile(content, { generate, dev: false, filename: name }); } catch (error) { failure = { name: error.name, code: error.code, message: error.message, start: error.start, end: error.end, frame: error.frame }; }
     assert.equal(failure?.code, 'node_invalid_placement', `${engine} ${generate} must exercise the actual original compiler blocker`);
@@ -199,14 +200,9 @@ test('unchanged expressions resource remains atomic fallback because the genuine
   }
   for (const threads of [1, 4, 'auto']) {
     const mixed = [file('let before=true;', 'before.js'), ...files];
-    assert.equal(raw(mixed, threads).supported, false); assert.equal(raw(mixed, threads).result, undefined);
-    const native = createInstrumenter(logger, { cache: false, engine: 'native', instrumentationThreads: threads === 'auto' ? undefined : threads });
-    await assert.rejects(native.instrument(mixed, options), /unsupported/i);
-    const automatic = createInstrumenter(logger, { cache: false, engine: 'auto', instrumentationThreads: threads === 'auto' ? undefined : threads });
-    assert.deepEqual(plain(await automatic.instrument(mixed, options)), plain(await new Instrumenter(logger).instrument(mixed, options)));
-    assert.deepEqual([automatic.stats.nativeBatches, automatic.stats.fallbackBatches, automatic.stats.nativeErrors], [0, 1, 0]);
+    await compare(mixed, options, threads);
   }
-  await receipt('unqualified-expressions', { name, source, sha256: hash(source), compiler: VERSION, expected, errors });
+  await receipt('qualified-compiler-invalid-expressions', { name, source, sha256: hash(source), compiler: VERSION, ...pair, errors, diagnosticContract: "Exact class/code/message; generated positions and frames differ." });
 });
 
 test('broader template and TypeScript compiler grammar remains unproved atomic fallback', async () => {
