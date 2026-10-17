@@ -60,7 +60,8 @@ if (mode === 'local') {
     await mkdir(directory, { recursive: true });
     await cp(join(root, `native/stryker-rust.${target.name}.node`), join(directory, 'binding.node'));
     await cp(join(root, 'LICENSE'), join(directory, 'LICENSE'));
-    await writeFile(join(directory, 'package.json'), JSON.stringify({ name, version: pkg.version, description: `Native ${target.name} binding for ${pkg.name}`, license: pkg.license, main: 'binding.node', files: ['binding.node', 'LICENSE'], os: [target.os], cpu: [target.cpu], ...(target.libc ? { libc: [target.libc] } : {}), engines: pkg.engines }, null, 2));
+    await cp(join(root, 'NOTICE'), join(directory, 'NOTICE'));
+    await writeFile(join(directory, 'package.json'), JSON.stringify({ name, version: pkg.version, description: `Native ${target.name} binding for ${pkg.name}`, license: pkg.license, main: 'binding.node', files: ['binding.node', 'LICENSE', 'NOTICE'], os: [target.os], cpu: [target.cpu], ...(target.libc ? { libc: [target.libc] } : {}), engines: pkg.engines }, null, 2));
     manifest.optionalDependencies[name] = pkg.version;
     await pack(directory);
   }

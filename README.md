@@ -93,8 +93,13 @@ npx stryker-rust run
 ```
 
 For existing projects, keep their selected test framework and runner plugin
-installed. Bun command execution needs no Stryker framework plugin. No npm release
-has been published.
+installed. Bun command execution needs no Stryker framework plugin. The public npm
+package selects a prebuilt native addon for the consumer's OS, CPU and libc:
+
+```sh
+npm install --save-dev stryker-mutator-rust
+npx stryker-rust run
+```
 
 ## CLI and API
 
