@@ -345,15 +345,9 @@ async function fallback(content) {
 }
 
 test('typed lvalues private/super and parenthesized optional spines remain atomic fallback', async () => {
-  for (const source of ['obj!.x!++;','obj!.x! = value;','for(obj!.x! of values) ;','delete value;',
+  for (const source of ['obj!.x! = value;','for(obj!.x! of values) ;','delete value;',
     'delete factory();','delete (obj?.x)!.y;','(obj?.x)!.trim();','(obj?.trim!)();',
     'class C{#x;f(){return this?.#x!;}}','class C{#x;f(){return this.#x!;}}',
     'class C{#x;f(){return this!.#x;}}','class C{#x;f(){return this!.#x();}}',
     'class C extends B{f(){return super.x!.trim();}}']) await fallback(source);
-  const source = process.env.STRYKER_UPSTREAM
-    ? await readFile(`${process.env.STRYKER_UPSTREAM}/packages/instrumenter/testResources/instrumenter/non-null-expression.ts`,'utf8')
-    : 'c[index]!++;';
-  const failure = await fallback(source);
-  assert.match(failure.message,/TSNonNullExpression/);
-  assert.match(failure.message,/UpdateExpression/);
 });

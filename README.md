@@ -327,6 +327,16 @@ Assignments and prefix/postfix updates support identifier, public-member and pri
 targets. Getter/setter order, logical assignment and update return values follow
 JavaScript semantics. Active mutations on an update target's object spine use
 upstream fallback to preserve its existing placement errors.
+An ordinary identifier or public-member update target can have a single
+TypeScript non-null assertion, as in `c[index]!++`. The assertion stays in TS
+output and erases during the caller's normal compilation. Native and auto modes
+preserve prefix/postfix values, reference evaluation, conversions and coverage,
+correcting StrykerJS 10.0.0's update-constructor error for this valid syntax.
+Printed replacements retain the assertion in supported Boolean, Arithmetic,
+Logical, array and conditional ancestors. The shared AST printer preserves
+Babel's `a! --` separator for postfix decrement, while increment stays `a!++`.
+Repeated direct assertions, other typed lvalues, optional/private/super roots and
+active receiver-spine placement errors retain their conservative boundaries.
 Ordinary loops, synchronous `for-in`/`for-of`, switch cases, labels,
 break/continue and sequence expressions are supported. Loop-test mutations,
 omitted-test `for` clones and switch fallthrough follow upstream placement.
@@ -527,10 +537,18 @@ It compares explicit serial/parallel execution for 2/8/32 balanced and skewed
 files, including repeated uncached batches. Its separate end-to-end run imports
 and tests all eight generated modules and compares complete reports with upstream.
 
-One upstream corpus fixture, `non-null-expression.ts`, currently fails in the
-reference 10.0.0 instrumenter/Babel combination (`TSNonNullExpression` in an update
-expression). Matching this existing error is recorded separately from successful
-instrumentation; it is not a compatibility success for that syntax.
+The reference 10.0.0 instrumenter/Babel combination rejects the valid update in
+`non-null-expression.ts` with a `TSNonNullExpression` constructor error.
+`engine: 'upstream'` retains that error; native and auto instrument the unchanged
+fixture with four intended mutations. The corpus classifies this exact
+source/hash/error-bound exception as `corrected-upstream-error`, preserving the
+reference error and complete original spans. An independent oracle uses the
+pinned instrumenter's original AST, traversal and printing with a per-call
+mutator array that corrects only the invalid UpdateOperator constructor. It
+does not rewrite source or modify package globals; ordinary inputs retain
+complete-result equivalence with upstream. Original and every direct source
+mutant are compared with native runtime behavior under Node and Bun.
+Other reference failures retain strict error comparisons.
 
 ## Platform release bundle
 

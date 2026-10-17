@@ -5,10 +5,11 @@ import { Instrumenter } from '@stryker-mutator/instrumenter';
 import { createInstrumenter } from '../lib/index.js';
 import { logger, options } from '../test/helpers.js';
 import { loadNative } from '../lib/native.js';
+import { nonNullUpdateOracle, pinnedNonNullSource, pinnedNonNullHash, nonNullErrorMessage, sha256 } from '../test/non-null-update-oracle.js';
 
 const upstream = resolve(process.env.STRYKER_UPSTREAM || 'artifacts/upstream/stryker-js');
 const source = join(upstream, 'packages/instrumenter/testResources/instrumenter');
-const output = resolve('artifacts/verification/corpus');
+const output = resolve(process.env.STRYKER_CORPUS_OUTPUT || 'artifacts/verification/corpus');
 await mkdir(output, { recursive: true });
 await rm(join(output, 'cache'), { recursive: true, force: true });
 const baseline = new Instrumenter(logger);
@@ -29,6 +30,26 @@ async function visit(directory) {
       if (failure) {
         // Invalid parser fixtures and resources requiring context must fail identically.
         await assert.rejects(cached.instrument(files, config), (error) => error.message === failure.message);
+        if (relative(source, path) === 'non-null-expression.ts' &&
+            files[0].content === pinnedNonNullSource && sha256(files[0].content) === pinnedNonNullHash &&
+            failure.name === 'TypeError' && failure.message === nonNullErrorMessage) {
+          // Explicit correctness exception for these exact pinned bytes and
+          // this exact upstream constructor error. Every other failure retains
+          // the strict automatic-failure comparison below.
+          const oracle = await nonNullUpdateOracle(files, config);
+          const actual = await automatic.instrument(files, config);
+          assert.equal(automatic.stats.nativeBatches, nativeBefore + 1);
+          assert.deepEqual(actual.mutants, oracle.expected.mutants, `${path}: corrected full ordered records`);
+          assert.deepEqual(actual.files.map(({ content, ...metadata }) => metadata),
+            files.map(({ content, ...metadata }) => metadata), `${path}: corrected complete file metadata`);
+          results.push({ file: relative(source, path), outcome: 'corrected-upstream-error', backend: 'native',
+            sourceHash: pinnedNonNullHash, upstreamError: { name: failure.name, message: failure.message, stack: failure.stack },
+            oracle: 'Pinned original-AST traversal with a per-call corrected UpdateOperator constructor; unchanged upstream printing, placement, filtering and metadata',
+            oracleDetails: oracle.oracle, mutants: actual.mutants, originalSpans: oracle.spans,
+            fileMetadata: actual.files.map(({ content, ...metadata }) => metadata),
+            runtimeProof: 'test/native-non-null-updates.test.js: original, every direct original-span mutant, corrected-upstream and native outputs under Node and Bun' });
+          continue;
+        }
         await assert.rejects(automatic.instrument(files, config), (error) =>
           error.name === failure.name && error.message.split(/\n\s+at /)[0] === failure.message.split(/\n\s+at /)[0]);
         results.push({ file: relative(source, path), outcome: 'matching-error', backend: 'fallback', message: failure.message });
@@ -48,6 +69,6 @@ async function visit(directory) {
 await visit(source);
 assert.equal(automatic.stats.nativeErrors, 0, 'Unexpected native failures must not hide behind fallback');
 assert.equal(automatic.stats.nativeBatches + automatic.stats.fallbackBatches, results.length);
-const report = { upstream: '10.0.0', comparison: 'Exact compatibility/cache results plus automatic ordered mutant records; native runtime parity is checked separately', files: results.length, stats: cached.stats, automaticStats: automatic.stats, results };
+const report = { upstream: '10.0.0', comparison: 'Exact compatibility/cache results plus automatic ordered mutant records, with one byte/hash/error-bound corrected-upstream-error explicitly classified; runtime parity is checked separately', files: results.length, stats: cached.stats, automaticStats: automatic.stats, results };
 await writeFile(join(output, 'result.json'), JSON.stringify(report, null, 2));
 console.log(JSON.stringify({ files: report.files, matchingErrors: results.filter((r) => r.outcome === 'matching-error').length, stats: report.stats, automaticStats: report.automaticStats }));

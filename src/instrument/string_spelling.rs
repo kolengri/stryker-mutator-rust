@@ -10,20 +10,21 @@
 //! generator's literal spelling. If none differ, print the original AST directly.
 //! Arrows reuse that visit and the conditional output parse for their
 //! parameter ranges. Await operands use Babel's extra grouping at generated AST
-//! ranges. Existing synchronous paths gain no cloning or parsing.
+//! ranges. Non-null postfix decrements use the same generated AST ranges to
+//! preserve Babel's `! --` separator, including inside ancestor replacements.
 
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentTarget, AwaitExpression, Expression, NumericLiteral,
-    RegExpFlags, RegExpLiteral, StaticMemberExpression, StringLiteral, TSSatisfiesExpression,
-    TSTypeAssertion,
+    RegExpFlags, RegExpLiteral, SimpleAssignmentTarget, StaticMemberExpression, StringLiteral,
+    TSSatisfiesExpression, TSTypeAssertion, UpdateExpression,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk};
 use oxc_codegen::{Codegen, CodegenOptions, Gen, GenExpr, IndentChar};
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 use oxc_syntax::{
-    operator::BinaryOperator,
+    operator::{BinaryOperator, UpdateOperator},
     precedence::{GetPrecedence, Precedence},
 };
 
@@ -87,11 +88,17 @@ struct NeedsProtection {
     regexes: bool,
     awaits: usize,
     assertions: usize,
+    non_null_decrements: usize,
     unproven_assertions: bool,
     arrows: printed_arrows::Proof,
 }
 
 impl<'a> Visit<'a> for NeedsProtection {
+    fn visit_update_expression(&mut self, node: &UpdateExpression<'a>) {
+        self.non_null_decrements += usize::from(non_null_postfix_decrement(node));
+        walk::walk_update_expression(self, node);
+    }
+
     fn visit_ts_satisfies_expression(&mut self, node: &TSSatisfiesExpression<'a>) {
         self.assertions += 1;
         self.unproven_assertions |= !super::simple_printed_type(&node.type_annotation)
@@ -145,6 +152,47 @@ impl<'a> Visit<'a> for NeedsProtection {
         {
             self.regexes = regex_spelling(node) != raw;
         }
+    }
+}
+
+fn non_null_postfix_decrement(node: &UpdateExpression<'_>) -> bool {
+    !node.prefix
+        && node.operator == UpdateOperator::Decrement
+        && matches!(
+            node.argument,
+            SimpleAssignmentTarget::TSNonNullExpression(_)
+        )
+}
+
+#[derive(Default)]
+struct NonNullDecrements<'s> {
+    code: &'s str,
+    visited: usize,
+    unproven: bool,
+    edits: Vec<(Span, String)>,
+}
+
+impl<'a> Visit<'a> for NonNullDecrements<'_> {
+    fn visit_update_expression(&mut self, node: &UpdateExpression<'a>) {
+        if non_null_postfix_decrement(node) {
+            self.visited += 1;
+            let end = node.argument.span().end;
+            // These ranges belong to the reparsed generated AST, independent
+            // of overlapping original/replacement spans and literal contents.
+            if end == 0
+                || self.code.get(end as usize - 1..end as usize) != Some("!")
+                || !matches!(
+                    self.code.get(end as usize..node.span.end as usize),
+                    Some("--" | " --")
+                )
+            {
+                self.unproven = true;
+            } else {
+                self.edits
+                    .push((Span::new(end, node.span.end), " --".into()));
+            }
+        }
+        walk::walk_update_expression(self, node);
     }
 }
 
@@ -439,6 +487,7 @@ fn restore(
     arrows: printed_arrows::Proof,
     awaits: usize,
     assertions: usize,
+    non_null_decrements: usize,
 ) -> Result<String, String> {
     arrows.check()?;
     if spellings.is_empty()
@@ -446,6 +495,7 @@ fn restore(
         && arrows.is_empty()
         && awaits == 0
         && assertions == 0
+        && non_null_decrements == 0
     {
         return Ok(code);
     }
@@ -532,6 +582,20 @@ fn restore(
         }
         edits.extend(spelling.edits);
     }
+    if non_null_decrements > 0 {
+        let mut spelling = NonNullDecrements {
+            code: &code,
+            ..Default::default()
+        };
+        spelling.visit_expression(&expression);
+        if spelling.visited != non_null_decrements || spelling.unproven {
+            return Err(
+                "Non-null postfix decrement spelling requires proven generated update ranges"
+                    .into(),
+            );
+        }
+        edits.extend(spelling.edits);
+    }
     edits.sort_unstable_by_key(|(span, _)| span.start);
     let mut result = String::new();
     let mut start = 0;
@@ -565,6 +629,7 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
             needs_protection.arrows,
             needs_protection.awaits,
             needs_protection.assertions,
+            needs_protection.non_null_decrements,
         );
     }
     let allocator = Allocator::default();
@@ -584,6 +649,7 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
         needs_protection.arrows,
         needs_protection.awaits,
         needs_protection.assertions,
+        needs_protection.non_null_decrements,
     )
 }
 
@@ -607,6 +673,7 @@ pub(super) fn assignment_target(
             needs_protection.arrows,
             needs_protection.awaits,
             needs_protection.assertions,
+            needs_protection.non_null_decrements,
         );
     }
     let allocator = Allocator::default();
@@ -626,6 +693,7 @@ pub(super) fn assignment_target(
         needs_protection.arrows,
         needs_protection.awaits,
         needs_protection.assertions,
+        needs_protection.non_null_decrements,
     )
 }
 
@@ -633,6 +701,55 @@ pub(super) fn assignment_target(
 mod tests {
     use super::*;
     use oxc_ast::builder::AstBuilder;
+
+    #[test]
+    fn non_null_decrement_separators_follow_current_generated_update_nodes() {
+        for (source, expected) in [
+            ("a!++", "a!++"),
+            ("a!--", "a! --"),
+            ("++a!", "++a!"),
+            ("--a!", "--a!"),
+            ("!(a!--)", "!a! --"),
+            ("(a!--) + (b!++)", "a! -- + b!++"),
+            ("[a!--, b!++]", "[a! --, b!++]"),
+            (r"obj['\x78']!--", r"obj['\x78']! --"),
+            ("obj[0xff]!--", "obj[0xff]! --"),
+            ("obj[/a/mi.test(key)]!--", "obj[/a/mi.test(key)]! --"),
+            (r"f(x => obj['\x78']!--)", r"f(x => obj['\x78']! --)"),
+            (r"await (obj['\x78']!--)", r"await obj['\x78']! --"),
+            ("(<number>(obj[0xff]!--))+1", "<number> obj[0xff]! -- + 1"),
+            (
+                "(obj.x!-- satisfies number)+1",
+                "(obj.x! -- satisfies number) + 1",
+            ),
+            (
+                "f(obj['!--']!--, '!--', /!--/mi)",
+                "f(obj['!--']! --, '!--', /!--/mi)",
+            ),
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::ts().with_module(true))
+                .parse_expression()
+                .unwrap();
+            assert_eq!(expression(&node, source).unwrap(), expected, "{source}");
+        }
+        for (code, count) in [("a!++", 1), ("--a!", 1), ("a!--", 2), ("a! -- + b!--", 1)] {
+            assert!(restore(code.into(), vec![], vec![], Default::default(), 0, 0, count).is_err());
+        }
+        let mut invalid = NonNullDecrements {
+            code: "a!++",
+            ..Default::default()
+        };
+        let allocator = Allocator::default();
+        let node = Parser::new(&allocator, "a!--", SourceType::ts().with_module(true))
+            .parse_expression()
+            .unwrap();
+        invalid.visit_expression(&node);
+        assert!(
+            invalid.unproven,
+            "generated AST operator bytes must prove the edit"
+        );
+    }
 
     #[test]
     fn assertion_clone_spelling_uses_generated_ast_ranges_and_keeps_raw_literals() {
@@ -684,8 +801,19 @@ mod tests {
                 .unwrap();
             assert_eq!(expression(&node, source).unwrap(), expected, "{source}");
         }
-        assert!(restore("x".into(), vec![], vec![], Default::default(), 0, 1).is_err());
-        assert!(restore("<number>x".into(), vec![], vec![], Default::default(), 0, 2).is_err());
+        assert!(restore("x".into(), vec![], vec![], Default::default(), 0, 1, 0).is_err());
+        assert!(
+            restore(
+                "<number>x".into(),
+                vec![],
+                vec![],
+                Default::default(),
+                0,
+                2,
+                0
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -768,6 +896,7 @@ mod tests {
                     vec!["0xff".into()],
                     Default::default(),
                     0,
+                    0,
                     0
                 )
                 .is_err(),
@@ -803,8 +932,19 @@ mod tests {
                 "{source}"
             );
         }
-        assert!(restore("await x".into(), vec![], vec![], Default::default(), 2, 0).is_err());
-        assert!(restore("x".into(), vec![], vec![], Default::default(), 1, 0).is_err());
+        assert!(
+            restore(
+                "await x".into(),
+                vec![],
+                vec![],
+                Default::default(),
+                2,
+                0,
+                0
+            )
+            .is_err()
+        );
+        assert!(restore("x".into(), vec![], vec![], Default::default(), 1, 0, 0).is_err());
     }
 
     fn arrow_proof(source: &str) -> printed_arrows::Proof {
@@ -832,7 +972,7 @@ mod tests {
             ("é(`😀(x) => x`, (x) => x)", "é(`😀(x) => x`, x => x)"),
         ] {
             assert_eq!(
-                restore(source.into(), vec![], vec![], arrow_proof(source), 0, 0).unwrap(),
+                restore(source.into(), vec![], vec![], arrow_proof(source), 0, 0, 0).unwrap(),
                 expected
             );
         }
@@ -859,6 +999,7 @@ mod tests {
                     vec![],
                     arrow_proof("f((x) => x)"),
                     0,
+                    0,
                     0
                 )
                 .is_err(),
@@ -871,6 +1012,7 @@ mod tests {
                 vec![],
                 vec![],
                 arrow_proof("f(async (x) => x)"),
+                0,
                 0,
                 0
             )
@@ -1045,6 +1187,7 @@ mod tests {
                     vec![],
                     Default::default(),
                     0,
+                    0,
                     0
                 ),
                 Err(UNPROVEN.into())
@@ -1061,6 +1204,7 @@ mod tests {
                 vec!["'\\x61'".into(), "\"a\"".into()],
                 vec![],
                 Default::default(),
+                0,
                 0,
                 0
             )

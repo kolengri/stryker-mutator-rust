@@ -1818,6 +1818,22 @@ impl Emitter<'_, '_> {
                 SimpleAssignmentTarget::StaticMemberExpression(member) if !member.optional => (&member.object, None),
                 SimpleAssignmentTarget::ComputedMemberExpression(member) if !member.optional => (&member.object, Some(&member.expression)),
                 SimpleAssignmentTarget::PrivateFieldExpression(member) if !member.optional => (&member.object, None),
+                SimpleAssignmentTarget::TSNonNullExpression(non_null) if placement == TargetPlacement::Update => {
+                    // A non-null assertion erases without reading its operand.
+                    // Keep the original reference (and wrapper bytes), placing
+                    // mutations only in the same object/key sites as an ordinary
+                    // update. Other typed targets retain their existing boundary.
+                    let inner = &non_null.expression;
+                    if private_chain(inner) || super_chain(inner) {
+                        return Err("Private and super non-null update targets require upstream instrumentation".into());
+                    }
+                    match inner {
+                        Expression::Identifier(_) => return Ok(emitter.text(target.span()).into()),
+                        Expression::StaticMemberExpression(member) if !member.optional => (&member.object, None),
+                        Expression::ComputedMemberExpression(member) if !member.optional => (&member.object, Some(&member.expression)),
+                        _ => return Err("Only ordinary identifiers and members support non-null update targets".into()),
+                    }
+                }
                 _ => return Err("Destructuring, optional, and typed assignment targets require upstream instrumentation".into()),
             };
             if matches!(object, Expression::Super(_)) {

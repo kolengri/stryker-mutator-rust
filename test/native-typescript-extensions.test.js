@@ -391,17 +391,6 @@ moduleTest('original pinned TS extension corpus executes every active mutant for
   }
 });
 
-test('original non null error and unproven optional chain shapes remain fallback', async () => {
-  const root = process.env.STRYKER_UPSTREAM ?? resolve('artifacts/upstream/stryker-js');
-  const nonNull = join(root, 'packages/instrumenter/testResources/instrumenter/non-null-expression.ts');
-  if (existsSync(nonNull)) {
-    const failure = await fallback(await readFile(nonNull, 'utf8'));
-    assert.ok(failure, 'preserve pinned upstream typed update exception');
-    assert.match(failure.message, /TSNonNullExpression/);
-  } else {
-    const failure = await fallback('c[index]!++;');
-    assert.ok(failure);
-    assert.match(failure.message, /TSNonNullExpression/);
-  }
+test('unproven optional chain shapes remain fallback', async () => {
   for (const source of ['(input?.id)!.toString();', 'delete obj?.method();']) await fallback(source);
 });
