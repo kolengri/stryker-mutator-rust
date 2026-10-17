@@ -33,6 +33,10 @@
       "types": "./lib/eta-reporter.d.ts",
       "import": "./lib/eta-reporter.js"
     },
+    "./bun-execution": {
+      "types": "./lib/bun-execution.d.ts",
+      "import": "./lib/bun-execution.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
