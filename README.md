@@ -403,20 +403,21 @@ parentheses around an entire optional expression remain supported.
 Non-null private/super combinations and unsupported delete argument shapes also
 require fallback.
 Regex literals support a bounded subset with non-Unicode flags (`g`, `i`, `m`,
-`s`, `d`, `y`, in their original order): start/end anchors,
+`s`, `d`, `y`, in their original order): start/end and word-boundary assertions, wildcard dot,
 ASCII letters, digits, spaces, underscores and hyphens, escaped slashes and
 backslashes, positive/negative printable ASCII character classes with literal
 ranges and predefined members (`\d`, `\D`, `\w`, `\W`, `\s`, `\S`), those same
 standalone predefined classes, ordinary capturing/noncapturing groups and
-alternation (including nested combinations and empty alternatives), and greedy
-`?`, `+`, `*`, `{n}`, `{n,}`, `{n,m}` quantifiers on atoms and groups.
+alternation (including nested combinations and empty alternatives), ordinary positive/negative
+lookahead and lookbehind over supported operands, and greedy or lazy
+`?`, `+`, `*`, `{n}`, `{n,}`, `{n,m}` quantifiers on atoms, groups and lookahead.
 Counts must use canonical decimal spelling and fit signed 32-bit
 integers, matching weapon-regex 2.0.6's parser. Native mutations preserve upstream
 ordering, duplicates, raw flag order and stateful regex initialization behavior.
-Empty groups (`()`, `(?:)`) retain weapon's parser diagnostics through fallback;
+Empty groups and lookarounds (`()`, `(?:)`, `(?=)`, `(?!)`, `(?<=)`, `(?<!)`) retain weapon's parser diagnostics through fallback;
 root patterns whose mutations emit an invalid empty `//` literal also stay upstream.
 Unicode flags (`u`/`v`), empty classes, escaped range endpoints, named/modifier
-groups, lookarounds, backreferences, lazy quantifiers, other escapes and unproven forms trigger
+groups, backreferences, noncanonical/overflow counts, other escapes and unproven forms trigger
 whole-batch fallback even when Regex is excluded or ignored, as do string-pattern
 `new RegExp` calls. This is a bounded level-one port, not full Regex compatibility.
 Private methods/accessors, optional private members, decorators, auto-accessors,

@@ -277,8 +277,8 @@ test('extended regex files retain exact results after parallel relocation recove
 });
 
 test('unproved forms still fall back atomically when ignored, with post-failure native recovery', async () => {
-  // Exact admitted group sources have full-record/runtime proof in native-regex-groups.test.js.
-  const unsupported = ['/a/u','/a/v','/a*?/g','/a{2}?/i','/(?<capture>a)/g','/a|(?=b)/m','/(?=a)/s',
+  // Exact admitted sources retain full-record/runtime proof in the groups and operators suites.
+  const unsupported = ['/a/u','/a/v','/a{02}?/g','/a{2147483648}?/i','/(?<capture>a)/g','/a|(?=)/m','/(?=)/s',
     String.raw`/\1/`, String.raw`/\p{L}/u`, '/é/i', '/[]/g', '/[^]/y', String.raw`/[a\-z]/`,
     String.raw`/[\/-0]/`, '/a{02}/', '/a{2,03}/', '/a{2147483648}/', 'new RegExp("a", "i")'];
   for (const expression of unsupported) {
@@ -302,7 +302,7 @@ test('unproved forms still fall back atomically when ignored, with post-failure 
       } finally {console.error=saved;}
     }
   }
-  for (const expression of ['/a/u', '/a*?/g', '/(?<capture>a)/g', '/a{02}/']) {
+  for (const expression of ['/a/u', '/a{02}?/g', '/(?<capture>a)/g', '/a{02}/']) {
     const files=[file(`// Stryker disable all: grammar still requires proof
 const ignored=${expression};`)];
     for (const threads of [1,4,'auto']) assert.equal(raw(files,options,threads).supported,false);

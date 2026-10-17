@@ -228,9 +228,9 @@ test('regex UTF16 ranges, global IDs, selected-off files and parallel emission a
 
 test('unsupported regex syntax, flags and constructors reject mixed batches atomically without native errors', async () => {
   // Admitted former negatives retain exact-source/full-record/runtime proof in
-  // native-regex-extensions.test.js and native-regex-groups.test.js.
-  const unsupported = ['/a??/', '/a+?/',
-    '/(?<capture>ab)/', '/a|(?=b)/', '/(?=a)/', '/./', '/\\x61/', '/é/', '/[]/', '/\\^/',
+  // native-regex-extensions.test.js, native-regex-groups.test.js and native-regex-operators.test.js.
+  const unsupported = ['/a{02}?/', '/a{2,03}?/',
+    '/(?<capture>ab)/', '/a|(?=)/', '/(?=)/', '/(?<capture>.)/', '/\\x61/', '/é/', '/[]/', '/\\^/',
     '/a/u', '/a/v',
     'new RegExp("^[+-]?\\\\d+$")', 'new RegExp("a", "i")'];
   for (const expression of unsupported) {
@@ -252,7 +252,7 @@ test('unsupported regex syntax, flags and constructors reject mixed batches atom
     }
   }
   const native = createInstrumenter(logger, { cache: false, engine: 'native' });
-  await assert.rejects(native.instrument([file('const unsupported=/a*?/;')], options), /unsupported/i);
+  await assert.rejects(native.instrument([file('const unsupported=/a{02}?/;')], options), /unsupported/i);
   assert.equal(native.stats.nativeErrors, 0);
   await compare([file('const recovered=/^[+-]?\\d+$/;')]);
 });

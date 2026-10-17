@@ -2,25 +2,27 @@
 //!
 //! Proven grammar: concatenations/disjunctions of ^/$ assertions, ASCII letters,
 //! digits, space, `_`, `-`, escaped slash/backslash, positive/negative printable
-//! ASCII character classes with ranges, \d/\D/\w/\W/\s/\S, and greedy ?/+/*
-//! or canonical signed-32-bit counted quantifiers on atoms, including ordinary
-//! capturing and noncapturing groups. Empty alternatives are allowed, but empty
-//! groups and mutations producing an empty root literal stay upstream (weapon
+//! ASCII character classes with ranges, \d/\D/\w/\W/\s/\S, and greedy/lazy
+//! ?/+/* or canonical signed-32-bit counted quantifiers on atoms,
+//! ordinary capturing/noncapturing groups and lookarounds, plus dot and word
+//! boundaries. Empty alternatives are allowed, but empty groups/lookarounds
+//! and mutations producing an empty root literal stay upstream (weapon
 //! rejects the former and Stryker emits invalid `//` for the latter). Non-Unicode
-//! flags g/i/m/s/d/y preserve their original order. Other group flavors, escapes,
+//! flags g/i/m/s/d/y preserve their original order. Named/modifier groups, escapes,
 //! Unicode flags and unproven quantifiers reject the entire batch, including
 //! when Regex is ignored. Do not infer support from
 //! Oxc accepting a pattern: its grammar is broader than this port's proof.
 //!
 //! Rules and preorder follow weapon-regex v2.0.6's BuiltinMutators,
-//! RegexTreeExtension, boundaryMutator, charClassMutator, predefCharClassMutator
-//! and quantifierMutator (Apache-2.0; see NOTICE). Only quantifier removal is
-//! level one; reluctant addition is level three. Preserve duplicates and order.
+//! RegexTreeExtension, boundaryMutator, charClassMutator, predefCharClassMutator,
+//! quantifierMutator and capturingMutator (Apache-2.0; see NOTICE). Only quantifier
+//! removal is level one; reluctant addition is level three. Preserve duplicates
+//! and order. Word boundaries and dot have no level-one mutations of their own.
 
 use oxc_ast::ast::RegExpLiteral;
 use oxc_regular_expression::ast::{
     BoundaryAssertionKind, CharacterClassContents, CharacterClassContentsKind, Disjunction,
-    Pattern, Quantifier, Term,
+    LookAroundAssertionKind, Pattern, Quantifier, Term,
 };
 use oxc_span::{GetSpan, Span};
 
@@ -70,6 +72,11 @@ impl Proven<'_> {
 
     fn quantifier(&self, quantifier: &Quantifier<'_>) -> Result<(), String> {
         let raw = self.text(Span::new(quantifier.body.span().end, quantifier.span.end))?;
+        let raw = if quantifier.greedy {
+            raw
+        } else {
+            raw.strip_suffix('?').ok_or(UNSUPPORTED)?
+        };
         if matches!(raw, "?" | "+" | "*") {
             return Ok(());
         }
@@ -102,12 +109,16 @@ impl Proven<'_> {
             Term::BoundaryAssertion(boundary)
                 if matches!(
                     boundary.kind,
-                    BoundaryAssertionKind::Start | BoundaryAssertionKind::End
+                    BoundaryAssertionKind::Start
+                        | BoundaryAssertionKind::End
+                        | BoundaryAssertionKind::Boundary
+                        | BoundaryAssertionKind::NegativeBoundary
                 ) =>
             {
                 Ok(())
             }
             Term::Character(character) => self.character(character.span, false),
+            Term::Dot(_) => Ok(()),
             Term::CharacterClassEscape(class) => self.predefined(class.span).map(|_| ()),
             Term::CharacterClass(class)
                 if class.kind == CharacterClassContentsKind::Union && !class.body.is_empty() =>
@@ -136,11 +147,10 @@ impl Proven<'_> {
                 Ok(())
             }
             Term::Quantifier(quantifier)
-                if quantifier.greedy
-                    && !matches!(
-                        quantifier.body,
-                        Term::BoundaryAssertion(_) | Term::Quantifier(_)
-                    ) =>
+                if !matches!(
+                    quantifier.body,
+                    Term::BoundaryAssertion(_) | Term::Quantifier(_)
+                ) =>
             {
                 self.quantifier(quantifier)?;
                 self.validate(&quantifier.body)
@@ -151,6 +161,7 @@ impl Proven<'_> {
             Term::IgnoreGroup(group) if group.modifiers.is_none() => {
                 self.validate_disjunction(&group.body)
             }
+            Term::LookAroundAssertion(assertion) => self.validate_disjunction(&assertion.body),
             _ => Err(UNSUPPORTED.into()),
         }
     }
@@ -217,6 +228,29 @@ impl Proven<'_> {
             }
             Term::CapturingGroup(group) => self.mutate_disjunction(&group.body, true, output),
             Term::IgnoreGroup(group) => self.mutate_disjunction(&group.body, true, output),
+            Term::LookAroundAssertion(assertion) => {
+                // A collapsed lone anchor is a direct child of Lookaround:
+                // BOL/EOLRemoval run on that node before LookaroundNegation.
+                // A Concat/Or child's anchors instead mutate after negation.
+                if let [alternative] = assertion.body.body.as_slice()
+                    && let [Term::BoundaryAssertion(boundary)] = alternative.body.as_slice()
+                    && matches!(
+                        boundary.kind,
+                        BoundaryAssertionKind::Start | BoundaryAssertionKind::End
+                    )
+                {
+                    self.replace(boundary.span, "", output);
+                }
+                let (offset, replacement) = match assertion.kind {
+                    LookAroundAssertionKind::Lookahead => (2, "!"),
+                    LookAroundAssertionKind::NegativeLookahead => (2, "="),
+                    LookAroundAssertionKind::Lookbehind => (3, "!"),
+                    LookAroundAssertionKind::NegativeLookbehind => (3, "="),
+                };
+                let start = assertion.span.start + offset;
+                self.replace(Span::new(start, start + 1), replacement, output);
+                self.mutate_disjunction(&assertion.body, false, output);
+            }
             _ => {}
         }
     }
@@ -449,20 +483,83 @@ mod tests {
     }
 
     #[test]
+    fn lookaround_direct_children_mutate_before_negation_then_recurse() {
+        for (prefix, negated) in [("?=", "?!"), ("?!", "?="), ("?<=", "?<!"), ("?<!", "?<=")] {
+            assert_eq!(
+                mutations(&format!("({prefix}^)")).unwrap(),
+                [format!("/({prefix})/"), format!("/({negated}^)/")]
+            );
+            assert_eq!(
+                mutations(&format!("({prefix}^$)")).unwrap(),
+                [
+                    format!("/({negated}^$)/"),
+                    format!("/({prefix}$)/"),
+                    format!("/({prefix}^)/")
+                ]
+            );
+        }
+        assert_eq!(
+            mutations("(?=(?=^))").unwrap(),
+            ["/(?!(?=^))/", "/(?=(?=))/", "/(?=(?!^))/"]
+        );
+        assert_eq!(
+            mutations("(?=^)|$").unwrap(),
+            ["/(?=^)/", "/(?=)|$/", "/(?!^)|$/"]
+        );
+        assert_eq!(mutations("a|(?=b)").unwrap(), ["/a|(?!b)/"]);
+        assert_eq!(mutations("(?=a)").unwrap(), ["/(?!a)/"]);
+    }
+
+    #[test]
+    fn lazy_quantifiers_remove_the_entire_suffix_without_adding_mutations() {
+        // Exact old negative atoms remain affirmative witnesses after repair.
+        for suffix in [
+            "??",
+            "+?",
+            "*?",
+            "{2}?",
+            "{0,0}?",
+            "{2,}?",
+            "{1,3}?",
+            "{2147483647}?",
+        ] {
+            for atom in ["a", ".", "(a)", "(?:a)"] {
+                assert_eq!(
+                    mutations(&format!("{atom}{suffix}")).unwrap(),
+                    [format!("/{atom}/")]
+                );
+            }
+        }
+        assert_eq!(mutations("(?=a)+?").unwrap(), ["/(?=a)/", "/(?!a)+?/"]);
+        assert_eq!(
+            mutations(r"a.[+-]?\d+").unwrap(),
+            [
+                r"/a.[+-]\d+/",
+                r"/a.[^+-]?\d+/",
+                r"/a.[+-]?\d/",
+                r"/a.[+-]?\D+/"
+            ]
+        );
+        for pattern in [".", r"\b", r"\B", r"\b.\B"] {
+            assert!(mutations(pattern).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn broader_parser_grammar_does_not_imply_eligibility() {
         for text in [
             "",
-            "a??",
-            "a+?",
-            "a*?",
-            "a{2}?",
+            "a{02}?",
+            "a{2,03}?",
+            "a{2147483648}?",
+            "a{1,2147483648}?",
             "a{02}",
             "a{2,03}",
             "a{2147483648}",
             "a{1,2147483648}",
-            "a|(?=b)",
+            "a|(?=)",
             "(?<capture>a)",
-            "(?=a)",
+            "(?=)",
             "(?i:a)",
             "()",
             "(?:)",
@@ -474,14 +571,14 @@ mod tests {
             "|$",
             "[]",
             "[^]",
-            ".",
+            r".\x61",
             r"[\/-0]",
             r"[a\-z]",
             r"\x61",
             r"\1",
             "é",
             r"\^",
-            r"a.[+-]?\d+",
+            r"a.[+-]?\x61+",
         ] {
             assert!(mutations(text).is_err(), "{text}");
         }

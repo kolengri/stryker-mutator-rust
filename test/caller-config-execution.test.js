@@ -51,7 +51,8 @@ for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'nativ
 }
 
 for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'native'], ['vitest', 'vitest']]) {
-  test(`worker caller ${runner} env set/delete and metadata effects reach descendants without changing main env`, { timeout: 60000 }, async (t) => {
+  // Allow all eight sequential Vitest sessions to finish, including grandchild probes.
+  test(`worker caller ${runner} env set/delete and metadata effects reach descendants without changing main env`, { timeout: runner === 'vitest' ? 120000 : 60000 }, async (t) => {
     const evidence = join(artifacts, 'windows-followup');
     await mkdir(evidence, { recursive: true });
     const cwd = await mkdtemp(join(evidence, `${runner}-worker-`));
@@ -59,6 +60,9 @@ for (const [runner, fixture] of [['command', 'native-command'], ['mocha', 'nativ
     await cp(join(root, 'fixtures', fixture), cwd, { recursive: true });
     await symlink(join(root, 'node_modules'), join(cwd, 'node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
     const options = JSON.parse(await readFile(join(cwd, 'stryker.config.json'), 'utf8'));
+    // The synchronous grandchild probe adds file-loading work outside test-body timing.
+    // Use core's default busy-machine allowance for this Vitest env-parity fixture.
+    if (runner === 'vitest') options.timeoutMS = 5000;
     const testFile = join(cwd, 'test/calculator.test.js');
     const required = ['HOMEDRIVE', 'HOMEPATH', 'LOGONSERVER', 'PATH', 'SYSTEMDRIVE', 'SYSTEMROOT', 'TEMP', 'USERDOMAIN', 'USERNAME', 'USERPROFILE', 'WINDIR'];
     const requiredProbe = `JSON.stringify(Object.entries(process.env).filter(([key])=>${JSON.stringify(required)}.includes(key.toUpperCase())))`;

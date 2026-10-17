@@ -326,8 +326,8 @@ test('mixed JS/TS parallel emission and actual relocation recovery retain ordere
 
 test('empty groups, root-empty mutations and unsupported siblings preserve atomic fallback and exact diagnostics', async () => {
   const unsupported = ['()', '(?:)', '(())', '(?:())', '()|a', 'a|(?:)', '()?',
-    '^|', '|^', '$|', '|$', '(?<capture>a)', '(?=a)', '(?!a)', '(?<=a)', '(?<!a)',
-    String.raw`(a)\1`, String.raw`(a|\x61)`, '(a|.)', '(a)+?', '(?:a){2}?'];
+    '^|', '|^', '$|', '|$', '(?<capture>a)', '(?=)', '(?!)', '(?<=)', '(?<!)',
+    String.raw`(a)\1`, String.raw`(a|\x61)`, '(a|[]).', '(a){02}?', '(?:a){2147483648}?'];
   for (const pattern of ['()', '(?:)', '(())', '(?:())', '()|a', 'a|(?:)', '()?']) {
     assert.throws(() => oracle(pattern), 'weapon rejects a sole empty RE inside a group');
   }
