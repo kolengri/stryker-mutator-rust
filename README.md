@@ -407,12 +407,16 @@ Regex literals support a bounded subset with non-Unicode flags (`g`, `i`, `m`,
 ASCII letters, digits, spaces, underscores and hyphens, escaped slashes and
 backslashes, positive/negative printable ASCII character classes with literal
 ranges and predefined members (`\d`, `\D`, `\w`, `\W`, `\s`, `\S`), those same
-standalone predefined classes, and greedy `?`, `+`, `*`, `{n}`, `{n,}`, `{n,m}`
-quantifiers. Counts must use canonical decimal spelling and fit signed 32-bit
+standalone predefined classes, ordinary capturing/noncapturing groups and
+alternation (including nested combinations and empty alternatives), and greedy
+`?`, `+`, `*`, `{n}`, `{n,}`, `{n,m}` quantifiers on atoms and groups.
+Counts must use canonical decimal spelling and fit signed 32-bit
 integers, matching weapon-regex 2.0.6's parser. Native mutations preserve upstream
 ordering, duplicates, raw flag order and stateful regex initialization behavior.
-Unicode flags (`u`/`v`), empty classes, escaped range endpoints, groups,
-alternation, lazy quantifiers, other escapes and unproven forms trigger
+Empty groups (`()`, `(?:)`) retain weapon's parser diagnostics through fallback;
+root patterns whose mutations emit an invalid empty `//` literal also stay upstream.
+Unicode flags (`u`/`v`), empty classes, escaped range endpoints, named/modifier
+groups, lookarounds, backreferences, lazy quantifiers, other escapes and unproven forms trigger
 whole-batch fallback even when Regex is excluded or ignored, as do string-pattern
 `new RegExp` calls. This is a bounded level-one port, not full Regex compatibility.
 Private methods/accessors, optional private members, decorators, auto-accessors,

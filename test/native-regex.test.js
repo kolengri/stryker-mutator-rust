@@ -227,9 +227,10 @@ test('regex UTF16 ranges, global IDs, selected-off files and parallel emission a
 });
 
 test('unsupported regex syntax, flags and constructors reject mixed batches atomically without native errors', async () => {
-  // Admitted former negatives retain full-record/runtime proof in native-regex-extensions.test.js.
+  // Admitted former negatives retain exact-source/full-record/runtime proof in
+  // native-regex-extensions.test.js and native-regex-groups.test.js.
   const unsupported = ['/a??/', '/a+?/',
-    '/(ab)/', '/a|b/', '/(?=a)/', '/./', '/\\x61/', '/é/', '/[]/', '/\\^/',
+    '/(?<capture>ab)/', '/a|(?=b)/', '/(?=a)/', '/./', '/\\x61/', '/é/', '/[]/', '/\\^/',
     '/a/u', '/a/v',
     'new RegExp("^[+-]?\\\\d+$")', 'new RegExp("a", "i")'];
   for (const expression of unsupported) {

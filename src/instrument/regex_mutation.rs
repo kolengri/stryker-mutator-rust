@@ -1,10 +1,13 @@
 //! Conservative weapon-regex 2.0.6 level-one port, using Oxc's parsed regex AST.
 //!
-//! Proven grammar: one nonempty concatenation of ^/$ assertions, ASCII letters,
+//! Proven grammar: concatenations/disjunctions of ^/$ assertions, ASCII letters,
 //! digits, space, `_`, `-`, escaped slash/backslash, positive/negative printable
 //! ASCII character classes with ranges, \d/\D/\w/\W/\s/\S, and greedy ?/+/*
-//! or canonical signed-32-bit counted quantifiers on atoms. Non-Unicode flags
-//! g/i/m/s/d/y preserve their original order. Other escapes, groups, alternatives,
+//! or canonical signed-32-bit counted quantifiers on atoms, including ordinary
+//! capturing and noncapturing groups. Empty alternatives are allowed, but empty
+//! groups and mutations producing an empty root literal stay upstream (weapon
+//! rejects the former and Stryker emits invalid `//` for the latter). Non-Unicode
+//! flags g/i/m/s/d/y preserve their original order. Other group flavors, escapes,
 //! Unicode flags and unproven quantifiers reject the entire batch, including
 //! when Regex is ignored. Do not infer support from
 //! Oxc accepting a pattern: its grammar is broader than this port's proof.
@@ -16,8 +19,8 @@
 
 use oxc_ast::ast::RegExpLiteral;
 use oxc_regular_expression::ast::{
-    BoundaryAssertionKind, CharacterClassContents, CharacterClassContentsKind, Pattern, Quantifier,
-    Term,
+    BoundaryAssertionKind, CharacterClassContents, CharacterClassContentsKind, Disjunction,
+    Pattern, Quantifier, Term,
 };
 use oxc_span::{GetSpan, Span};
 
@@ -94,6 +97,7 @@ impl Proven<'_> {
     }
 
     fn validate(&self, term: &Term<'_>) -> Result<(), String> {
+        self.text(term.span())?;
         match term {
             Term::BoundaryAssertion(boundary)
                 if matches!(
@@ -141,8 +145,32 @@ impl Proven<'_> {
                 self.quantifier(quantifier)?;
                 self.validate(&quantifier.body)
             }
+            Term::CapturingGroup(group) if group.name.is_none() => {
+                self.validate_disjunction(&group.body)
+            }
+            Term::IgnoreGroup(group) if group.modifiers.is_none() => {
+                self.validate_disjunction(&group.body)
+            }
             _ => Err(UNSUPPORTED.into()),
         }
+    }
+
+    fn validate_disjunction(&self, disjunction: &Disjunction<'_>) -> Result<(), String> {
+        self.text(disjunction.span)?;
+        // Weapon's RE requires a real term or a pipe. In particular, Oxc's
+        // valid () / (?:) must not silently bypass weapon's parser diagnostic.
+        if disjunction.body.is_empty()
+            || (disjunction.body.len() == 1 && disjunction.body[0].body.is_empty())
+        {
+            return Err(UNSUPPORTED.into());
+        }
+        for alternative in &disjunction.body {
+            self.text(alternative.span)?;
+            for term in &alternative.body {
+                self.validate(term)?;
+            }
+        }
+        Ok(())
     }
 
     fn replace(&self, span: Span, replacement: &str, output: &mut Vec<String>) {
@@ -187,38 +215,67 @@ impl Proven<'_> {
             Term::CharacterClassEscape(class) => {
                 self.replace(class.span, self.predefined(class.span).unwrap(), output);
             }
+            Term::CapturingGroup(group) => self.mutate_disjunction(&group.body, true, output),
+            Term::IgnoreGroup(group) => self.mutate_disjunction(&group.body, true, output),
             _ => {}
         }
     }
 
-    fn mutate(&self, pattern: &Pattern<'_>) -> Result<Vec<String>, String> {
-        if self.text.is_empty() || pattern.body.body.len() != 1 {
-            return Err(UNSUPPORTED.into());
-        }
-        let terms = &pattern.body.body[0].body;
-        if terms.is_empty() {
-            return Err(UNSUPPORTED.into());
-        }
-        for term in terms {
-            self.text(term.span())?;
-            self.validate(term)?;
-        }
-        let mut output = vec![];
-        // Weapon collapses singleton concatenations. Anchor removal operates on
-        // a node's direct children, so a lone ^ or $ has no mutation.
-        if terms.len() > 1 {
+    fn mutate_disjunction(
+        &self,
+        disjunction: &Disjunction<'_>,
+        in_group: bool,
+        output: &mut Vec<String>,
+    ) {
+        // Weapon collapses singleton Or/Concat nodes. Boundary mutators remove
+        // a Node's direct children before descending. Removing an Or branch
+        // removes its separator too; removing a Group's lone anchor keeps ().
+        if disjunction.body.len() > 1 {
             for kind in [BoundaryAssertionKind::Start, BoundaryAssertionKind::End] {
-                for term in terms {
-                    if let Term::BoundaryAssertion(boundary) = term
+                for (index, alternative) in disjunction.body.iter().enumerate() {
+                    if let [Term::BoundaryAssertion(boundary)] = alternative.body.as_slice()
                         && boundary.kind == kind
                     {
-                        self.replace(boundary.span, "", &mut output);
+                        let span = if index + 1 < disjunction.body.len() {
+                            Span::new(alternative.span.start, alternative.span.end + 1)
+                        } else {
+                            Span::new(alternative.span.start - 1, alternative.span.end)
+                        };
+                        self.replace(span, "", output);
                     }
                 }
             }
         }
-        for term in terms {
-            self.mutate_term(term, &mut output);
+        for alternative in &disjunction.body {
+            let terms = &alternative.body;
+            if terms.len() > 1 || (in_group && disjunction.body.len() == 1) {
+                for kind in [BoundaryAssertionKind::Start, BoundaryAssertionKind::End] {
+                    for term in terms {
+                        if let Term::BoundaryAssertion(boundary) = term
+                            && boundary.kind == kind
+                        {
+                            self.replace(boundary.span, "", output);
+                        }
+                    }
+                }
+            }
+            for term in terms {
+                self.mutate_term(term, output);
+            }
+        }
+    }
+
+    fn mutate(&self, pattern: &Pattern<'_>) -> Result<Vec<String>, String> {
+        self.validate_disjunction(&pattern.body)?;
+        let mut output = vec![];
+        self.mutate_disjunction(&pattern.body, false, &mut output);
+        // Preserve upstream's malformed-emission behavior through atomic fallback,
+        // rather than admitting an output whose // token starts a JS comment.
+        if output
+            .iter()
+            .any(|replacement| replacement == &format!("//{}", self.flags))
+        {
+            return Err(UNSUPPORTED.into());
         }
         Ok(output)
     }
@@ -356,6 +413,42 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_group_and_disjunction_children_preserve_boundary_order() {
+        assert_eq!(
+            mutations("(^)|^a$|$").unwrap(),
+            ["/(^)|^a$/", "/()|^a$|$/", "/(^)|a$|$/", "/(^)|^a|$/"]
+        );
+        assert_eq!(mutations("^|^|$").unwrap(), ["/^|$/", "/^|$/", "/^|^/"]);
+        assert_eq!(mutations("(^)").unwrap(), ["/()/"]);
+        assert_eq!(mutations("(?:$)").unwrap(), ["/(?:)/"]);
+        assert_eq!(mutations("(?:|^)").unwrap(), ["/(?:)/"]);
+        for text in ["(a)", "(?:a)", "a|b", "|", "a||b", "(|)", "(?:|)"] {
+            assert!(mutations(text).unwrap().is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn quantified_groups_recurse_after_quantifier_removal() {
+        assert_eq!(
+            mutations("(^|[ab]+){2}").unwrap(),
+            [
+                "/(^|[ab]+)/",
+                "/([ab]+){2}/",
+                "/(^|[ab]){2}/",
+                "/(^|[^ab]+){2}/",
+            ]
+        );
+        for group in ["(a|b)", "(?:a|b)"] {
+            for suffix in ["?", "+", "*", "{0}", "{2}", "{0,}", "{2,4}"] {
+                assert_eq!(
+                    mutations(&format!("{group}{suffix}")).unwrap(),
+                    [format!("/{group}/")]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn broader_parser_grammar_does_not_imply_eligibility() {
         for text in [
             "",
@@ -367,9 +460,18 @@ mod tests {
             "a{2,03}",
             "a{2147483648}",
             "a{1,2147483648}",
-            "a|b",
-            "(a)",
+            "a|(?=b)",
+            "(?<capture>a)",
             "(?=a)",
+            "(?i:a)",
+            "()",
+            "(?:)",
+            "(())",
+            "a|()",
+            "^|",
+            "|^",
+            "$|",
+            "|$",
             "[]",
             "[^]",
             ".",
