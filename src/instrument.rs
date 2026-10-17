@@ -996,6 +996,9 @@ struct Context<'a> {
     logical_parent: Option<L>,
     binding_name: Option<&'a str>,
     printed_ancestor: bool,
+    // Only this call's own replacement drops its arguments. Child contexts
+    // reset this bit; genuinely inherited printer boundaries still apply.
+    unprinted_call_arguments: bool,
     skip_string: bool,
 }
 
@@ -1194,6 +1197,14 @@ fn chain_prints(node: &Expression<'_>) -> bool {
         Expression::TSNonNullExpression(non_null) => chain_prints(&non_null.expression),
         _ => false,
     }
+}
+
+fn receiver_only_call(node: &Expression<'_>) -> bool {
+    matches!(node, Expression::CallExpression(call)
+        if !optional_kind(node)
+            && !chain_prints(&call.callee)
+            && method_target(&call.callee)
+                .is_some_and(|(_, name)| method_mapping(name) == Some(None)))
 }
 
 // Replace a cloned AST node, never splice unprotected text into a callee. The
@@ -1646,6 +1657,8 @@ impl Emitter<'_, '_> {
     ) -> Result<String, String> {
         // Call/member/non-null spines and tagged quasis defer placement. Keys,
         // arguments and template substitutions keep their own eligible placements.
+        context.unprinted_call_arguments =
+            !context.printed_ancestor && !self.printed_statement && receiver_only_call(node);
         context.printed_ancestor |= chain_prints(node);
         context.printed_ancestor |= self.printed_statement;
         let mut switches = vec![];
@@ -2210,6 +2223,10 @@ impl Emitter<'_, '_> {
                 }
                 let child_context = Context { printed_ancestor: context.printed_ancestor, ..Context::default() };
                 edits.push((call.callee.span(), self.chain_child(&call.callee, child_context, pending)?));
+                let argument_context = Context {
+                    printed_ancestor: context.printed_ancestor && !context.unprinted_call_arguments,
+                    ..Context::default()
+                };
                 let skip_string = !optional_kind(node) && matches!(&call.callee, Expression::Identifier(identifier) if matches!(identifier.name.as_str(), "require" | "Symbol"));
                 for argument in &call.arguments {
                     if let Argument::SpreadElement(spread) = argument {
@@ -2219,10 +2236,10 @@ impl Emitter<'_, '_> {
                         if call.optional || !matches!(&call.callee, Expression::Identifier(identifier) if !matches!(identifier.name.as_str(), "Array" | "RegExp" | "require" | "Symbol" | "eval")) {
                             return Err("Spread arguments outside ordinary identifier calls require upstream instrumentation".into());
                         }
-                        edits.push((spread.argument.span(), self.expression(&spread.argument, child_context)?));
+                        edits.push((spread.argument.span(), self.expression(&spread.argument, argument_context)?));
                     } else {
                         let argument = argument.as_expression().ok_or("Unsupported call argument")?;
-                        edits.push((argument.span(), self.expression(argument, Context { skip_string, ..child_context })?));
+                        edits.push((argument.span(), self.expression(argument, Context { skip_string, ..argument_context })?));
                     }
                 }
             }
@@ -3617,6 +3634,37 @@ mod tests {
                 .content
                 .contains("obj.trim((stryMutAct_9fa48(\"1\")")
         );
+    }
+
+    #[test]
+    fn receiver_only_call_keeps_inherited_printer_boundaries() {
+        let callback = "x => { if (x) { return true; } return false; }";
+        let admitted = run(
+            &format!("function keep(xs) {{ return xs.filter({callback}); }}"),
+            Value::Null,
+        );
+        assert!(admitted.supported, "{:?}", admitted.reason);
+        let result = admitted.result.unwrap();
+        assert!(result.mutants.iter().any(|record| {
+            record.mutator_name == "MethodExpression" && record.replacement == "xs"
+        }));
+        for source in [
+            format!("xs.some({callback});"),
+            format!("xs?.filter({callback});"),
+            format!("xs.filter({callback}).length;"),
+            format!("xs.map({callback}).filter(Boolean);"),
+            format!("xs.filter({callback}) + 1;"),
+        ] {
+            let rejected = run(&source, Value::Null);
+            assert!(!rejected.supported, "{source}");
+            assert!(rejected.result.is_none());
+            assert!(
+                rejected
+                    .reason
+                    .unwrap()
+                    .contains("Only concise or simple block arrows")
+            );
+        }
     }
 
     #[test]

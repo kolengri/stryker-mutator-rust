@@ -179,9 +179,9 @@ test('remaining printer boundaries and parse errors reject atomically without co
   for (const [content, reason] of [
     ["for(;;){receive('a\\\nb').trim();break;}", /Multiline strings in whole-for/],
     ["obj.trim(/* raw 'x' */ 'x');", /Comments/],
-    ["obj.trim('x',(...args)=>{return 1;});", /Only concise or simple block arrows/],
+    ["obj.endsWith('x',(...args)=>{return 1;});", /Only concise or simple block arrows/],
     ["obj.trim('x',0x10n);", /Unsupported expression/],
-    ["obj.trim('x',{value:'x'});", /Objects inside printed/],
+    ["obj.endsWith('x',{value:'x'});", /Objects inside printed/],
     ["const broken='unterminated;", /Syntax error/],
     ["obj.trim('" + String.fromCharCode(0xd800) + "');", /Invalid instrumentation input/],
   ]) {

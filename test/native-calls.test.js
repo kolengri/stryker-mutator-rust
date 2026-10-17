@@ -190,7 +190,7 @@ test('conservative call boundaries reject the whole batch and auto returns the c
     ['delete factory();','js'], ['const x=obj.tag`x`;','js'], ['class C extends B { foo() { super.foo(...args); } }','js'],
     ['class C { #foo() { return 1; } foo() { return this.#foo(); } }','js'], ['const x: number=(foo?.())!;','ts'],
     ['<div>{{ foo() }}</div>','html'],
-    ['const x=obj.trim(/* comment */ arg());','js'], ['const x=obj.trim((x=1) => { return 1; });','js'],
+    ['const x=obj.trim(/* comment */ arg());','js'], ['const x=obj.endsWith((x=1) => { return 1; });','js'],
   ];
   for (const [content, extension] of sources) {
     const files = [file('const first=true;', 'first.js'), file(content, `unsupported.${extension}`)];
