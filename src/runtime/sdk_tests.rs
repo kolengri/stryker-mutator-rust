@@ -555,7 +555,7 @@ async fn timeout_replacement_stays_pristine_for_the_next_static_mutant() {
 async fn cancellation_waits_for_active_mocha_process_and_sandbox_cleanup() {
     let directory = fixture(
         "export function value() { return true; }",
-        "import {value} from '../src/math.js'; import fs from 'node:fs'; it('waits',async()=>{if(!value()){fs.writeFileSync('active.pid',String(process.pid));await new Promise(()=>{});}});",
+        "import {value} from '../src/math.js'; import fs from 'node:fs'; it('waits',async()=>{if(!value()){fs.writeFileSync('active.pid.tmp',String(process.pid));fs.renameSync('active.pid.tmp','active.pid');await new Promise(()=>{});}});",
     );
     let input = request(directory.path(), json!({"timeoutMS":10000,"concurrency":2}));
     let (cancel, _) = watch::channel(false);
