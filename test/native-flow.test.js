@@ -2,7 +2,7 @@ import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
-import { writeFile, mkdtemp, rm } from 'node:fs/promises';
+import { writeFile, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { availableParallelism } from 'node:os';
 import { Instrumenter } from '@stryker-mutator/instrumenter';
@@ -226,6 +226,7 @@ test('Flow unsupported policies and non-JS filenames retain exact upstream error
 });
 
 test('Flow ambient Babel configuration bypasses native eligibility without executing a second parser', async () => {
+  await mkdir(new URL('../artifacts/native-flow-annotations/', import.meta.url), { recursive: true });
   const directory = await mkdtemp(new URL('../artifacts/native-flow-annotations/babel-', import.meta.url));
   try {
     await writeFile(join(directory,'.babelrc.json'),JSON.stringify({parserOpts:{plugins:['flow']}}));
