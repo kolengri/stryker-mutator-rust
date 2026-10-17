@@ -2,8 +2,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
-mkdirSync('artifacts/bun-execution-acceleration', { recursive: true });
+const artifactRoot = resolve(process.env.STRYKER_RUST_ACCELERATION_ARTIFACT_DIR ?? 'artifacts/bun-execution-acceleration');
+mkdirSync(artifactRoot, { recursive: true });
 const bunAvailable = spawnSync('bun', ['--version'], { encoding: 'utf8', timeout: 2000 }).stdout?.trim() === '1.4.3';
 
 function probe(runtime, body) {
@@ -36,7 +38,7 @@ test('Node and qualified Bun enter actual native Core stages and preserve pinned
     `);
     receipts.push(JSON.parse(output));
   }
-  writeFileSync('artifacts/bun-execution-acceleration/core-fast-path.json', JSON.stringify(receipts, null, 2));
+  writeFileSync(join(artifactRoot, 'core-fast-path.json'), JSON.stringify(receipts, null, 2));
 });
 
 test('Bun runtime pins retain atomic factory/helper/descriptor and source-file tamper guards', { skip: !bunAvailable && 'Bun 1.4.3 required' }, () => {
@@ -58,7 +60,7 @@ test('Bun runtime pins retain atomic factory/helper/descriptor and source-file t
     import { createRequire } from 'node:module'; import { pathToFileURL } from 'node:url';
     import { join, dirname } from 'node:path'; import { qualifyCoreRuntime } from './lib/core-runtime.js';
     const base = dirname(createRequire(import.meta.url).resolve('@stryker-mutator/core/package.json'));
-    const directory = mkdtempSync(join(process.cwd(),'artifacts/bun-execution-acceleration/core-source-'));
+    const directory = mkdtempSync(join(process.env.STRYKER_RUST_ACCELERATION_ARTIFACT_DIR ?? 'artifacts/bun-execution-acceleration','core-source-'));
     try {
       for (const path of ['mutants/test-coverage.js','mutants/mutant-test-planner.js','sandbox/sandbox.js']) {
         mkdirSync(dirname(join(directory,'dist/src',path)),{recursive:true});

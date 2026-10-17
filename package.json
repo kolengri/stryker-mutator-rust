@@ -44,6 +44,7 @@
     "bin",
     "native/*.node",
     "docs/eta.md",
+    "docs/bun-execution-acceleration.md",
     "LICENSE",
     "NOTICE",
     "README.md"

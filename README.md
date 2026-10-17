@@ -45,6 +45,9 @@ Unknown scopes and unmeasured preparation stay explicit; ranges are heuristic.
 
 ## Bun execution
 
+The opt-in [Bun file execution adapter](docs/bun-execution-acceleration.md) uses
+qualified child-aware coverage and falls back to the full suite when proof is incomplete.
+
 Bun is the primary execution target for new fixtures and performance work. Existing
 tests written with `bun:test` run unchanged. Select the Rust coordinator explicitly
 and configure its built-in command runner:

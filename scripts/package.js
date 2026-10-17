@@ -18,7 +18,7 @@ for (const target of selected) await access(join(root, `native/stryker-rust.${ta
 const stage = join(output, 'stage');
 await rm(stage, { recursive: true, force: true });
 await mkdir(stage, { recursive: true });
-for (const path of ['lib', 'bin', 'docs/eta.md', 'LICENSE', 'NOTICE', 'README.md']) {
+for (const path of ['lib', 'bin', 'docs/eta.md', 'docs/bun-execution-acceleration.md', 'LICENSE', 'NOTICE', 'README.md']) {
   await mkdir(dirname(join(stage, path)), { recursive: true });
   await cp(join(root, path), join(stage, path), { recursive: true });
 }
@@ -46,6 +46,7 @@ const pack = async (directory) => {
   const info = Array.isArray(report) ? report[0] : report[pkg.name] ?? Object.values(report)[0];
   if (!info?.filename || !Array.isArray(info.files)) throw new Error('Unexpected npm pack JSON response');
   if (directory === stage && !info.files.some((file) => file.path === 'docs/eta.md')) throw new Error('Package archive omitted the linked ETA documentation');
+  if (directory === stage && !info.files.some((file) => file.path === 'docs/bun-execution-acceleration.md')) throw new Error('Package archive omitted the linked Bun execution documentation');
   const archive = join(output, info.filename);
   const sha256 = createHash('sha256').update(await readFile(archive)).digest('hex');
   packages.push({ file: info.filename, sha256, size: info.size, files: info.files.map((f) => f.path) });

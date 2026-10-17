@@ -8,7 +8,7 @@ import { loadNative } from '../lib/native.js';
 import { assertProcessStopped } from './helpers.js';
 
 const qualification = 'independent-files-bun-sync-v1';
-const artifactRoot = resolve('artifacts/bun-execution-acceleration');
+const artifactRoot = resolve(process.env.STRYKER_RUST_ACCELERATION_ARTIFACT_DIR ?? 'artifacts/bun-execution-acceleration');
 mkdirSync(artifactRoot, { recursive: true });
 const bunAvailable = spawnSync('bun', ['--version'], { encoding: 'utf8', timeout: 2000 }).stdout?.trim() === '1.4.3';
 const bunTest = (name, fn) => test(name, { skip: !bunAvailable && 'Bun 1.4.3 required' }, fn);
@@ -174,13 +174,22 @@ bunTest('unknown boundaries, process exit, baseline failures, crashes and cancel
       writeFileSync(f.files[0], `import { test } from 'bun:test'; import {a} from './a.js'; test('boundary',async()=>{a(1);${scenario}});`);
       const session = f.session();
       const results = [];
-      await session.collect(async (files) => { const result = await run(files, session.env, { timeout: 700 }); results.push(result); return result; }, { status: 'survived' });
+      const rootHits = [];
+      await session.collect(async (files) => {
+        const result = await run(files, session.env, { timeout: 700 });
+        results.push(result);
+        const { directory } = JSON.parse(session.env.STRYKER_RUST_FILE_COVERAGE);
+        const events = readFileSync(join(directory, 'root.ndjson'), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+        rootHits.push(events.filter((event) => event.type === 'hit'));
+        return result;
+      }, { status: 'survived' });
+      assert.ok(rootHits[0].length > 0, `The unsupported boundary must be exercised after positive root coverage: ${scenario}`);
       assert.equal(session.select('0').files, undefined, scenario);
       assert.notEqual(session.reason, 'Complete owned receipts', scenario);
       if (!scenario.includes('throw new Error') && !scenario.includes('process.exit') && !scenario.includes('await new Promise(()=>{})')) {
         assert.equal(results[0].status, 'survived', `${scenario}\n${results[0].stderr}`);
       }
-      witnesses.push({ scenario, reason: session.reason, results });
+      witnesses.push({ scenario, reason: session.reason, results, rootHits });
     }
     writeFileSync(f.files[0], "import { test } from 'bun:test'; test('cancel',async()=>{await new Promise(()=>{})},10000);");
     const session = f.session();
