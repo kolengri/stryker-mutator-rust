@@ -110,8 +110,27 @@ async function launch(t, { nodeArgs = [], env = {} } = {}) {
     assert.equal(Object.hasOwn(response, 'result'), true);
     return response.result;
   }
+  function waitForOutput(channel, pattern) {
+    const stream = child[channel];
+    const output = () => channel === 'stdout' ? stdout : stderr;
+    if (pattern.test(output())) return Promise.resolve(output());
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => finish(new Error(`Timed out waiting for ${channel} ${pattern}; output: ${output()}`)), 10000);
+      function finish(error) {
+        clearTimeout(timer);
+        stream.off('data', onData);
+        stream.off('close', onClose);
+        if (error) reject(error); else resolve(output());
+      }
+      function onData() { if (pattern.test(output())) finish(); }
+      function onClose() { finish(new Error(`${channel} closed waiting for ${pattern}; output: ${output()}`)); }
+      stream.on('data', onData);
+      stream.once('close', onClose);
+      if (stream.destroyed) onClose();
+    });
+  }
   return {
-    cwd, child, socket, frames, waitFor, request, call, exited, token,
+    cwd, child, socket, frames, waitFor, waitForOutput, request, call, exited, token,
     output: () => ({ stdout, stderr }),
     initialize: (name = 'class', overrides = {}) => call('initialize', {
       cwd, options: { nested: { frozen: true }, logLevel: 'debug' },
@@ -146,15 +165,16 @@ test('SDK class DI, schemas, logs, and arbitrary user output use separate channe
   assert.deepEqual((await bridge.call('runner.mutantRun', mutantOptions)).params, mutantOptions);
   await bridge.waitFor((frame) => frame.event === 'log' && frame.params.category === 'CustomCategory');
   assert.equal(bridge.frames.some(({ params, event }) => event === 'log' && params.category === 'ExampleRunner' && params.message === 'constructed %s'), true);
-  assert.match(bridge.output().stdout, /plugin stdout: not JSON/);
-  assert.match(bridge.output().stdout, /\{direct stdout without a newline\}/);
-  assert.match(bridge.output().stderr, /plugin stderr/);
+  assert.match(await bridge.waitForOutput('stdout', /plugin stdout: not JSON/), /plugin stdout: not JSON/);
+  assert.match(await bridge.waitForOutput('stdout', /\{direct stdout without a newline\}/), /\{direct stdout without a newline\}/);
+  assert.match(await bridge.waitForOutput('stderr', /plugin stderr/), /plugin stderr/);
   assert.equal(JSON.stringify(bridge.frames.filter(({ event }) => event !== 'hello')).includes(bridge.token), false);
   await bridge.call('dispose');
 });
 
 test('prepare returns SDK/plugin schemas before construction and preserves validated module selection', async (t) => {
   const bridge = await launch(t);
+  bridge.child.stdout.pause();
   const metadata = await bridge.call('prepare', { cwd: bridge.cwd, modules: [plugin] });
   assert.equal(metadata.sdkVersion, '10.0.0');
   assert.equal(metadata.coreSchema.title, 'StrykerOptions');
@@ -167,7 +187,10 @@ test('prepare returns SDK/plugin schemas before construction and preserves valid
     cwd: bridge.cwd, modules: [], options: {}, fileDescriptions: {}, plugin: { kind: 'TestRunner', name: 'class' },
   })).error.name, 'StateError');
   await bridge.initialize('class', { modules: metadata.loadedModules.map(({ moduleName }) => moduleName) });
-  assert.match(bridge.output().stdout, /plugin stdout/);
+  assert.equal(bridge.output().stdout, '', 'the TCP response does not drain a paused stdout pipe');
+  const output = bridge.waitForOutput('stdout', /plugin stdout/);
+  bridge.child.stdout.resume();
+  assert.match(await output, /plugin stdout/);
 });
 
 test('metadata-only prepared workers dispose without constructing plugins', async (t) => {
