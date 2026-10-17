@@ -1,6 +1,7 @@
 //! Preserve parser-owned raw literals when printing cloned replacement ASTs.
 //!
-//! Oxc 0.154 normalizes strings and numbers, whereas Babel retains raw tokens.
+//! Oxc 0.154 normalizes strings, numbers and regex flag order, whereas Babel
+//! retains raw tokens.
 //! Give every literal occurrence a distinct AST marker, then parse
 //! the generated expression to obtain its exact output byte range. This never
 //! searches output text or identifies literals by their decoded value/source
@@ -14,7 +15,7 @@
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentTarget, AwaitExpression, Expression, NumericLiteral,
-    StaticMemberExpression, StringLiteral,
+    RegExpFlags, RegExpLiteral, StaticMemberExpression, StringLiteral,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk};
 use oxc_codegen::{Codegen, CodegenOptions, Gen, GenExpr, IndentChar};
@@ -53,10 +54,32 @@ fn number_spelling(node: &NumericLiteral<'_>) -> String {
     generator.into_source_text()
 }
 
+fn regex_spelling(node: &RegExpLiteral<'_>) -> String {
+    let mut generator = generator();
+    node.print(&mut generator, oxc_codegen::Context::empty());
+    generator.into_source_text()
+}
+
+fn regex_raw<'n>(node: &'n RegExpLiteral<'_>) -> Option<&'n str> {
+    let raw = node.raw.as_ref()?.as_str();
+    let flags = raw
+        .strip_prefix('/')?
+        .strip_prefix(node.regex.pattern.text.as_str())?
+        .strip_prefix('/')?;
+    let parsed = flags.bytes().try_fold(RegExpFlags::empty(), |seen, byte| {
+        let flag = RegExpFlags::try_from(byte).ok()?;
+        (!seen.intersects(flag)).then_some(seen | flag)
+    })?;
+    // A transformed literal can retain its old raw field. Restore raw bytes
+    // only when its current pattern and flags still describe that token.
+    (parsed == node.regex.flags).then_some(raw)
+}
+
 #[derive(Default)]
 struct NeedsProtection {
     strings: bool,
     numbers: bool,
+    regexes: bool,
     awaits: usize,
     arrows: printed_arrows::Proof,
 }
@@ -87,6 +110,14 @@ impl<'a> Visit<'a> for NeedsProtection {
             self.numbers = number_spelling(node) != raw.as_str();
         }
     }
+
+    fn visit_reg_exp_literal(&mut self, node: &RegExpLiteral<'a>) {
+        if !self.regexes
+            && let Some(raw) = regex_raw(node)
+        {
+            self.regexes = regex_spelling(node) != raw;
+        }
+    }
 }
 
 struct Protect<'a> {
@@ -96,6 +127,16 @@ struct Protect<'a> {
 }
 
 impl<'a> VisitMut<'a> for Protect<'a> {
+    fn visit_reg_exp_literal(&mut self, node: &mut RegExpLiteral<'a>) {
+        let spelling = regex_raw(node).map_or_else(|| regex_spelling(node), str::to_owned);
+        let marker = format!("{PREFIX}{}__", self.spellings.len());
+        self.spellings.push(spelling);
+        node.regex.pattern.text = self.allocator.alloc_str(&marker).into();
+        node.regex.pattern.pattern = None;
+        node.regex.flags = RegExpFlags::empty();
+        node.raw = None;
+    }
+
     fn visit_numeric_literal(&mut self, node: &mut NumericLiteral<'a>) {
         let spelling = node
             .raw
@@ -169,6 +210,23 @@ impl<'a> Visit<'a> for AwaitGroups {
 }
 
 impl<'a> Visit<'a> for Ranges {
+    fn visit_reg_exp_literal(&mut self, node: &RegExpLiteral<'a>) {
+        let text = node.regex.pattern.text.as_str();
+        let index = text
+            .strip_prefix(PREFIX)
+            .and_then(|value| value.strip_suffix("__"))
+            .and_then(|value| value.parse::<usize>().ok());
+        if let Some(index) = index
+            && text == format!("{PREFIX}{index}__")
+            && node.regex.flags.is_empty()
+            && let Some(slot @ None) = self.spans.get_mut(index)
+        {
+            *slot = Some(node.span);
+        } else {
+            self.proven = false;
+        }
+    }
+
     fn visit_static_member_expression(&mut self, node: &StaticMemberExpression<'a>) {
         if let Expression::NumericLiteral(number) = &node.object {
             let index = number.value - NUMBER_MARKER;
@@ -318,7 +376,7 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
     let mut needs_protection = NeedsProtection::default();
     needs_protection.visit_expression(node);
     needs_protection.arrows.check()?;
-    if !needs_protection.strings && !needs_protection.numbers {
+    if !needs_protection.strings && !needs_protection.numbers && !needs_protection.regexes {
         let mut generator = generator().with_source_text(source);
         generator.print_expression(node);
         return restore(
@@ -355,7 +413,7 @@ pub(super) fn assignment_target(
     let mut needs_protection = NeedsProtection::default();
     needs_protection.visit_assignment_target(node);
     needs_protection.arrows.check()?;
-    if !needs_protection.strings && !needs_protection.numbers {
+    if !needs_protection.strings && !needs_protection.numbers && !needs_protection.regexes {
         let mut generator = generator().with_source_text(source);
         node.print(&mut generator, oxc_codegen::Context::empty());
         return restore(
@@ -389,6 +447,55 @@ pub(super) fn assignment_target(
 mod tests {
     use super::*;
     use oxc_ast::builder::AstBuilder;
+
+    #[test]
+    fn raw_regex_flags_share_occurrence_markers_with_other_literals() {
+        for source in [
+            r"f('raw', /[^a-z\w]{1,3}/mi, /a/ig, 1_000)",
+            r"f('__stryker_raw_string_0__', /__stryker_raw_string_0__/mi, /a/g)",
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::mjs())
+                .parse_expression()
+                .unwrap();
+            assert_eq!(expression(&node, source).unwrap(), source);
+        }
+        let allocator = Allocator::default();
+        let node = Parser::new(&allocator, "/a/g", SourceType::mjs())
+            .parse_expression()
+            .unwrap();
+        let mut needs = NeedsProtection::default();
+        needs.visit_expression(&node);
+        assert!(
+            !needs.regexes,
+            "canonical flags retain the direct-print path"
+        );
+    }
+
+    #[test]
+    fn transformed_regexes_never_restore_stale_raw_patterns_or_flags() {
+        let source = r"f('raw', /[a-z]+/mi)";
+        let allocator = Allocator::default();
+        let mut node = Parser::new(&allocator, source, SourceType::mjs())
+            .parse_expression()
+            .unwrap();
+        let Expression::CallExpression(call) = &mut node else {
+            panic!()
+        };
+        let oxc_ast::ast::Argument::RegExpLiteral(regex) = &mut call.arguments[1] else {
+            panic!()
+        };
+        regex.regex.pattern.text = allocator.alloc_str("[^a-z]+").into();
+        assert_eq!(expression(&node, source).unwrap(), r"f('raw', /[^a-z]+/im)");
+        let Expression::CallExpression(call) = &mut node else {
+            panic!()
+        };
+        let oxc_ast::ast::Argument::RegExpLiteral(regex) = &mut call.arguments[1] else {
+            panic!()
+        };
+        regex.regex.flags = RegExpFlags::G;
+        assert_eq!(expression(&node, source).unwrap(), r"f('raw', /[^a-z]+/g)");
+    }
 
     #[test]
     fn raw_numbers_and_numeric_member_punctuation_survive_protected_clones() {

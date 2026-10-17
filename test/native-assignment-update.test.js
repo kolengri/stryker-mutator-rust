@@ -355,6 +355,7 @@ test('all 17 registry mutators are accounted for at the accepted grammar boundar
   const call = await compare([file('foo();')]);
   assert.deepEqual(call.actual.mutants.map(m=>m.mutatorName),['CallExpression']);
   runtime(pair, 'let a=0,b=2;const obj={x:4,trim(){events.push("trim");return 3;}};function foo(x){events.push(x);}', '[calc(),calc()]', '[typeof a,b]');
-  // Regex range syntax remains unproven and requires upstream fallback.
-  await fallback('a = /[a-z]/;');
+  // The old range fixture has full-record/runtime proof in native-regex-extensions.test.js.
+  // Groups still require upstream fallback inside assignment values.
+  await fallback('a = /(a)/;');
 });

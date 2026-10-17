@@ -401,7 +401,7 @@ test('unproven parameter patterns and existing grammar and printer boundaries re
     'class C{constructor(@dec public a=true){}}', 'class C{constructor(override a=true){}}',
     'class C{m(public a=true){}}', 'function f(a /* comment */=true){}',
     'function f(a=true){"use strict";}', 'function f(a=true){"directive";return a;}',
-    'function f(a=/[a-z]/){}',
+    'function f(a=/(a)/){}',
     'function f(a=1**2){}', 'function f(a=[...items]){}', 'function f(...rest){return obj.g(...rest);}',
     'const f=((a=true)=>a)+1;', 'for(;;){const f=(a=true)=>a;break;}',
     'function f(a=1_000+2n){}', 'function f(a=true){try{return a;}catch({message}){}}', 'function f(a=new.target){}',

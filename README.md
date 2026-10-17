@@ -402,12 +402,19 @@ Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
 Non-null private/super combinations and unsupported delete argument shapes also
 require fallback.
-Regex literals support a bounded subset with no flags: start/end anchors,
+Regex literals support a bounded subset with non-Unicode flags (`g`, `i`, `m`,
+`s`, `d`, `y`, in their original order): start/end anchors,
 ASCII letters, digits, spaces, underscores and hyphens, escaped slashes and
-backslashes, positive literal character classes, digit classes (`\d`/`\D`),
-and greedy `?`/`+` quantifiers. Native mutations preserve upstream ordering and
-duplicates. Flags, ranges, groups, alternation, other escapes and unproven forms
-trigger whole-batch fallback, as do string-pattern `new RegExp` calls.
+backslashes, positive/negative printable ASCII character classes with literal
+ranges and predefined members (`\d`, `\D`, `\w`, `\W`, `\s`, `\S`), those same
+standalone predefined classes, and greedy `?`, `+`, `*`, `{n}`, `{n,}`, `{n,m}`
+quantifiers. Counts must use canonical decimal spelling and fit signed 32-bit
+integers, matching weapon-regex 2.0.6's parser. Native mutations preserve upstream
+ordering, duplicates, raw flag order and stateful regex initialization behavior.
+Unicode flags (`u`/`v`), empty classes, escaped range endpoints, groups,
+alternation, lazy quantifiers, other escapes and unproven forms trigger
+whole-batch fallback even when Regex is excluded or ignored, as do string-pattern
+`new RegExp` calls. This is a bounded level-one port, not full Regex compatibility.
 Private methods/accessors, optional private members, decorators, auto-accessors,
 unsupported parameter-property forms, computed/quoted method keys, computed fields,
 mapped super calls, dynamic imports,

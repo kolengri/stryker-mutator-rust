@@ -273,7 +273,7 @@ test('unsupported bindings, async iteration, expression targets and formatter bo
   for (const [content, extension='js'] of [
     ['for(let [x=1] of list)foo();'], ['for({x} of list)foo();'], ['for([x] in list)foo();'],
     ['for await(const x of list)foo();'], ['for(let i:number=0;i<2;i++)foo(i satisfies number);','ts'],
-    ['for(;tick(true);)new Thing(...args);'], ['while(tick(true)) /[a-z]/.test(value);'],
+    ['for(;tick(true);)new Thing(...args);'], ['while(tick(true)) /(a)/.test(value);'],
     ['for(;;){ /* ordinary comment */ break;}'], ['for(;;){note({x:1});break;}'],
     ['// Stryker disable ConditionalExpression: reason\nfor(;;)break;'],
     ['for(;;)break;\n// trailing clone comment'],

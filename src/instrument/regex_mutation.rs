@@ -1,10 +1,12 @@
 //! Conservative weapon-regex 2.0.6 level-one port, using Oxc's parsed regex AST.
 //!
 //! Proven grammar: one nonempty concatenation of ^/$ assertions, ASCII letters,
-//! digits, space, `_`, `-`, escaped slash/backslash, positive literal character
-//! classes (also allowing `+`), digit classes \d/\D, and greedy ?/+ on atoms.
-//! Flags, ranges, other escapes, groups, alternatives and other quantifiers reject
-//! the entire batch, including when Regex is ignored. Do not infer support from
+//! digits, space, `_`, `-`, escaped slash/backslash, positive/negative printable
+//! ASCII character classes with ranges, \d/\D/\w/\W/\s/\S, and greedy ?/+/*
+//! or canonical signed-32-bit counted quantifiers on atoms. Non-Unicode flags
+//! g/i/m/s/d/y preserve their original order. Other escapes, groups, alternatives,
+//! Unicode flags and unproven quantifiers reject the entire batch, including
+//! when Regex is ignored. Do not infer support from
 //! Oxc accepting a pattern: its grammar is broader than this port's proof.
 //!
 //! Rules and preorder follow weapon-regex v2.0.6's BuiltinMutators,
@@ -14,7 +16,8 @@
 
 use oxc_ast::ast::RegExpLiteral;
 use oxc_regular_expression::ast::{
-    BoundaryAssertionKind, CharacterClassContents, CharacterClassContentsKind, Pattern, Term,
+    BoundaryAssertionKind, CharacterClassContents, CharacterClassContentsKind, Pattern, Quantifier,
+    Term,
 };
 use oxc_span::{GetSpan, Span};
 
@@ -24,6 +27,7 @@ const UNSUPPORTED: &str =
 struct Proven<'a> {
     text: &'a str,
     offset: u32,
+    flags: &'a str,
 }
 
 impl Proven<'_> {
@@ -41,8 +45,48 @@ impl Proven<'_> {
             || (raw.len() == 1
                 && (raw.as_bytes()[0].is_ascii_alphanumeric()
                     || matches!(raw.as_bytes()[0], b' ' | b'_' | b'-')
-                    || (in_class && raw == "+")))
+                    || (in_class && matches!(raw.as_bytes()[0], b' '..=b'~'))))
         {
+            Ok(())
+        } else {
+            Err(UNSUPPORTED.into())
+        }
+    }
+
+    fn predefined(&self, span: Span) -> Result<&'static str, String> {
+        match self.text(span)? {
+            r"\d" => Ok(r"\D"),
+            r"\D" => Ok(r"\d"),
+            r"\w" => Ok(r"\W"),
+            r"\W" => Ok(r"\w"),
+            r"\s" => Ok(r"\S"),
+            r"\S" => Ok(r"\s"),
+            _ => Err(UNSUPPORTED.into()),
+        }
+    }
+
+    fn quantifier(&self, quantifier: &Quantifier<'_>) -> Result<(), String> {
+        let raw = self.text(Span::new(quantifier.body.span().end, quantifier.span.end))?;
+        if matches!(raw, "?" | "+" | "*") {
+            return Ok(());
+        }
+        // Weapon's Parser.number uses Numbers.nonNegativeIntString.toInt:
+        // leading zeroes do not parse as counts, and overflow throws (and is
+        // logged by Stryker). Oxc accepts both. Compare AST-derived canonical
+        // spellings instead of parsing a second regex grammar here.
+        if quantifier.min > i32::MAX as u64
+            || quantifier.max.is_some_and(|max| max > i32::MAX as u64)
+        {
+            return Err(UNSUPPORTED.into());
+        }
+        let canonical = match quantifier.max {
+            Some(max) if max == quantifier.min && raw == format!("{{{max}}}") => {
+                return Ok(());
+            }
+            Some(max) => format!("{{{},{max}}}", quantifier.min),
+            None => format!("{{{},}}", quantifier.min),
+        };
+        if raw == canonical {
             Ok(())
         } else {
             Err(UNSUPPORTED.into())
@@ -60,21 +104,30 @@ impl Proven<'_> {
                 Ok(())
             }
             Term::Character(character) => self.character(character.span, false),
-            Term::CharacterClassEscape(class)
-                if matches!(self.text(class.span)?, r"\d" | r"\D") =>
-            {
-                Ok(())
-            }
+            Term::CharacterClassEscape(class) => self.predefined(class.span).map(|_| ()),
             Term::CharacterClass(class)
-                if !class.negative
-                    && class.kind == CharacterClassContentsKind::Union
-                    && !class.body.is_empty() =>
+                if class.kind == CharacterClassContentsKind::Union && !class.body.is_empty() =>
             {
                 for child in &class.body {
-                    let CharacterClassContents::Character(character) = child else {
-                        return Err(UNSUPPORTED.into());
-                    };
-                    self.character(character.span, true)?;
+                    match child {
+                        CharacterClassContents::Character(character) => {
+                            self.character(character.span, true)?;
+                        }
+                        CharacterClassContents::CharacterClassRange(range) => {
+                            // Weapon's range production only accepts unescaped
+                            // character literals as its endpoints.
+                            for endpoint in [&range.min, &range.max] {
+                                if self.text(endpoint.span)?.len() != 1 {
+                                    return Err(UNSUPPORTED.into());
+                                }
+                                self.character(endpoint.span, true)?;
+                            }
+                        }
+                        CharacterClassContents::CharacterClassEscape(class) => {
+                            self.predefined(class.span)?;
+                        }
+                        _ => return Err(UNSUPPORTED.into()),
+                    }
                 }
                 Ok(())
             }
@@ -83,12 +136,9 @@ impl Proven<'_> {
                     && !matches!(
                         quantifier.body,
                         Term::BoundaryAssertion(_) | Term::Quantifier(_)
-                    )
-                    && matches!(
-                        self.text(Span::new(quantifier.body.span().end, quantifier.span.end))?,
-                        "?" | "+"
                     ) =>
             {
+                self.quantifier(quantifier)?;
                 self.validate(&quantifier.body)
             }
             _ => Err(UNSUPPORTED.into()),
@@ -100,10 +150,11 @@ impl Proven<'_> {
         let start = (span.start - self.offset) as usize;
         let end = (span.end - self.offset) as usize;
         output.push(format!(
-            "/{}{}{}/",
+            "/{}{}{}/{}",
             &self.text[..start],
             replacement,
-            &self.text[end..]
+            &self.text[end..],
+            self.flags,
         ));
     }
 
@@ -118,18 +169,23 @@ impl Proven<'_> {
                 self.mutate_term(&quantifier.body, output);
             }
             Term::CharacterClass(class) => {
-                self.replace(Span::empty(class.span.start + 1), "^", output);
+                if class.negative {
+                    self.replace(
+                        Span::new(class.span.start + 1, class.span.start + 2),
+                        "",
+                        output,
+                    );
+                } else {
+                    self.replace(Span::empty(class.span.start + 1), "^", output);
+                }
+                for child in &class.body {
+                    if let CharacterClassContents::CharacterClassEscape(class) = child {
+                        self.replace(class.span, self.predefined(class.span).unwrap(), output);
+                    }
+                }
             }
             Term::CharacterClassEscape(class) => {
-                self.replace(
-                    class.span,
-                    if self.text(class.span).unwrap() == r"\d" {
-                        r"\D"
-                    } else {
-                        r"\d"
-                    },
-                    output,
-                );
+                self.replace(class.span, self.predefined(class.span).unwrap(), output);
             }
             _ => {}
         }
@@ -169,13 +225,25 @@ impl Proven<'_> {
 }
 
 pub(super) fn mutate(literal: &RegExpLiteral<'_>) -> Result<Vec<String>, String> {
-    if !literal.regex.flags.is_empty() {
+    // The flag bitset prints in canonical order; Babel replacements retain the
+    // original spelling. Oxc's parser-owned raw literal and pattern byte length
+    // locate the suffix without scanning delimiters or reparsing the pattern.
+    let text = literal.regex.pattern.text.as_str();
+    let flags = literal
+        .raw
+        .as_ref()
+        .and_then(|raw| raw.strip_prefix('/'))
+        .and_then(|raw| raw.strip_prefix(text))
+        .and_then(|raw| raw.strip_prefix('/'))
+        .ok_or(UNSUPPORTED)?;
+    if !flags.bytes().all(|flag| b"gimsdy".contains(&flag)) {
         return Err(UNSUPPORTED.into());
     }
     let pattern = literal.regex.pattern.pattern.as_ref().ok_or(UNSUPPORTED)?;
     Proven {
-        text: literal.regex.pattern.text.as_str(),
+        text,
         offset: literal.span.start + 1,
+        flags,
     }
     .mutate(pattern)
 }
@@ -201,7 +269,12 @@ mod tests {
         )
         .parse()
         .map_err(|_| UNSUPPORTED.to_string())?;
-        Proven { text, offset: 37 }.mutate(&pattern)
+        Proven {
+            text,
+            offset: 37,
+            flags: "",
+        }
+        .mutate(&pattern)
     }
 
     #[test]
@@ -250,22 +323,58 @@ mod tests {
     }
 
     #[test]
+    fn classes_and_counted_quantifiers_keep_preorder_and_original_bytes() {
+        assert_eq!(
+            mutations(r"^[^a-z\d\W]{2,4}\s*$").unwrap(),
+            [
+                r"/[^a-z\d\W]{2,4}\s*$/",
+                r"/^[^a-z\d\W]{2,4}\s*/",
+                r"/^[^a-z\d\W]\s*$/",
+                r"/^[a-z\d\W]{2,4}\s*$/",
+                r"/^[^a-z\D\W]{2,4}\s*$/",
+                r"/^[^a-z\d\w]{2,4}\s*$/",
+                r"/^[^a-z\d\W]{2,4}\s$/",
+                r"/^[^a-z\d\W]{2,4}\S*$/",
+            ]
+        );
+        for suffix in [
+            "*",
+            "{0}",
+            "{2}",
+            "{0,}",
+            "{2,}",
+            "{0,0}",
+            "{2,4}",
+            "{2147483647}",
+        ] {
+            assert_eq!(mutations(&format!("a{suffix}")).unwrap(), ["/a/"]);
+        }
+        assert_eq!(
+            mutations(r"[\d\d]").unwrap(),
+            [r"/[^\d\d]/", r"/[\D\d]/", r"/[\d\D]/"]
+        );
+    }
+
+    #[test]
     fn broader_parser_grammar_does_not_imply_eligibility() {
         for text in [
             "",
-            "a*",
             "a??",
             "a+?",
-            "a{2}",
+            "a*?",
+            "a{2}?",
+            "a{02}",
+            "a{2,03}",
+            "a{2147483648}",
+            "a{1,2147483648}",
             "a|b",
             "(a)",
             "(?=a)",
-            "[a-z]",
-            "[^ab]",
             "[]",
+            "[^]",
             ".",
-            r"\w",
-            r"[\d]",
+            r"[\/-0]",
+            r"[a\-z]",
             r"\x61",
             r"\1",
             "é",
