@@ -30,9 +30,14 @@ baseline and full-suite retry on a failed selected-file baseline, as in the
 Dealyv adapter. Actual mutant runs retain the existing runner's process isolation,
 activation, output parsing, timeout, and result classification.
 
-The consumer patches and executable qualification are under
-`artifacts/bun-execution-acceleration/consumer/` and `fixture/`. They are parent
-applied artifacts, outside the npm package. No Dealyv worktree is edited.
+The repaired task-local consumer patch is
+`artifacts/bun-execution-acceleration/review-repairs-r1/consumer/combined.patch`;
+its executable qualification is under
+`artifacts/bun-execution-acceleration/review-repairs-r1/fixture/`.
+The earlier `artifacts/bun-execution-acceleration/consumer/` and `fixture/`
+directories contain historical V1 evidence, superseded by the repaired patch.
+These ignored, parent-applied artifacts are outside the npm package. No Dealyv
+worktree is edited.
 
 ## Qualification is explicit
 
