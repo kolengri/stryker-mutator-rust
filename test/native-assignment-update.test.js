@@ -356,6 +356,6 @@ test('all 17 registry mutators are accounted for at the accepted grammar boundar
   assert.deepEqual(call.actual.mutants.map(m=>m.mutatorName),['CallExpression']);
   runtime(pair, 'let a=0,b=2;const obj={x:4,trim(){events.push("trim");return 3;}};function foo(x){events.push(x);}', '[calc(),calc()]', '[typeof a,b]');
   // The old range fixture has full-record/runtime proof in native-regex-extensions.test.js.
-  // The exact old group source is retained in native-regex-groups.test.js.
-  await fallback('a = /(?<capture>a)/;');
+  // Exact old group sources are retained in the groups and named-references Regex suites.
+  await fallback('a = /(?<capture>)/;');
 });

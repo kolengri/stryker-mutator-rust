@@ -357,9 +357,23 @@ remain opaque, matching upstream's skipped subtree. Generic calls retain type
 arguments in original code and drop them only in the replacements reconstructed
 by upstream. Statement-call filtering preserves the pinned TS skip behavior.
 `.ts`, `.mts`, `.cts` and their declaration extensions use the same runtime
-parsing policy as the reference instrumenter. `satisfies`,
-angle-bracket assertions, typed updates/iteration targets,
-TSX and unproven typed replacement printing still require fallback.
+parsing policy as the reference instrumenter. Ordinary expression-context
+`satisfies` and angle-bracket assertions traverse their inner expressions;
+`as` remains opaque. Assertion types retain their source bytes, including inert
+literal types and skipped annotation subtrees. Reachable boolean, unary and
+template literal types that cause pinned upstream placement errors still require
+fallback, as do assertion-wrapped assignment, update and iteration targets.
+Cloned assertions support proven simple types and generated operand grouping.
+Native instrumentation retains parentheses where dropping them changes the
+original expression's binding or coercion order, including awaited operands.
+This deliberately corrects a
+pinned upstream generator defect: `(<number>(a & b)) + 1` with `a=4,b=2` evaluates
+to `1`, while upstream's printed output evaluates to `0`. The corresponding
+arithmetic replacement is honestly reported as `<number> (a & b) - 1`; all other
+mutant fields retain the reference contract. Complex assertion types, nested
+`satisfies` clones, nested-angle binary clones and mixed nullish/logical clone
+grammar remain conservative boundaries. TSX angle brackets retain their existing
+JSX ambiguity, and other unproven typed replacement printing requires fallback.
 Runtime TypeScript namespaces preserve executable exports and initialization in
 source order, including merged and nested namespaces. Their module bodies are
 statement lists without a BlockStatement removal mutant. Ambient declarations and
@@ -402,8 +416,8 @@ Parenthesized optional-chain operands on a callee/object spine require fallback;
 parentheses around an entire optional expression remain supported.
 Non-null private/super combinations and unsupported delete argument shapes also
 require fallback.
-Regex literals support a bounded subset with non-Unicode flags (`g`, `i`, `m`,
-`s`, `d`, `y`, in their original order): start/end and word-boundary assertions, wildcard dot,
+Regex literals support a bounded subset with flags `g`, `i`, `m`, `s`, `d`, `y`,
+`u` in their original order: start/end and word-boundary assertions, wildcard dot,
 ASCII letters, digits, spaces, underscores and hyphens, escaped slashes and
 backslashes, positive/negative printable ASCII character classes with literal
 ranges and predefined members (`\d`, `\D`, `\w`, `\W`, `\s`, `\S`), those same
@@ -411,13 +425,20 @@ standalone predefined classes, ordinary capturing/noncapturing groups and
 alternation (including nested combinations and empty alternatives), ordinary positive/negative
 lookahead and lookbehind over supported operands, and greedy or lazy
 `?`, `+`, `*`, `{n}`, `{n,}`, `{n,m}` quantifiers on atoms, groups and lookahead.
+Named groups and references accept decoded ASCII identifier names
+(`[A-Za-z_$][A-Za-z0-9_$]*`), including Unicode escapes spelling those names.
+Numeric backreferences use the total capture count, including forward references
+and captures in lookbehind. Disjoint-alternative duplicate names are supported
+when Oxc accepts them. The `u` flag admits the same proven operands without
+extending support to Unicode properties or arbitrary Unicode escapes.
 Counts must use canonical decimal spelling and fit signed 32-bit
 integers, matching weapon-regex 2.0.6's parser. Native mutations preserve upstream
 ordering, duplicates, raw flag order and stateful regex initialization behavior.
 Empty groups and lookarounds (`()`, `(?:)`, `(?=)`, `(?!)`, `(?<=)`, `(?<!)`) retain weapon's parser diagnostics through fallback;
 root patterns whose mutations emit an invalid empty `//` literal also stay upstream.
-Unicode flags (`u`/`v`), empty classes, escaped range endpoints, named/modifier
-groups, backreferences, noncanonical/overflow counts, other escapes and unproven forms trigger
+The `v` flag, empty classes, escaped range endpoints, modifier groups, non-ASCII
+name values, legacy decimal/octal character escapes, noncanonical/overflow counts,
+other escapes and unproven forms trigger
 whole-batch fallback even when Regex is excluded or ignored, as do string-pattern
 `new RegExp` calls. This is a bounded level-one port, not full Regex compatibility.
 Private methods/accessors, optional private members, decorators, auto-accessors,

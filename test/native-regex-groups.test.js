@@ -325,14 +325,15 @@ test('mixed JS/TS parallel emission and actual relocation recovery retain ordere
 });
 
 test('empty groups, root-empty mutations and unsupported siblings preserve atomic fallback and exact diagnostics', async () => {
+  // Exact admitted name/reference/u sources remain positive witnesses in native-regex-named-references.test.js.
   const unsupported = ['()', '(?:)', '(())', '(?:())', '()|a', 'a|(?:)', '()?',
-    '^|', '|^', '$|', '|$', '(?<capture>a)', '(?=)', '(?!)', '(?<=)', '(?<!)',
-    String.raw`(a)\1`, String.raw`(a|\x61)`, '(a|[]).', '(a){02}?', '(?:a){2147483648}?'];
+    '^|', '|^', '$|', '|$', '(?<capture>)', '(?=)', '(?!)', '(?<=)', '(?<!)',
+    String.raw`(a)\01`, String.raw`(a|\x61)`, '(a|[]).', '(a){02}?', '(?:a){2147483648}?'];
   for (const pattern of ['()', '(?:)', '(())', '(?:())', '()|a', 'a|(?:)', '()?']) {
     assert.throws(() => oracle(pattern), 'weapon rejects a sole empty RE inside a group');
   }
   for (const pattern of ['^|', '|^', '$|', '|$']) assert.deepEqual(oracle(pattern), ['//']);
-  for (const expression of [...unsupported.map(p => `/${p}/`), '/(a|b)/u', '/(a|b)/v',
+  for (const expression of [...unsupported.map(p => `/${p}/`), '/(a|\\x62)/u', '/(a|b)/v',
     '/(?i:a)/', 'new RegExp("(a|b)")']) {
     const files = [file('const before=/(a|[ab]+){1,3}/mi;', 'before.js'),
       file(`const bad=${expression};`, 'unsupported.js'), file('const after=/((a)|b)+/ygd;', 'after.ts')];

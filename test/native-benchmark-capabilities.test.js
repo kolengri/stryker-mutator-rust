@@ -254,7 +254,8 @@ let notes=0;function factory(){return obj;}function f(x){events.push(x(2));}func
 
 test('unproven adjacent grammar still rejects mixed batches even when mutations are pruned or excluded', async () => {
   const unsupported = [
-    'namespace N {export const x=true satisfies boolean;}', 'module Alias {export const x=true;}',
+    // Exact old namespace is qualified in native-ts-assertion-wrappers.test.js.
+    'namespace N {export const x=true satisfies true;}', 'module Alias {export const x=true;}',
     'namespace N {"directive";export const x=true;}',
     'function f(a=1**2){}', 'class C{constructor(public x:number=1**2){}}',
     'function calc(){return flag??new C(1);}', 'function calc(){return flag??new C<T>();}',

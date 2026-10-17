@@ -277,8 +277,8 @@ test('extended regex files retain exact results after parallel relocation recove
 });
 
 test('unproved forms still fall back atomically when ignored, with post-failure native recovery', async () => {
-  // Exact admitted sources retain full-record/runtime proof in the groups and operators suites.
-  const unsupported = ['/a/u','/a/v','/a{02}?/g','/a{2147483648}?/i','/(?<capture>a)/g','/a|(?=)/m','/(?=)/s',
+  // Exact admitted sources retain full-record/runtime proof in the groups, operators and named-references suites.
+  const unsupported = ['/\\x61/u','/a/v','/a{02}?/g','/a{2147483648}?/i','/(?<capture>)/g','/a|(?=)/m','/(?=)/s',
     String.raw`/\1/`, String.raw`/\p{L}/u`, '/é/i', '/[]/g', '/[^]/y', String.raw`/[a\-z]/`,
     String.raw`/[\/-0]/`, '/a{02}/', '/a{2,03}/', '/a{2147483648}/', 'new RegExp("a", "i")'];
   for (const expression of unsupported) {
@@ -302,7 +302,7 @@ test('unproved forms still fall back atomically when ignored, with post-failure 
       } finally {console.error=saved;}
     }
   }
-  for (const expression of ['/a/u', '/a{02}?/g', '/(?<capture>a)/g', '/a{02}/']) {
+  for (const expression of ['/\\x61/u', '/a{02}?/g', '/(?<capture>)/g', '/a{02}/']) {
     const files=[file(`// Stryker disable all: grammar still requires proof
 const ignored=${expression};`)];
     for (const threads of [1,4,'auto']) assert.equal(raw(files,options,threads).supported,false);
@@ -312,7 +312,7 @@ const ignored=${expression};`)];
     assert.equal(auto.stats.fallbackBatches,1);assert.equal(auto.stats.nativeErrors,0);
   }
   const sut=createInstrumenter(logger,{cache:false,engine:'native'});
-  await assert.rejects(sut.instrument([file('const bad=/a/u;')],options), /unsupported/i);
+  await assert.rejects(sut.instrument([file('const bad=/\\x61/u;')],options), /unsupported/i);
   assert.equal(sut.stats.nativeErrors,0);
   const recovered=[file('const recovered=/[^a-z\\w]{1,3}/mi;')];
   assert.deepEqual((await sut.instrument(recovered,options)).mutants,(await new Instrumenter(logger).instrument(recovered,options)).mutants);

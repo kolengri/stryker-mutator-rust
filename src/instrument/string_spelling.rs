@@ -15,12 +15,17 @@
 use oxc_allocator::{Allocator, CloneIn};
 use oxc_ast::ast::{
     ArrowFunctionExpression, AssignmentTarget, AwaitExpression, Expression, NumericLiteral,
-    RegExpFlags, RegExpLiteral, StaticMemberExpression, StringLiteral,
+    RegExpFlags, RegExpLiteral, StaticMemberExpression, StringLiteral, TSSatisfiesExpression,
+    TSTypeAssertion,
 };
 use oxc_ast_visit::{Visit, VisitMut, walk};
 use oxc_codegen::{Codegen, CodegenOptions, Gen, GenExpr, IndentChar};
 use oxc_parser::Parser;
-use oxc_span::{SourceType, Span};
+use oxc_span::{GetSpan, SourceType, Span};
+use oxc_syntax::{
+    operator::BinaryOperator,
+    precedence::{GetPrecedence, Precedence},
+};
 
 use super::printed_arrows;
 
@@ -81,10 +86,33 @@ struct NeedsProtection {
     numbers: bool,
     regexes: bool,
     awaits: usize,
+    assertions: usize,
+    unproven_assertions: bool,
     arrows: printed_arrows::Proof,
 }
 
 impl<'a> Visit<'a> for NeedsProtection {
+    fn visit_ts_satisfies_expression(&mut self, node: &TSSatisfiesExpression<'a>) {
+        self.assertions += 1;
+        self.unproven_assertions |= !super::simple_printed_type(&node.type_annotation)
+            || matches!(
+                node.expression,
+                Expression::TSSatisfiesExpression(_) | Expression::TSAsExpression(_)
+            );
+        walk::walk_ts_satisfies_expression(self, node);
+    }
+
+    fn visit_ts_type_assertion(&mut self, node: &TSTypeAssertion<'a>) {
+        self.assertions += 1;
+        self.unproven_assertions |= !super::simple_printed_type(&node.type_annotation)
+            || matches!(
+                node.expression,
+                Expression::TSSatisfiesExpression(_) | Expression::TSAsExpression(_)
+            )
+            || matches!(&node.expression, Expression::TSTypeAssertion(inner) if matches!(inner.expression, Expression::BinaryExpression(_) | Expression::LogicalExpression(_)));
+        walk::walk_ts_type_assertion(self, node);
+    }
+
     fn visit_await_expression(&mut self, node: &AwaitExpression<'a>) {
         self.awaits += 1;
         walk::walk_await_expression(self, node);
@@ -203,9 +231,140 @@ impl<'a> Visit<'a> for AwaitGroups {
             }
             Expression::UnaryExpression(node) => self.group(&node.argument),
             Expression::ConditionalExpression(node) => self.group(&node.test),
+            Expression::TSSatisfiesExpression(node) => self.group(&node.expression),
+            Expression::TSTypeAssertion(node) => self.group(&node.expression),
             _ => {}
         }
         walk::walk_expression(self, node);
+    }
+}
+
+#[derive(Default)]
+struct AssertionSpelling<'s> {
+    code: &'s str,
+    visited: usize,
+    edits: Vec<(Span, String)>,
+    unproven: bool,
+    preserve_angles: Vec<Span>,
+}
+
+impl AssertionSpelling<'_> {
+    fn preserve_angle(
+        &mut self,
+        child: &Expression<'_>,
+        parent: Precedence,
+        right: bool,
+        coalesce: Option<bool>,
+    ) {
+        let Expression::TSTypeAssertion(assertion) = child else {
+            return;
+        };
+        let Expression::ParenthesizedExpression(group) = &assertion.expression else {
+            return;
+        };
+        let (precedence, mixed_coalesce) = match &group.expression {
+            Expression::BinaryExpression(binary) => (binary.precedence(), false),
+            Expression::LogicalExpression(logical) => (
+                logical.precedence(),
+                coalesce.is_some_and(|parent| {
+                    parent != (logical.operator == oxc_syntax::operator::LogicalOperator::Coalesce)
+                }),
+            ),
+            _ => return,
+        };
+        // Mixed nullish/logical clones are a separate, unqualified grammar seam.
+        if mixed_coalesce {
+            self.unproven = true;
+            return;
+        }
+        // Preserve Oxc's necessary delimiters where Babel's missing assertion
+        // parent rule changes the erased expression tree or coercion order.
+        // Other pinned spelling stays exact.
+        if precedence < parent
+            || (precedence == parent
+                && coalesce.is_none()
+                && right != parent.is_right_associative())
+        {
+            self.preserve_angles.push(assertion.span);
+        }
+    }
+
+    fn operand(&mut self, node: &Expression<'_>, angle: bool) {
+        let Expression::ParenthesizedExpression(group) = node else {
+            return;
+        };
+        // Babel's BinaryLike rule uses comparison precedence for satisfies,
+        // but has no binary/logical operand grouping rule for TSTypeAssertion.
+        // Remove only the generator-owned delimiters proved by this parsed AST.
+        let remove = match &group.expression {
+            Expression::BinaryExpression(binary) => {
+                angle
+                    || !(binary.operator.is_equality()
+                        || matches!(
+                            binary.operator,
+                            BinaryOperator::BitwiseOR
+                                | BinaryOperator::BitwiseXOR
+                                | BinaryOperator::BitwiseAnd
+                        ))
+            }
+            Expression::LogicalExpression(_) => angle,
+            _ => false,
+        };
+        if remove {
+            let span = group.span;
+            self.unproven |= self.code.get(span.start as usize..span.start as usize + 1)
+                != Some("(")
+                || self.code.get(span.end as usize - 1..span.end as usize) != Some(")");
+            self.edits
+                .push((Span::new(span.start, span.start + 1), String::new()));
+            self.edits
+                .push((Span::new(span.end - 1, span.end), String::new()));
+        }
+    }
+}
+
+impl<'a> Visit<'a> for AssertionSpelling<'_> {
+    fn visit_expression(&mut self, node: &Expression<'a>) {
+        match node {
+            Expression::BinaryExpression(binary) => {
+                self.preserve_angle(&binary.left, binary.precedence(), false, None);
+                self.preserve_angle(&binary.right, binary.precedence(), true, None);
+            }
+            Expression::LogicalExpression(logical) => {
+                let coalesce =
+                    Some(logical.operator == oxc_syntax::operator::LogicalOperator::Coalesce);
+                self.preserve_angle(&logical.left, logical.precedence(), false, coalesce);
+                self.preserve_angle(&logical.right, logical.precedence(), true, coalesce);
+            }
+            Expression::UnaryExpression(unary) => {
+                self.preserve_angle(&unary.argument, Precedence::Prefix, true, None)
+            }
+            Expression::AwaitExpression(awaited) => {
+                self.preserve_angle(&awaited.argument, Precedence::Prefix, true, None)
+            }
+            _ => {}
+        }
+        walk::walk_expression(self, node);
+    }
+
+    fn visit_ts_satisfies_expression(&mut self, node: &TSSatisfiesExpression<'a>) {
+        self.visited += 1;
+        self.operand(&node.expression, false);
+        walk::walk_ts_satisfies_expression(self, node);
+    }
+
+    fn visit_ts_type_assertion(&mut self, node: &TSTypeAssertion<'a>) {
+        self.visited += 1;
+        let gap = Span::new(
+            node.type_annotation.span().end,
+            node.expression.span().start,
+        );
+        self.unproven |= self.code.get(gap.start as usize..gap.end as usize) != Some(">");
+        self.edits.push((gap, "> ".into()));
+        if !self.preserve_angles.contains(&node.span) {
+            self.operand(&node.expression, true);
+        }
+        walk::walk_ts_type_assertion(self, node);
     }
 }
 
@@ -279,9 +438,15 @@ fn restore(
     numbers: Vec<String>,
     arrows: printed_arrows::Proof,
     awaits: usize,
+    assertions: usize,
 ) -> Result<String, String> {
     arrows.check()?;
-    if spellings.is_empty() && numbers.is_empty() && arrows.is_empty() && awaits == 0 {
+    if spellings.is_empty()
+        && numbers.is_empty()
+        && arrows.is_empty()
+        && awaits == 0
+        && assertions == 0
+    {
         return Ok(code);
     }
     let allocator = Allocator::default();
@@ -356,6 +521,17 @@ fn restore(
         }
         edits.extend(groups.edits);
     }
+    if assertions > 0 {
+        let mut spelling = AssertionSpelling {
+            code: &code,
+            ..AssertionSpelling::default()
+        };
+        spelling.visit_expression(&expression);
+        if spelling.visited != assertions || spelling.unproven {
+            return Err("Assertion spelling requires proven generated wrapper ranges".into());
+        }
+        edits.extend(spelling.edits);
+    }
     edits.sort_unstable_by_key(|(span, _)| span.start);
     let mut result = String::new();
     let mut start = 0;
@@ -376,6 +552,9 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
     let mut needs_protection = NeedsProtection::default();
     needs_protection.visit_expression(node);
     needs_protection.arrows.check()?;
+    if needs_protection.unproven_assertions {
+        return Err("Complex or nested satisfies types inside cloned replacements require upstream formatting".into());
+    }
     if !needs_protection.strings && !needs_protection.numbers && !needs_protection.regexes {
         let mut generator = generator().with_source_text(source);
         generator.print_expression(node);
@@ -385,6 +564,7 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
             vec![],
             needs_protection.arrows,
             needs_protection.awaits,
+            needs_protection.assertions,
         );
     }
     let allocator = Allocator::default();
@@ -403,6 +583,7 @@ pub(super) fn expression(node: &Expression<'_>, source: &str) -> Result<String, 
         protect.numbers,
         needs_protection.arrows,
         needs_protection.awaits,
+        needs_protection.assertions,
     )
 }
 
@@ -413,6 +594,9 @@ pub(super) fn assignment_target(
     let mut needs_protection = NeedsProtection::default();
     needs_protection.visit_assignment_target(node);
     needs_protection.arrows.check()?;
+    if needs_protection.unproven_assertions {
+        return Err("Complex or nested satisfies types inside cloned replacements require upstream formatting".into());
+    }
     if !needs_protection.strings && !needs_protection.numbers && !needs_protection.regexes {
         let mut generator = generator().with_source_text(source);
         node.print(&mut generator, oxc_codegen::Context::empty());
@@ -422,6 +606,7 @@ pub(super) fn assignment_target(
             vec![],
             needs_protection.arrows,
             needs_protection.awaits,
+            needs_protection.assertions,
         );
     }
     let allocator = Allocator::default();
@@ -440,6 +625,7 @@ pub(super) fn assignment_target(
         protect.numbers,
         needs_protection.arrows,
         needs_protection.awaits,
+        needs_protection.assertions,
     )
 }
 
@@ -447,6 +633,60 @@ pub(super) fn assignment_target(
 mod tests {
     use super::*;
     use oxc_ast::builder::AstBuilder;
+
+    #[test]
+    fn assertion_clone_spelling_uses_generated_ast_ranges_and_keeps_raw_literals() {
+        for (source, expected) in [
+            ("(<number>a) - b", "<number> a - b"),
+            ("(<number>(a + b)) / 2", "<number> (a + b) / 2"),
+            (
+                "((a + b) satisfies number) - 1",
+                "(a + b satisfies number) - 1",
+            ),
+            (
+                "((a > b) satisfies boolean) || true",
+                "a > b satisfies boolean || true",
+            ),
+            (
+                "((a === b) satisfies boolean) || true",
+                "(a === b) satisfies boolean || true",
+            ),
+            (
+                "((a & b) satisfies number) - 1",
+                "((a & b) satisfies number) - 1",
+            ),
+            ("(<number>(a && b)) - 1", "<number> (a && b) - 1"),
+            ("(<number>(a & b)) - 1", "<number> (a & b) - 1"),
+            ("a + (<number>(b + c))", "a + <number> (b + c)"),
+            ("(<number>(a + b)) - c", "<number> a + b - c"),
+            ("(<number><number>a) - b", "<number> <number> a - b"),
+            ("(<number>0xff) - 1_000", "<number> 0xff - 1_000"),
+            (
+                "(<RegExp>/a/mi).test('raw')",
+                "(<RegExp> /a/mi).test('raw')",
+            ),
+            (
+                "((await x) satisfies number) - 1",
+                "((await x) satisfies number) - 1",
+            ),
+            ("(<number>(await x)) - 1", "<number> (await x) - 1"),
+            ("await <number>(a & b)", "await <number> (a & b)"),
+            ("await <number>(a + b)", "await <number> (a + b)"),
+            ("await <number>(a ** b)", "await <number> (a ** b)"),
+        ] {
+            let allocator = Allocator::default();
+            let node = Parser::new(&allocator, source, SourceType::ts().with_module(true))
+                .with_options(oxc_parser::ParseOptions {
+                    preserve_parens: false,
+                    ..Default::default()
+                })
+                .parse_expression()
+                .unwrap();
+            assert_eq!(expression(&node, source).unwrap(), expected, "{source}");
+        }
+        assert!(restore("x".into(), vec![], vec![], Default::default(), 0, 1).is_err());
+        assert!(restore("<number>x".into(), vec![], vec![], Default::default(), 0, 2).is_err());
+    }
 
     #[test]
     fn raw_regex_flags_share_occurrence_markers_with_other_literals() {
@@ -527,6 +767,7 @@ mod tests {
                     vec![],
                     vec!["0xff".into()],
                     Default::default(),
+                    0,
                     0
                 )
                 .is_err(),
@@ -562,8 +803,8 @@ mod tests {
                 "{source}"
             );
         }
-        assert!(restore("await x".into(), vec![], vec![], Default::default(), 2).is_err());
-        assert!(restore("x".into(), vec![], vec![], Default::default(), 1).is_err());
+        assert!(restore("await x".into(), vec![], vec![], Default::default(), 2, 0).is_err());
+        assert!(restore("x".into(), vec![], vec![], Default::default(), 1, 0).is_err());
     }
 
     fn arrow_proof(source: &str) -> printed_arrows::Proof {
@@ -591,7 +832,7 @@ mod tests {
             ("é(`😀(x) => x`, (x) => x)", "é(`😀(x) => x`, x => x)"),
         ] {
             assert_eq!(
-                restore(source.into(), vec![], vec![], arrow_proof(source), 0).unwrap(),
+                restore(source.into(), vec![], vec![], arrow_proof(source), 0, 0).unwrap(),
                 expected
             );
         }
@@ -612,7 +853,15 @@ mod tests {
             "f(`(x) => x`)",
         ] {
             assert!(
-                restore(code.into(), vec![], vec![], arrow_proof("f((x) => x)"), 0).is_err(),
+                restore(
+                    code.into(),
+                    vec![],
+                    vec![],
+                    arrow_proof("f((x) => x)"),
+                    0,
+                    0
+                )
+                .is_err(),
                 "{code}"
             );
         }
@@ -622,6 +871,7 @@ mod tests {
                 vec![],
                 vec![],
                 arrow_proof("f(async (x) => x)"),
+                0,
                 0
             )
             .is_err()
@@ -794,6 +1044,7 @@ mod tests {
                     vec!["'original'".into()],
                     vec![],
                     Default::default(),
+                    0,
                     0
                 ),
                 Err(UNPROVEN.into())
@@ -810,6 +1061,7 @@ mod tests {
                 vec!["'\\x61'".into(), "\"a\"".into()],
                 vec![],
                 Default::default(),
+                0,
                 0
             )
             .unwrap(),

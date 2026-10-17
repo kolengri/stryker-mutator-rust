@@ -7,9 +7,13 @@
 //! ordinary capturing/noncapturing groups and lookarounds, plus dot and word
 //! boundaries. Empty alternatives are allowed, but empty groups/lookarounds
 //! and mutations producing an empty root literal stay upstream (weapon
-//! rejects the former and Stryker emits invalid `//` for the latter). Non-Unicode
-//! flags g/i/m/s/d/y preserve their original order. Named/modifier groups, escapes,
-//! Unicode flags and unproven quantifiers reject the entire batch, including
+//! rejects the former and Stryker emits invalid `//` for the latter). Named
+//! groups/references use ASCII identifier values, including Oxc-validated Unicode
+//! escapes spelling those values. Actual numeric backreferences use Oxc's capture
+//! counting, including forward references; legacy decimal/octal character escapes
+//! remain unsupported. Flags g/i/m/s/d/y/u preserve their original order. The u
+//! flag admits only these same canonical operands, not additional Unicode syntax.
+//! Modifier groups, other escapes, v and unproven quantifiers reject the batch, including
 //! when Regex is ignored. Do not infer support from
 //! Oxc accepting a pattern: its grammar is broader than this port's proof.
 //!
@@ -36,6 +40,19 @@ struct Proven<'a> {
 }
 
 impl Proven<'_> {
+    fn name(name: &str) -> bool {
+        // Weapon's ParserJS.groupName accepts these ID_Start/ID_Continue values
+        // literally or as Unicode escapes, retaining their *raw* spelling via
+        // `.string`. Oxc has already decoded and validated the name. Restrict the
+        // value to ASCII to avoid differences between their Unicode ID tables;
+        // span edits preserve escaped names without decoding or printing them.
+        let mut bytes = name.bytes();
+        bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$'))
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$'))
+    }
+
     fn text(&self, span: Span) -> Result<&str, String> {
         span.start
             .checked_sub(self.offset)
@@ -155,8 +172,26 @@ impl Proven<'_> {
                 self.quantifier(quantifier)?;
                 self.validate(&quantifier.body)
             }
-            Term::CapturingGroup(group) if group.name.is_none() => {
+            Term::CapturingGroup(group)
+                if group
+                    .name
+                    .as_ref()
+                    .is_none_or(|name| Self::name(name.as_str())) =>
+            {
                 self.validate_disjunction(&group.body)
+            }
+            Term::NamedReference(reference) if Self::name(reference.name.as_str()) => Ok(()),
+            Term::IndexedReference(reference)
+                if reference.index > 0
+                    && self.text(reference.span)? == format!(r"\{}", reference.index) =>
+            {
+                // ParserJS uses charOct (one to three raw decimal digits), not
+                // Parser.numReference. Further digits are inert literal leaves.
+                // Neither leaf has a level-one rule, so even a longer actual
+                // backreference rebuilds identically; quantifier removal edits
+                // the same suffix. Oxc distinguishes these from Annex-B escapes
+                // using the total capture count, including later/lookbehind groups.
+                Ok(())
             }
             Term::IgnoreGroup(group) if group.modifiers.is_none() => {
                 self.validate_disjunction(&group.body)
@@ -327,7 +362,7 @@ pub(super) fn mutate(literal: &RegExpLiteral<'_>) -> Result<Vec<String>, String>
         .and_then(|raw| raw.strip_prefix(text))
         .and_then(|raw| raw.strip_prefix('/'))
         .ok_or(UNSUPPORTED)?;
-    if !flags.bytes().all(|flag| b"gimsdy".contains(&flag)) {
+    if !flags.bytes().all(|flag| b"gimsdyu".contains(&flag)) {
         return Err(UNSUPPORTED.into());
     }
     let pattern = literal.regex.pattern.pattern.as_ref().ok_or(UNSUPPORTED)?;
@@ -347,12 +382,16 @@ mod tests {
     use super::*;
 
     fn mutations(text: &str) -> Result<Vec<String>, String> {
+        mutations_with_flags(text, "")
+    }
+
+    fn mutations_with_flags(text: &str, flags: &str) -> Result<Vec<String>, String> {
         let allocator = Allocator::default();
         // Nonzero offsets exercise the parser-owned source coordinates.
         let pattern = LiteralParser::new(
             &allocator,
             text,
-            Some(""),
+            Some(flags),
             Options {
                 pattern_span_offset: 37,
                 ..Options::default()
@@ -363,7 +402,7 @@ mod tests {
         Proven {
             text,
             offset: 37,
-            flags: "",
+            flags,
         }
         .mutate(&pattern)
     }
@@ -546,6 +585,78 @@ mod tests {
     }
 
     #[test]
+    fn named_groups_references_and_escaped_ascii_names_keep_raw_spelling() {
+        // Exact old negative remains an affirmative zero-mutant witness.
+        assert!(mutations("(?<capture>a)").unwrap().is_empty());
+        assert_eq!(
+            mutations_with_flags(r"^(?<\u0061>[ab]+)\k<\u{61}>$", "uydg").unwrap(),
+            [
+                r"/(?<\u0061>[ab]+)\k<\u{61}>$/uydg",
+                r"/^(?<\u0061>[ab]+)\k<\u{61}>/uydg",
+                r"/^(?<\u0061>[ab])\k<\u{61}>$/uydg",
+                r"/^(?<\u0061>[^ab]+)\k<\u{61}>$/uydg",
+            ]
+        );
+        assert_eq!(
+            mutations(r"(?<word>^)\k<word>").unwrap(),
+            [r"/(?<word>)\k<word>/"]
+        );
+        assert_eq!(
+            mutations(r"(?<word>a+)|(?<word>b+)").unwrap(),
+            [r"/(?<word>a)|(?<word>b+)/", r"/(?<word>a+)|(?<word>b)/"]
+        );
+    }
+
+    #[test]
+    fn actual_numeric_references_use_total_capture_count_and_keep_weapon_leaf_spelling() {
+        assert_eq!(
+            mutations_with_flags(r"\2(a+)(b)", "u").unwrap(),
+            [r"/\2(a)(b)/u"]
+        );
+        assert_eq!(
+            mutations(r"(?<=(a+))(b)\2\1").unwrap(),
+            [r"/(?<!(a+))(b)\2\1/", r"/(?<=(a))(b)\2\1/"]
+        );
+        for count in [1, 9, 10, 12, 99, 100, 1000] {
+            let body = format!(r"{}\{count}", "(a)".repeat(count));
+            assert_eq!(
+                mutations_with_flags(&format!("{body}+"), "u").unwrap(),
+                [format!("/{body}/u")]
+            );
+        }
+        for text in [r"\1", r"(a)\12+", r"\8+", r"\01+", r"[\1]"] {
+            assert!(
+                mutations(text).is_err(),
+                "legacy numeric character escape: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn unicode_mode_keeps_canonical_operands_and_rejects_additional_unicode_syntax() {
+        assert!(mutations_with_flags("a", "u").unwrap().is_empty());
+        assert_eq!(
+            mutations_with_flags(r"^[a-z\d]+.$", "u").unwrap(),
+            [
+                r"/[a-z\d]+.$/u",
+                r"/^[a-z\d]+./u",
+                r"/^[a-z\d].$/u",
+                r"/^[^a-z\d]+.$/u",
+                r"/^[a-z\D]+.$/u"
+            ]
+        );
+        for text in [
+            r"\p{L}+",
+            r"\u{1F600}+",
+            r"(?<\u00e9>a+)",
+            "(?<é>a+)",
+            r"(?<a>a)\k<missing>",
+        ] {
+            assert!(mutations_with_flags(text, "u").is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn broader_parser_grammar_does_not_imply_eligibility() {
         for text in [
             "",
@@ -558,7 +669,7 @@ mod tests {
             "a{2147483648}",
             "a{1,2147483648}",
             "a|(?=)",
-            "(?<capture>a)",
+            "(?<capture>)",
             "(?=)",
             "(?i:a)",
             "()",

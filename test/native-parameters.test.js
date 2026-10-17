@@ -401,8 +401,8 @@ test('unproven parameter patterns and existing grammar and printer boundaries re
     'class C{constructor(@dec public a=true){}}', 'class C{constructor(override a=true){}}',
     'class C{m(public a=true){}}', 'function f(a /* comment */=true){}',
     'function f(a=true){"use strict";}', 'function f(a=true){"directive";return a;}',
-    // Keep the exact old empty-body fixture in native-regex-groups.test.js.
-    'function f(a=/(?<capture>a)/){}',
+    // Exact old empty-body fixtures remain in the groups and named-references Regex suites.
+    'function f(a=/(?<capture>)/){}',
     'function f(a=1**2){}', 'function f(a=[...items]){}', 'function f(...rest){return obj.g(...rest);}',
     'const f=((a=true)=>a)+1;', 'for(;;){const f=(a=true)=>a;break;}',
     'function f(a=1_000+2n){}', 'function f(a=true){try{return a;}catch({message}){}}', 'function f(a=new.target){}',

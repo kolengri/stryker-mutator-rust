@@ -603,9 +603,15 @@ fn instrument_program_inner(
     if source.len() > u32::MAX as usize {
         return Err("Source exceeds 32-bit span limits".into());
     }
-    // Babel uses the TS parser for declaration extensions too, without Oxc's
-    // ambient-definition restrictions on otherwise ordinary runtime statements.
-    let source_type = source_type.with_typescript(source_type.is_typescript());
+    // Babel's ignoreExtensions TS preset uses the same runtime grammar for
+    // .ts/.mts/.cts and declaration files. In particular it does not enable
+    // Oxc's extension-specific ban on angle assertions in .mts/.cts. Keep the
+    // distinct TSX policy while removing only those TS filename restrictions.
+    let source_type = if source_type.is_typescript() {
+        SourceType::ts().with_jsx(source_type.is_jsx())
+    } else {
+        source_type
+    };
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type.with_module(true))
         .with_options(ParseOptions {
@@ -824,6 +830,49 @@ impl<'a> Visit<'a> for LeafJsx {
 #[derive(Default)]
 struct ReservedBindings {
     found: bool,
+}
+
+// These wrappers are runtime expressions in Babel, unlike its opaque `as`
+// subtree. Their types are not uniformly opaque: reachable boolean, unary and
+// template literal types can produce invalid Babel placements. Validate the
+// inert subset and retain actual skipped-node effects on the call filter.
+#[derive(Default)]
+struct AssertionType {
+    unsupported: bool,
+    skips: usize,
+}
+
+impl<'a> Visit<'a> for AssertionType {
+    fn visit_ts_type_annotation(&mut self, _: &TSTypeAnnotation<'a>) {
+        self.skips += 1;
+    }
+
+    fn visit_ts_type_parameter_declaration(&mut self, _: &TSTypeParameterDeclaration<'a>) {
+        self.skips += 1;
+    }
+
+    fn visit_ts_type_parameter_instantiation(&mut self, _: &TSTypeParameterInstantiation<'a>) {
+        self.skips += 1;
+    }
+
+    fn visit_ts_literal_type(&mut self, node: &TSLiteralType<'a>) {
+        self.unsupported |= !matches!(
+            node.literal,
+            TSLiteral::NumericLiteral(_)
+                | TSLiteral::StringLiteral(_)
+                | TSLiteral::BigIntLiteral(_)
+        );
+    }
+
+    fn visit_ts_template_literal_type(&mut self, _: &TSTemplateLiteralType<'a>) {
+        self.unsupported = true;
+    }
+
+    fn visit_string_literal(&mut self, _: &StringLiteral<'a>) {
+        // Quoted signature keys and import-type arguments are not protected by
+        // StringLiteral's TSLiteralType parent exclusion in the pinned mutator.
+        self.unsupported = true;
+    }
 }
 
 impl<'a> Visit<'a> for ReservedBindings {
@@ -1488,6 +1537,20 @@ impl Emitter<'_, '_> {
             return Err("JSX inside cloned replacements requires upstream formatting".into());
         }
         string_spelling::expression(node, self.source)
+    }
+
+    fn assertion_type(&mut self, node: &TSType<'_>) -> Result<(), String> {
+        let mut proof = AssertionType::default();
+        proof.visit_ts_type(node);
+        if proof.unsupported {
+            return Err(
+                "TypeScript assertion type literals require upstream mutation placement".into(),
+            );
+        }
+        if !self.pruned {
+            self.ts_skip_generation += proof.skips;
+        }
+        Ok(())
     }
 
     fn changed(
@@ -2159,6 +2222,22 @@ impl Emitter<'_, '_> {
                 edits.push((non_null.expression.span(), self.chain_child(&non_null.expression, Context {
                     printed_ancestor: context.printed_ancestor, ..Context::default()
                 }, pending)?));
+            }
+            Expression::TSSatisfiesExpression(assertion) => {
+                // Neither wrapper joins Babel's call/member/non-null spine.
+                // Place inner candidates at their own expression boundary and
+                // reset predicate/string-parent context at this real AST node.
+                edits.push((assertion.expression.span(), self.expression(&assertion.expression, Context {
+                    printed_ancestor: context.printed_ancestor, ..Context::default()
+                })?));
+                self.assertion_type(&assertion.type_annotation)?;
+            }
+            Expression::TSTypeAssertion(assertion) => {
+                self.assertion_type(&assertion.type_annotation)?;
+                let rendered = self.expression(&assertion.expression, Context {
+                    printed_ancestor: context.printed_ancestor, ..Context::default()
+                })?;
+                edits.push((assertion.expression.span(), rendered));
             }
             Expression::AssignmentExpression(assignment) => {
                 let target = assignment.left.as_simple_assignment_target().ok_or("Destructuring assignment targets require upstream instrumentation")?;

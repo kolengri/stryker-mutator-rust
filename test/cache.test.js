@@ -243,9 +243,19 @@ test('cache I/O errors and diagnostic callback failures do not affect execution'
   const { directory } = await context(t);
   const path = join(directory, 'file');
   await writeFile(path, 'not a directory');
-  const sut = createInstrumenter(logger, { cacheDir: join(path, 'nested'), onEvent() { throw new Error('observer'); } });
-  assert.deepEqual(await sut.instrument(files, options), await new Instrumenter(logger).instrument(files, options));
-  assert.ok(sut.stats.errors > 0);
+  const reference = await new Instrumenter(logger).instrument(files, options);
+  for (const engine of ['auto', 'upstream']) {
+    const baseline = createInstrumenter(logger, { cache: false, engine });
+    const expected = await baseline.instrument(files, options);
+    const sut = createInstrumenter(logger, { engine, cacheDir: join(path, 'nested'), onEvent() { throw new Error('observer'); } });
+    const actual = await sut.instrument(files, options);
+    assert.deepEqual(actual, expected, `${engine}: cache and callback failures preserve the complete engine result`);
+    assert.deepEqual(actual.mutants, reference.mutants, `${engine}: complete ordered upstream records`);
+    assert.deepEqual(actual.files.map(({ content, ...rest }) => rest), reference.files.map(({ content, ...rest }) => rest));
+    assert.equal(sut.stats.nativeBatches, baseline.stats.nativeBatches);
+    assert.equal(sut.stats.fallbackBatches, baseline.stats.fallbackBatches);
+    assert.ok(sut.stats.errors > 0);
+  }
 });
 
 test('Babel config bypass does not execute config twice or reuse dynamic output', async (t) => {

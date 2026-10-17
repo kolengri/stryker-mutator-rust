@@ -312,10 +312,11 @@ test('mixed JS/TS large-first/small-next batches actually spawn and recover relo
 });
 
 test('unproven operands remain atomic even ignored or excluded and retain exact upstream diagnostics', async () => {
+  // Exact admitted name/reference/u sources remain positive witnesses in native-regex-named-references.test.js.
   const unsupported = ['(?=)', '(?!)', '(?<=)', '(?<!)', '(?=())', '(?![])', '(?<=é)',
-    String.raw`(?=\x61)`, String.raw`(?=(a)\1)`, '(?<capture>a)', '(?i:a)',
+    String.raw`(?=\x61)`, String.raw`(?=(a)\01)`, '(?<capture>)', '(?i:a)',
     'a{02}?', 'a{2,03}?', 'a{2147483648}?', 'a{0,2147483648}?', '^|', '|$'];
-  for (const expression of [...unsupported.map(p => `/${p}/`), '/(?=a)/u', '/(?=a)/v', 'new RegExp("(?=a)")']) {
+  for (const expression of [...unsupported.map(p => `/${p}/`), '/(?=\\x61)/u', '/(?=a)/v', 'new RegExp("(?=a)")']) {
     const files = [file(`const before=${clonedLiteral};`, 'before.js'), file(`const bad=${expression};`, 'bad.js'),
       file('const after=/(?<=a).+?/yd;', 'after.ts')];
     const ignored = [file(`// Stryker disable all: operands still require proof\nconst bad=${expression};`)];
