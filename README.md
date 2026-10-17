@@ -38,6 +38,11 @@ establish Windows runtime support.
 The corresponding API is `runNativeMutationTest({ cwd, args, overrides }, { signal })`
 from `stryker-mutator-rust/native`. Cancellation settles only after native cleanup.
 
+Opt-in [plan and campaign ETA](docs/eta.md) adds a Rust estimator, the
+`stryker-mutator-rust/eta` API, and the additive `rust-eta` reporter for Node/Bun
+compatibility runs. Native runs can use `STRYKER_RUST_ETA=1` or `options.eta`.
+Unknown scopes and unmeasured preparation stay explicit; ranges are heuristic.
+
 ## Bun execution
 
 Bun is the primary execution target for new fixtures and performance work. Existing

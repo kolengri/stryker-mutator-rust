@@ -143,6 +143,7 @@ enum Environment {
 }
 
 struct Worker {
+    last_attempts: u32,
     config: Arc<Config>,
     directory: PathBuf,
     descriptions: Arc<Value>,
@@ -164,6 +165,7 @@ impl Worker {
         cancellation: watch::Sender<bool>,
     ) -> Self {
         Self {
+            last_attempts: 0,
             config,
             directory,
             descriptions,
@@ -330,7 +332,9 @@ impl Worker {
 
     async fn run(&mut self, method: &str, options: Value) -> Result<Value, String> {
         let mut last_error = String::new();
+        self.last_attempts = 0;
         for _ in 0..2 {
+            self.last_attempts += 1;
             match self.run_once(method, options.clone()).await {
                 Ok(result) => return Ok(result),
                 Err(BridgeError::Cancelled) => return Err(CANCELLED.into()),
@@ -362,6 +366,7 @@ fn pairs(value: &Value) -> Result<Value, String> {
 struct Plan {
     mutant: Value,
     options: Value,
+    net_ms: f64,
 }
 
 struct Plans {
@@ -500,7 +505,11 @@ fn plans(
         if !decision["hitLimit"].is_null() {
             options["hitLimit"] = decision["hitLimit"].clone();
         }
-        runnable.push(Plan { mutant, options });
+        runnable.push(Plan {
+            mutant,
+            options,
+            net_ms: decision["netTime"].as_f64().expect("planned net time"),
+        });
     }
     runnable.sort_by_key(|plan| plan.options["reloadEnvironment"] == true);
     Ok(Plans {
@@ -573,6 +582,7 @@ pub(super) async fn run(
             if *cancellation.borrow() { return Err(CANCELLED.into()); }
             let stats = &workers[0].stats;
             for sandbox in &mut sandboxes { sandbox.finish(&config); }
+            if let Some(eta) = &config.eta { eta.plan(vec![], 0, gross, vec!["no tests; allowEmpty".into()]); eta.end(); }
             return Ok(json!({"version":1,"supported":true,"exitCode":0,"mutants":[],"stats":{"coordinator":"rust","nativeInstrumentationBatches":usize::from(!project.instrumented.is_empty()),"nativeCoverageBatches":0,"nativePlanningBatches":0,"nativePlannedMutants":0,"compatibilityCalls":stats.calls+2,"metadataWorkerStarts":1,"workerStarts":stats.starts,"workerPids":stats.pids,"workerRestarts":stats.restarts,"maximumConcurrency":0,"sandboxes":sandboxes.len(),"timeouts":stats.timeouts,"outputTruncations":stats.truncations,"capturedOutputBytes":stats.captured_output_bytes,"droppedLogEvents":stats.dropped_events,"cache":"disabled"}}));
         }
         for test in tests.iter_mut() {
@@ -590,6 +600,13 @@ pub(super) async fn run(
             sandboxes.push(Sandbox::create(&config, &project)?);
             workers.push(Worker::new(config.clone(), sandboxes.last().expect("new sandbox").path.clone(), descriptions.clone(), test_files.clone(), cancellation.clone()));
         }
+        if let Some(eta) = &config.eta {
+            eta.plan(queue.iter().map(|plan| crate::eta::Job { id: plan.mutant["id"].as_str().expect("native mutant ID").into(),
+                baseline_ms: Some(plan.net_ms + (gross-net).max(0.0)), timeout_ms: plan.options["timeout"].as_f64(), reload: plan.options["reloadEnvironment"] == true }).collect(),
+                1, gross, vec!["actual native SDK plan; measured wall time includes timeout, reload and recovery".into(),"cold runners enter effective capacity only after initialization".into()]);
+            if worker_count > 1 { eta.capacity(1, vec!["cold worker initialization unmeasured".into()]); }
+        }
+        let ready = Arc::new(AtomicUsize::new(0));
         let queue = Arc::new(Mutex::new(queue));
         let active = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
@@ -601,12 +618,15 @@ pub(super) async fn run(
             let queue = queue.clone(); let cancellation = cancellation.clone();
             let active = active.clone(); let maximum = maximum.clone();
             let initializations = initializations.clone();
+            let ready = ready.clone();
             tasks.spawn(async move {
                 let outcome = async {
                     if worker.session.is_none() {
                         let _permit = initializations.acquire().await.map_err(|error| error.to_string())?;
                         worker.start().await?;
                     }
+                    let runners = ready.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(eta) = &worker.config.eta { eta.capacity(runners, if runners == worker_count {vec![]} else {vec!["cold worker initialization unmeasured".into()]}); }
                     let mut results = Vec::new();
                     loop {
                         if *cancellation.borrow() { return Err(CANCELLED.to_owned()); }
@@ -614,9 +634,14 @@ pub(super) async fn run(
                         plan.options["sandboxFileName"] = json!(worker.directory.join(plan.mutant["fileName"].as_str().expect("native mutant file")));
                         let concurrent = active.fetch_add(1, Ordering::Relaxed) + 1;
                         maximum.fetch_max(concurrent, Ordering::Relaxed);
+                        let eta = worker.config.eta.clone();
+                        let job_id = plan.mutant["id"].as_str().expect("native mutant ID");
+                        let started = Instant::now();
+                        if let Some(eta) = &eta { eta.start(job_id); }
                         let result = worker.run("runner.mutantRun", plan.options).await;
                         active.fetch_sub(1, Ordering::Relaxed);
                         let result = result?;
+                        if let Some(eta) = &eta { eta.finish(job_id, started.elapsed().as_secs_f64()*1000.0, worker.last_attempts, result["status"] == "timeout"); }
                         results.push(completed(plan.mutant, result)?);
                     }
                     Ok::<_, String>(results)
@@ -642,6 +667,7 @@ pub(super) async fn run(
             return Err(if errors.iter().all(|error| error == CANCELLED) { CANCELLED.into() } else { errors.join("; ") });
         }
         if *cancellation.borrow() { return Err(CANCELLED.into()); }
+        if let Some(eta) = &config.eta { eta.end(); }
         results.sort_by_key(|mutant| mutant["id"].as_str().and_then(|id| id.parse::<u64>().ok()).unwrap_or(0));
         let completed = results.into_iter().map(|mutant| report::complete(mutant, None, &config.cwd)).collect::<Vec<_>>();
         let tests = baseline["tests"].as_array().expect("validated tests");

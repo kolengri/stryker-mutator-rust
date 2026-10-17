@@ -7,6 +7,7 @@ fn config(root: &Path) -> Config {
     options["disableTypeChecks"] = false.into();
     options["cleanTempDir"] = "always".into();
     Config {
+        eta: None,
         cwd: root.canonicalize().unwrap(),
         options,
         concurrency: 1,

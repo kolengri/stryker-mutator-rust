@@ -1,6 +1,8 @@
 import { Stryker as UpstreamStryker } from '@stryker-mutator/core';
 import type { Instrumenter, InstrumenterOptions, InstrumentResult, File } from '@stryker-mutator/instrumenter';
 import type { Logger } from '@stryker-mutator/api/logging';
+export { CampaignEta, createEtaIdentity, formatEta } from './eta.js';
+export type { EtaEstimate, EtaPlan, EtaJob, EtaEvent, EtaHistory, EtaIdentityComponents } from './eta.js';
 
 export interface AccelerationStats { hits: number; misses: number; bypasses: number; errors: number; nativeBatches: number; fallbackBatches: number; nativeErrors: number }
 export interface InstrumentationStats {

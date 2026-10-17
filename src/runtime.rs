@@ -202,6 +202,12 @@ async fn run_config(
         sandboxes.push(project::Sandbox::create(&config, &project)?);
         worker_ids.push(worker_id());
     }
+    if let Some(eta) = &config.eta {
+        eta.plan(project.mutants.iter().zip(decisions).filter(|(_, decision)| decision["kind"] != "existing").map(|(mutant, decision)| crate::eta::Job {
+            id: mutant["id"].as_str().expect("native mutant ID").into(),
+            baseline_ms: Some(baseline.duration_ms), timeout_ms: decision["timeout"].as_f64(), reload: true,
+        }).collect(), worker_count, baseline.duration_ms, vec!["actual native command plan; inactive baseline includes process startup".into()]);
+    }
     let mut available: VecDeque<_> = (0..worker_count).collect();
     let mut tasks = JoinSet::new();
     let mut completed = Vec::with_capacity(project.mutants.len());
@@ -222,11 +228,14 @@ async fn run_config(
             let cwd = config.cwd.clone();
             let receiver = cancellation.subscribe();
             let worker_id = worker_ids[worker].clone();
+            let eta = config.eta.clone();
+            if let Some(eta) = &eta { eta.start(mutant["id"].as_str().expect("native mutant ID")); }
             tasks.spawn(async move {
                 let id = mutant["id"].as_str().ok_or("Native mutant has no ID")?;
                 let outcome = process::run(&command, &directory, Some(id), &worker_id, timeout, receiver).await?;
                 let timed_out = outcome.timed_out;
                 let truncated = outcome.truncated;
+                if let Some(eta) = &eta { eta.finish(id, outcome.duration_ms, 1, timed_out); }
                 Ok::<_, String>((worker, report::complete(mutant, Some(outcome), &cwd), timed_out, truncated))
             });
             command_starts += 1;
@@ -251,6 +260,7 @@ async fn run_config(
         });
     }
     if *cancellation.borrow() { return Err("Native mutation run cancelled".into()); }
+    if let Some(eta) = &config.eta { eta.end(); }
     completed.sort_by_key(|mutant| mutant["id"].as_str().and_then(|id| id.parse::<u64>().ok()).unwrap_or(0));
     let report = report::assemble(&config, &project, &completed);
     report::write(&config, &report)?;

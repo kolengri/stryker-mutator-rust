@@ -5,6 +5,7 @@ if (process.argv[2] === '--rust-info') {
   console.log(JSON.stringify(nativeStatus(), null, 2));
 } else if (process.env.STRYKER_RUST_COORDINATOR_ENGINE === 'native') {
   const { runNativeMutationTest } = await import('../lib/runtime.js');
+  const { CampaignEta, formatEta } = await import('../lib/eta.js');
   const args = process.argv.slice(2);
   if (args[0] === 'run') args.shift();
   process.title = 'stryker-rust';
@@ -15,7 +16,11 @@ if (process.argv[2] === '--rust-info') {
   process.on('SIGINT', interrupt);
   process.on('SIGTERM', terminate);
   try {
-    const result = await runNativeMutationTest({ args }, { signal: controller.signal });
+    const eta = process.env.STRYKER_RUST_ETA === '1' ? {
+      campaign: new CampaignEta({ scopes: [{ id: 'run' }] }), scopeId: 'run', intervalMs: 10_000,
+      onEstimate: (estimate) => console.error(`[stryker-rust] ${formatEta(estimate)}`),
+    } : undefined;
+    const result = await runNativeMutationTest({ args }, { signal: controller.signal, eta });
     if (!result.supported) {
       console.error(`[stryker-rust] Native coordinator does not support this run: ${result.reason}`);
       process.exitCode = 2;

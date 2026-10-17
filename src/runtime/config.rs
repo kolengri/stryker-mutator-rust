@@ -26,6 +26,7 @@ fn empty_object() -> Value {
 }
 
 pub(super) struct Config {
+    pub eta: Option<crate::eta::Observer>,
     pub cwd: PathBuf,
     pub options: Value,
     pub concurrency: usize,
@@ -754,6 +755,7 @@ fn finalize(
         .map(|module| module.as_str().expect("plugin string").to_owned())
         .collect();
     Ok(Config {
+        eta: None,
         cwd,
         options,
         concurrency,

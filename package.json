@@ -25,12 +25,21 @@
       "types": "./lib/runtime.d.ts",
       "import": "./lib/runtime.js"
     },
+    "./eta": {
+      "types": "./lib/eta.d.ts",
+      "import": "./lib/eta.js"
+    },
+    "./eta-reporter": {
+      "types": "./lib/eta-reporter.d.ts",
+      "import": "./lib/eta-reporter.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
     "lib",
     "bin",
     "native/*.node",
+    "docs/eta.md",
     "LICENSE",
     "NOTICE",
     "README.md"

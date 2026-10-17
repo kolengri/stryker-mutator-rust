@@ -1,3 +1,5 @@
+import type { CampaignEta, EtaEstimate } from './eta.js';
+
 export interface NativeRunRequest {
   /** Project directory. Executable configs require the caller’s canonical cwd. */
   cwd?: string;
@@ -8,6 +10,10 @@ export interface NativeRunRequest {
 }
 
 export interface NativeRunResult {
+  /** Present only when options.eta was supplied. */
+  eta?: EtaEstimate;
+  /** Observer callback failures never affect mutation results. */
+  etaError?: string;
   version: 1;
   supported: true;
   exitCode: number;
@@ -31,5 +37,5 @@ export interface UnsupportedNativeRun {
  */
 export function runNativeMutationTest(
   request?: NativeRunRequest,
-  options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal; eta?: { campaign: CampaignEta; scopeId: string; beginScope?: boolean; onEstimate?: (estimate: EtaEstimate) => void; intervalMs?: number } },
 ): Promise<NativeRunResult | UnsupportedNativeRun>;

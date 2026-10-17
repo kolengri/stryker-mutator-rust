@@ -1,6 +1,7 @@
 use napi_derive::napi;
 
 mod coverage;
+mod eta;
 mod instrument;
 mod mutations;
 mod planner;

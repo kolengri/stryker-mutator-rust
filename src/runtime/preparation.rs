@@ -196,6 +196,7 @@ pub(super) fn cancel(id: &str) -> bool {
 /// rewritten by the caller. `run` consumes it once; `close` abandons it.
 #[napi]
 pub struct NativePreparation {
+    eta: Option<crate::eta::Observer>,
     pending: Option<Result<config::Discovered, String>>,
     ready: Option<Result<config::Config, String>>,
     ownership: Option<Arc<Ownership>>,
@@ -221,6 +222,7 @@ impl NativePreparation {
             None
         };
         Ok(Self {
+            eta: None,
             pending: Some(discovered),
             ready: None,
             ownership,
@@ -269,6 +271,15 @@ fn pinned_core(schema: &serde_json::Value) -> Result<(), String> {
 }
 #[napi]
 impl NativePreparation {
+    #[napi]
+    pub fn track_eta(
+        &mut self,
+        engine: &crate::eta::EtaEngine,
+        scope_id: String,
+    ) -> napi::Result<()> {
+        self.eta = Some(crate::eta::Observer::new(engine, scope_id)?);
+        Ok(())
+    }
     #[napi(getter)]
     pub fn config_path(&self) -> Option<String> {
         self.pending
@@ -401,7 +412,7 @@ impl NativePreparation {
                     config::finish(discovered, None)
                 })
         };
-        let config = config.and_then(|config| {
+        let config = config.and_then(|mut config| {
             if self.executable && !self.plugins_complete {
                 return Err("Executable plugin preparation must complete before run".into());
             }
@@ -428,6 +439,7 @@ impl NativePreparation {
                         .push((owner.cancellation.subscribe(), Arc::new(context)));
                 }
             }
+            config.eta = self.eta.take();
             Ok(config)
         });
         if config.is_err() {
