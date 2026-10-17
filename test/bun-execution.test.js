@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync, rmSync, existsSync, truncateSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { BunFileCoverageSession, bunCoveragePreload } from 'stryker-mutator-rust/bun-execution';
 import { loadNative } from '../lib/native.js';
@@ -12,6 +12,29 @@ const artifactRoot = resolve('artifacts/bun-execution-acceleration');
 mkdirSync(artifactRoot, { recursive: true });
 const bunAvailable = spawnSync('bun', ['--version'], { encoding: 'utf8', timeout: 2000 }).stdout?.trim() === '1.4.3';
 const bunTest = (name, fn) => test(name, { skip: !bunAvailable && 'Bun 1.4.3 required' }, fn);
+
+test('oversized journals fail closed before native decoding, including the aggregate budget', async () => {
+  const directory = mkdtempSync(join(artifactRoot, 'size-'));
+  const files = [0, 1, 2].map((i) => join(directory, `${i}.test.js`));
+  for (const file of files) writeFileSync(file, '// synthetic metadata fixture');
+  try {
+    for (const [bytes, selectedFiles, reason] of [
+      [4 * 1024 * 1024 + 1, files.slice(0, 1), 'Coverage receipt exceeds 4 MiB'],
+      [3 * 1024 * 1024, files, 'Coverage evidence exceeds 8 MiB'],
+    ]) {
+      const session = new BunFileCoverageSession({ files: selectedFiles, identityFiles: files, qualification });
+      // This unit callback supplies malformed sparse evidence, not execution proof.
+      await session.collect(async () => {
+        const { directory } = JSON.parse(session.env.STRYKER_RUST_FILE_COVERAGE);
+        const journal = join(directory, 'root.ndjson');
+        writeFileSync(journal, ''); truncateSync(journal, bytes);
+        return { status: 'survived' };
+      }, { status: 'survived' });
+      assert.equal(session.select('0').files, undefined);
+      assert.equal(session.reason, reason);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
 
 function run(files, env, { bail = false, timeout = 2500, signal } = {}) {
   return new Promise((settle) => {

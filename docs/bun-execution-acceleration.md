@@ -100,7 +100,9 @@ A failed full or isolated baseline, missing/corrupt/truncated/extra journal,
 unsettled child, signal/error/timeout/cancellation, unsupported boundary, unknown
 phase/identity, changed source/test/cwd, absent native API, static mutation, no
 positive hit, or every-file coverage keeps the full suite. Coverage evidence is
-not cached across runner instances or campaigns. Collection directories are
+not cached across runner instances or campaigns. Accepted evidence is limited to
+4 MiB per journal and 8 MiB in aggregate before decoding/serialization; oversized
+evidence retains the full suite. Collection directories are
 removed after awaited completion; supported descendants share the runner's
 process group and timeout/cancellation cleanup. Unqualified external launchers
 retain their existing semantics; this helper does not promise to contain arbitrary
