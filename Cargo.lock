@@ -592,6 +592,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hermes-ast"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96c745f145ea2cc9e1a647756779cbc9ce4c70fede6886cd48aa1773b6b9c384"
+dependencies = [
+ "hermes-atom-table",
+ "hermes-support",
+]
+
+[[package]]
+name = "hermes-atom-table"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83bdb8c21717b2a843e5e2bd62e049c3412a58cb5cacf2965258b89e52d3620"
+
+[[package]]
+name = "hermes-parser"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "421b1836e58cc625a1b14c93985d8714bb4e757ad7e2257c9c35e8b08e7ef7ef"
+dependencies = [
+ "bumpalo",
+ "hermes-ast",
+ "hermes-atom-table",
+ "hermes-support",
+ "hermes-unicode",
+]
+
+[[package]]
+name = "hermes-support"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "957935233d8cd508d06d5bbb508e2736ef6f610cab297205c01a561e263097e3"
+dependencies = [
+ "hermes-unicode",
+]
+
+[[package]]
+name = "hermes-unicode"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4a95d39576f0de87522589064b2a53902cc9a1b3930e4b39a0c022739aea817"
+
+[[package]]
 name = "hstr"
 version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2231,6 +2275,9 @@ dependencies = [
  "dunce",
  "getrandom 0.4.3",
  "globset",
+ "hermes-ast",
+ "hermes-parser",
+ "hermes-support",
  "jsonc-parser",
  "jsonschema",
  "junction",

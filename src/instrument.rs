@@ -22,6 +22,7 @@ use crate::mutations::{
     Utf16Offsets, assignment_operator_replacement, method_replacement as method_mapping,
 };
 
+mod flow;
 mod html;
 mod parallel;
 mod printed_arrows;
@@ -444,6 +445,7 @@ impl<'a> Visit<'a> for CommentBoundaries<'_> {
 struct Options {
     excluded: HashSet<String>,
     no_header: bool,
+    flow: Option<flow::Policy>,
 }
 
 impl Options {
@@ -470,7 +472,7 @@ impl Options {
                 "noHeader" => {
                     options.no_header = value.as_bool().ok_or("noHeader must be boolean")?
                 }
-                "plugins" if value.is_null() || value.as_array().is_some_and(Vec::is_empty) => {}
+                "plugins" => options.flow = flow::Policy::parse(value)?,
                 "ignorers" if value.as_array().is_some_and(Vec::is_empty) => {}
                 _ => return Err(format!("Unsupported native instrumentation option: {name}")),
             }
@@ -518,6 +520,16 @@ fn instrument_file_inner(
     next_id: &mut usize,
     relocation_proven: Option<&mut bool>,
 ) -> Result<String, String> {
+    if options.flow.is_some()
+        && !matches!(
+            std::path::Path::new(&file.name)
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("js" | "mjs" | "cjs")
+        )
+    {
+        return Err("Explicit Flow is qualified only for standalone JS filenames".into());
+    }
     if std::path::Path::new(&file.name)
         .extension()
         .and_then(|ext| ext.to_str())
@@ -612,8 +624,13 @@ fn instrument_program_inner(
     } else {
         source_type
     };
+    // The None branch does no Hermes work, copy/masking or Flow AST walk.
+    let flow = options.flow.map(|_| flow::prepare(source)).transpose()?;
+    let parse_source = flow
+        .as_ref()
+        .map_or(source, |prepared| prepared.masked.as_str());
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type.with_module(true))
+    let parsed = Parser::new(&allocator, parse_source, source_type.with_module(true))
         .with_options(ParseOptions {
             preserve_parens: false,
             parse_regular_expression: true,
@@ -649,6 +666,9 @@ fn instrument_program_inner(
         return Err(
             "Directive prologues and Flow preprocessing require upstream instrumentation".into(),
         );
+    }
+    if let Some(flow) = &flow {
+        flow.check_program(&parsed.program, source)?;
     }
     let directives = CommentBoundaries::directives(&parsed.program, source)?;
     let semantics = SemanticBuilder::new()
@@ -736,6 +756,7 @@ fn instrument_program_inner(
     let _emitter_timer = parallel::diagnostic::Timer::start(2);
     let mut emitter = Emitter {
         source,
+        flow: flow.as_ref(),
         file_name: &file.name,
         positions: Positions::new(source),
         offset,
@@ -1410,6 +1431,7 @@ struct Switch {
 
 struct Emitter<'s, 'r> {
     source: &'s str,
+    flow: Option<&'s flow::Prepared>,
     file_name: &'s str,
     positions: Positions,
     // Selection and comment ownership stay script-relative. Only the public
@@ -1531,6 +1553,9 @@ impl Emitter<'_, '_> {
     }
 
     fn print(&self, node: &Expression<'_>) -> Result<String, String> {
+        if let Some(flow) = self.flow {
+            flow.check_print(node.span())?;
+        }
         let mut jsx = LeafJsx::default();
         jsx.visit_expression(node);
         if jsx.found {
@@ -2890,6 +2915,9 @@ impl Emitter<'_, '_> {
     // formatter beside the existing expression printer and apply its same guards
     // to every descendant while traversing the original branch.
     fn print_statement(&self, node: &Statement<'_>) -> Result<String, String> {
+        if let Some(flow) = self.flow {
+            flow.check_print(node.span())?;
+        }
         fn indent(text: &str) -> String {
             text.lines()
                 .map(|line| format!("  {line}"))

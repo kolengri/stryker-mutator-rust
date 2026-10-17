@@ -337,6 +337,18 @@ Logical, array and conditional ancestors. The shared AST printer preserves
 Babel's `a! --` separator for postfix decrement, while increment stays `a!++`.
 Repeated direct assertions, other typed lvalues, optional/private/super roots and
 active receiver-spine placement errors retain their conservative boundaries.
+An explicit single `flow` parser plugin also supports `number`, `string` and
+`boolean` annotations on identifier variables and named function declarations,
+including defaults and returns. The Rust frontend proves the type spans; the
+existing Oxc instrumenter parses a view with those spans masked while source
+reconstruction, comments and public UTF-16 coordinates use the original text.
+Requests without the Flow option retain the existing parser path.
+Flow casts, generics, declarations, typed arrows/classes, annotation comments,
+unproven policy and filtering contexts, standalone declarations whose trailing
+annotation extends beyond the JavaScript parser's ASI span, and printed ancestors
+retaining Flow syntax use whole-batch fallback. Flow batches whose relocation cannot be proved
+recover serially. This subset covers runtime mutations; the declaration-only
+upstream Flow corpus resource still uses fallback.
 Ordinary loops, synchronous `for-in`/`for-of`, switch cases, labels,
 break/continue and sequence expressions are supported. Loop-test mutations,
 omitted-test `for` clones and switch fallthrough follow upstream placement.

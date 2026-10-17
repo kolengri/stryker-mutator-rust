@@ -70,6 +70,7 @@
     "typed-inject": "5.0.0"
   },
   "devDependencies": {
+    "@babel/plugin-transform-flow-strip-types": "8.0.1",
     "@napi-rs/cli": "3.10.8",
     "@stryker-mutator/mocha-runner": "10.0.0",
     "@stryker-mutator/vitest-runner": "10.0.0",

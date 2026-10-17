@@ -65,6 +65,7 @@ pub(super) fn instrument(
             Positions::new(&file.content).at(range.start as u32),
             &Options {
                 no_header: !document,
+                flow: None,
                 excluded: options.excluded.clone(),
             },
             records,
