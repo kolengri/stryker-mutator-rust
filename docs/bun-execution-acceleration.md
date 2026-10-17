@@ -46,6 +46,12 @@ owned process group and bounds cleanup to 2 seconds; stream destruction never co
 as EOF. The temporary descriptor/listeners are restored after every run. Passing
 `{ signal }` as collect's third argument or invalidating the session cancels ownership.
 Unknown, escaping/native launchers are outside this owned process-group contract.
+Every rejected in-scope launch latches a collection failure, even if the SDK or
+callback catches its exception. SDK 1.6.0 RSS polling (`maxChildRss`) uses an
+unowned `ps` process on the qualified host; its first collection poll therefore
+invalidates coverage and keeps the full suite. The RSS configuration is retained
+for ordinary baseline/active runs. RSS monitoring inside collection is not
+qualified, and unidentified monitor processes are never passed through.
 
 Call `select(id, { staticMutation })` for each actual mutant;
 `files: undefined` means the full suite. The optional `staticMutation` flag means

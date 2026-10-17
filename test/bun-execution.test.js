@@ -100,6 +100,49 @@ function fixture() {
     session: () => new BunFileCoverageSession({ files, identityFiles: [...names.map((n) => join(directory, n)), childEntry], qualification, completion: { bunPath: 'bun' } }) };
 }
 
+bunTest('caught in-scope launch rejections still invalidate an otherwise valid collection', async () => {
+  const f = fixture();
+  const rows = [];
+  try {
+    const baseline = await run(f.files, {});
+    assert.equal(baseline.status, 'survived');
+    for (const kind of ['missing-token', 'duplicate', 'launch-mode']) {
+      const session = f.session();
+      const row = { kind };
+      await session.collect(async (files) => {
+        if (kind !== 'launch-mode') row.rootResult = await run(files, session.env);
+        try {
+          if (kind === 'missing-token') spawn('ps', ['-o', 'rss=', '-p', String(row.rootResult.pid)]);
+          else spawn('bun', ['--no-env-file', 'test', ...files], {
+            detached: kind !== 'launch-mode', stdio: ['ignore', 'pipe', 'pipe'],
+            env: { ...process.env, ...session.env },
+          });
+          assert.fail('The unsupported launch must throw before spawning');
+        } catch (error) { row.caught = error.message; }
+        // A catch cannot restore authority. With the old code all three cases
+        // could proceed to an ordinary successful root and complete index.
+        return row.rootResult ?? await run(files, session.env);
+      }, baseline);
+      assert.equal(session.index, undefined);
+      assert.equal(session.select('0').files, undefined);
+      const reason = kind === 'missing-token' ? 'Unowned process launch inside coverage collection'
+        : kind === 'duplicate' ? 'Duplicate or late owned producer' : 'Unsupported owned Bun launch mode';
+      assert.equal(row.caught, reason);
+      assert.equal(session.reason, reason);
+      if (row.rootResult) {
+        assert.equal(row.rootResult.status, 'survived');
+        assertProcessStopped(row.rootResult.pid);
+      }
+      rows.push({ ...row, reason: session.reason });
+    }
+    const clean = f.session();
+    await clean.collect((files) => run(files, clean.env), baseline);
+    assert.equal(clean.reason, 'Complete owned receipts');
+    assert.deepEqual(clean.select('0').files, [f.files[0]]);
+    writeFileSync(join(artifactRoot, 'caught-launch-rejections.json'), JSON.stringify(rows, null, 2));
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});
+
 bunTest('public file session selects actual fresh Bun tests, includes settled children, and preserves ordered mutant outcomes', async () => {
   const f = fixture();
   try {
@@ -249,21 +292,34 @@ bunTest('late timer hits remain visible through EOF, and missing/corrupt/unowned
     assert.equal(pending.select('0').files, undefined);
     assert.match(pending.reason, /Unsettled asynchronous/);
     writeFileSync(f.files[0], `import {test,expect} from 'bun:test';import {a} from './a.js';test('a',()=>expect(a(1)).toBe(2));`);
+    const journalFallbacks = [];
     for (const mode of ['missing', 'corrupt', 'late', 'unsettled']) {
       const session = f.session();
+      let original, injected;
       await session.collect(async (files) => {
         const result = await run(files, session.env);
         const { directory, session: token, file } = JSON.parse(session.env.STRYKER_RUST_FILE_COVERAGE);
         const root = join(directory, 'root.ndjson');
+        original = readFileSync(root, 'utf8');
         if (mode === 'missing') rmSync(root);
         else if (mode === 'corrupt') writeFileSync(root, '{');
         else if (mode === 'unsettled') writeFileSync(join(directory, 'root.tmp'), 'pending');
-        else writeFileSync(join(directory, '00000000-0000-0000-0000-000000000000.ndjson'), JSON.stringify({ type: 'start',
-          version: 1, session: token, file, id: 'late', parent: 'root' }) + '\n');
+        else {
+          injected = { type: 'start', version: 2, session: token, file, id: 'late', parent: 'root', pid: result.pid };
+          writeFileSync(join(directory, '00000000-0000-0000-0000-000000000000.ndjson'), JSON.stringify(injected) + '\n');
+        }
         return result;
       }, { status: 'survived' });
       assert.equal(session.select('0').files, undefined, mode);
-      assert.notEqual(session.reason, 'Complete owned receipts', mode);
+      if (mode === 'late') {
+        assert.equal(session.reason, 'Unowned or late participant');
+        const events = original.trim().split('\n').map(JSON.parse);
+        assert.equal(events[0].version, 2);
+        assert.ok(events[0].pid > 0 && events.some((event) => event.type === 'hit'));
+      }
+      else assert.notEqual(session.reason, 'Complete owned receipts', mode);
+      journalFallbacks.push({ mode, reason: session.reason, original, injected });
     }
+    writeFileSync(join(artifactRoot, 'journal-fallbacks.json'), JSON.stringify(journalFallbacks, null, 2));
   } finally { rmSync(f.directory, { recursive: true, force: true }); }
 });
