@@ -153,11 +153,28 @@ setInterval(()=>{},1000);
     } finally { controller.abort(reason); settled = await pending; }
     assert.strictEqual(settled.error, reason);
     assert.equal(pids.length, 2);
-    for (const pid of pids) assertProcessStopped(pid);
     assert.ok(!(await readdir(cwd)).includes('.stryker-tmp'));
+    if (enabled) assert.notEqual(campaign.snapshot().state, 'complete');
+    const stopped = calls;
+    // POSIX cleanup reaps the shell after signalling its group. Adopted
+    // descendants with ignored stdio can still be finishing kernel exit;
+    // neither the shell's wait nor pipe EOF waits for their zombie state.
+    const cleanupDeadline = performance.now() + 2000;
+    for (const pid of pids) {
+      let firstError;
+      for (;;) {
+        try { assertProcessStopped(pid); break; }
+        catch (error) {
+          if (!(error instanceof assert.AssertionError) || !error.message.startsWith(`Child ${pid} remains active`)) throw error;
+          firstError ??= error;
+          if (performance.now() >= cleanupDeadline) {
+            throw new AggregateError([firstError, error], 'Owned command processes did not stop after cancellation');
+          }
+        }
+        await delay(10);
+      }
+    }
     if (enabled) {
-      assert.notEqual(campaign.snapshot().state, 'complete');
-      const stopped = calls;
       await delay(30);
       assert.equal(calls, stopped, 'ETA interval must stop with native ownership');
     }
