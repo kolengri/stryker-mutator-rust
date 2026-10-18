@@ -256,12 +256,12 @@ struct Index {
     roots: Vec<Root>,
 }
 
-fn index(input: &str) -> Result<Index, String> {
+fn index(input: &str, require_qualification: bool) -> Result<Index, String> {
     if input.len() > 16 * 1024 * 1024 {
         return Err("Coverage evidence exceeds 16 MiB".into());
     }
     let input: Input = serde_json::from_str(input).map_err(|e| e.to_string())?;
-    if input.version != 2 || !input.qualified || input.files.is_empty() {
+    if input.version != 2 || (require_qualification && !input.qualified) || input.files.is_empty() {
         return Err("Unqualified file isolation or coverage ABI".into());
     }
     let files: HashSet<_> = input.files.iter().collect();
@@ -344,6 +344,36 @@ fn index(input: &str) -> Result<Index, String> {
     Ok(result)
 }
 
+impl Index {
+    fn candidates(
+        &self,
+        mutant_id: &str,
+        static_mutation: bool,
+    ) -> (Option<Vec<&String>>, &'static str) {
+        if static_mutation || self.static_mutants.contains(mutant_id) {
+            return (None, "Static mutation");
+        }
+        let Some(slots) = self.by_mutant.get(mutant_id) else {
+            return (None, "No positive coverage evidence");
+        };
+        if slots.len() == self.files.len() {
+            return (None, "Every file covers this mutant");
+        }
+        (
+            Some(slots.iter().map(|slot| &self.files[*slot]).collect()),
+            "Complete positive file coverage",
+        )
+    }
+}
+
+fn summary(index: Option<&Index>, reason: &str) -> String {
+    json!({"complete": index.is_some(), "reason": reason,
+        "files": index.map_or(0, |i| i.files.len()),
+        "participants": index.map_or(0, |i| i.participants),
+        "roots": index.map(|i| &i.roots)})
+    .to_string()
+}
+
 /// A fail-closed native index. The caller owns I/O and must invalidate on source,
 /// runtime, configuration or dependency changes. No result authorizes NoCoverage.
 #[napi]
@@ -356,7 +386,7 @@ pub struct ExecutionCoverage {
 impl ExecutionCoverage {
     #[napi(constructor)]
     pub fn new(input_json: String) -> Self {
-        match index(&input_json) {
+        match index(&input_json, true) {
             Ok(index) => Self {
                 index: Some(index),
                 reason: "Complete owned receipts".into(),
@@ -370,30 +400,55 @@ impl ExecutionCoverage {
 
     #[napi]
     pub fn summary(&self) -> String {
-        json!({"complete": self.index.is_some(), "reason": self.reason,
-            "files": self.index.as_ref().map_or(0, |i| i.files.len()),
-            "participants": self.index.as_ref().map_or(0, |i| i.participants),
-            "roots": self.index.as_ref().map(|i| &i.roots)})
-        .to_string()
+        summary(self.index.as_ref(), &self.reason)
     }
 
     #[napi]
     pub fn select(&self, mutant_id: String, static_mutation: bool) -> String {
-        let full = |reason: &str| json!({"files": null, "reason": reason}).to_string();
         let Some(index) = &self.index else {
-            return full(&self.reason);
+            return json!({"files": null, "reason": self.reason}).to_string();
         };
-        if static_mutation || index.static_mutants.contains(&mutant_id) {
-            return full("Static mutation");
+        let (files, reason) = index.candidates(&mutant_id, static_mutation);
+        json!({"files": files, "reason": reason}).to_string()
+    }
+}
+
+/// Validated, untrusted evidence for investigation only. This object has no
+/// selection or promotion API, regardless of the input's qualification flag.
+#[napi]
+pub struct ExecutionCoverageInspection {
+    index: Option<Index>,
+    reason: String,
+}
+
+#[napi]
+impl ExecutionCoverageInspection {
+    #[napi(constructor)]
+    pub fn new(input_json: String) -> Self {
+        match index(&input_json, false) {
+            Ok(index) => Self {
+                index: Some(index),
+                reason: "Complete owned receipts".into(),
+            },
+            Err(reason) => Self {
+                index: None,
+                reason,
+            },
         }
-        let Some(slots) = index.by_mutant.get(&mutant_id) else {
-            return full("No positive coverage evidence");
+    }
+
+    #[napi]
+    pub fn summary(&self) -> String {
+        summary(self.index.as_ref(), &self.reason)
+    }
+
+    #[napi]
+    pub fn candidates(&self, mutant_id: String, static_mutation: bool) -> String {
+        let Some(index) = &self.index else {
+            return json!({"candidateFiles": null, "reason": self.reason}).to_string();
         };
-        if slots.len() == index.files.len() {
-            return full("Every file covers this mutant");
-        }
-        let files: Vec<_> = slots.iter().map(|slot| &index.files[*slot]).collect();
-        json!({"files": files, "reason": "Complete positive file coverage"}).to_string()
+        let (files, reason) = index.candidates(&mutant_id, static_mutation);
+        json!({"candidateFiles": files, "reason": reason}).to_string()
     }
 }
 
@@ -520,6 +575,17 @@ mod tests {
                 ExecutionCoverage::new(input.to_string()).index.is_none(),
                 "completion case {case}"
             );
+            input["qualified"] = json!(false);
+            let inspection = ExecutionCoverageInspection::new(input.to_string());
+            assert!(
+                inspection.index.is_none(),
+                "inspection completion case {case}"
+            );
+            assert!(
+                serde_json::from_str::<Value>(&inspection.candidates("m".into(), false)).unwrap()
+                    ["candidateFiles"]
+                    .is_null()
+            );
         }
     }
     #[test]
@@ -533,6 +599,64 @@ mod tests {
         assert_eq!(selection["files"], json!(["a"]));
         for (id, is_static) in [("m", true), ("s", false), ("c", false), ("absent", false)] {
             assert!(serde_json::from_str::<Value>(&index.select(id.into(),is_static)).unwrap()["files"].is_null());
+        }
+    }
+    #[test]
+    fn execution_coverage_inspection_shares_candidates_without_selection_authority() {
+        for qualified in [false, true] {
+            let mut evidence = input();
+            evidence["qualified"] = json!(qualified);
+            let inspection = ExecutionCoverageInspection::new(evidence.to_string());
+            let trusted = ExecutionCoverage::new(evidence.to_string());
+            let diagnostics: Value = serde_json::from_str(&inspection.summary()).unwrap();
+            assert_eq!(diagnostics["complete"], true);
+            assert_eq!(diagnostics["participants"], 3);
+            assert_eq!(diagnostics["roots"].as_array().unwrap().len(), 2);
+            assert_eq!(
+                serde_json::from_str::<Value>(&inspection.candidates("m".into(), false)).unwrap(),
+                json!({"candidateFiles":["a"],"reason":"Complete positive file coverage"})
+            );
+            if !qualified {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&trusted.summary()).unwrap(),
+                    json!({"complete":false,"reason":"Unqualified file isolation or coverage ABI",
+                        "files":0,"participants":0,"roots":null})
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(&trusted.select("m".into(), false)).unwrap(),
+                    json!({"files":null,"reason":"Unqualified file isolation or coverage ABI"})
+                );
+            }
+            for (id, is_static, reason) in [
+                ("m", true, "Static mutation"),
+                ("s", false, "Static mutation"),
+                ("c", false, "Static mutation"),
+                ("absent", false, "No positive coverage evidence"),
+            ] {
+                assert_eq!(
+                    serde_json::from_str::<Value>(&inspection.candidates(id.into(), is_static))
+                        .unwrap(),
+                    json!({"candidateFiles":null,"reason":reason})
+                );
+            }
+            let raw = evidence["runs"][1]["receipts"][0].as_str().unwrap();
+            evidence["runs"][1]["receipts"][0] = json!(format!(
+                "{raw}{}\n",
+                json!({"type":"hit","mutant":"m","phase":"test"})
+            ));
+            let inspection = ExecutionCoverageInspection::new(evidence.to_string());
+            assert_eq!(
+                serde_json::from_str::<Value>(&inspection.candidates("m".into(), false)).unwrap(),
+                json!({"candidateFiles":null,"reason":"Every file covers this mutant"})
+            );
+            evidence["qualified"] = json!(true);
+            assert_eq!(
+                serde_json::from_str::<Value>(
+                    &ExecutionCoverage::new(evidence.to_string()).select("m".into(), false)
+                )
+                .unwrap(),
+                json!({"files":null,"reason":"Every file covers this mutant"})
+            );
         }
     }
     #[test]
@@ -579,6 +703,16 @@ mod tests {
                 serde_json::from_str::<Value>(&index.select("m".into(), false)).unwrap()["files"]
                     .is_null()
             );
+            if case != 0 {
+                value["qualified"] = json!(false);
+                let inspection = ExecutionCoverageInspection::new(value.to_string());
+                assert!(inspection.index.is_none(), "inspection case {case}");
+                assert!(
+                    serde_json::from_str::<Value>(&inspection.candidates("m".into(), false))
+                        .unwrap()["candidateFiles"]
+                        .is_null()
+                );
+            }
         }
     }
 }

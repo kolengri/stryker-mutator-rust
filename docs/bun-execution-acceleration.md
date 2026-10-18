@@ -40,6 +40,44 @@ close cannot authorize selection, even if the pipes eventually drain. The callba
 result and output bytes are never rewritten. Legitimate late output before SDK
 completion drains normally; the exit/grace `outputIncomplete` path remains fallback.
 
+### Untrusted evidence inspection
+
+Use a separate session's `collectEvidence(runInactiveFile, { signal })` to
+investigate receipts before independent-file qualification or an exhaustive
+combined baseline. It uses the same callback requirements, frozen identities,
+collection deadline, journal bounds, owned completion and native Rust validator
+as `collect()`. Every isolated inactive file must still survive; partial or
+invalid evidence is discarded. Passing runs do not establish file independence.
+
+```js
+const diagnostic = new BunFileCoverageSession({
+  files, identityFiles, completion: { bunPath: 'bun', runnerModule },
+});
+// The existing inactive callback must launch with diagnostic.env and the preload.
+await diagnostic.collectEvidence(runInactiveFile, { signal });
+const snapshot = diagnostic.inspect(mutantId);
+// Explicitly save snapshot if needed; no persistence is automatic.
+// snapshot.candidateFiles is investigative, never a production test filter.
+// snapshot.evidenceJson contains bounded raw receipts with qualified: false.
+```
+
+`inspect()` returns native receipt/completion diagnostics and Rust-calculated
+`candidateFiles`. `diagnostics.complete` means complete validated evidence, not
+qualification. Static, unknown and every-file hits have no candidate subset.
+`select()` always falls back to the full suite for a diagnostic session, even
+if its constructor was given a qualification string. A session permits only one
+attempt across both acquisition methods; `collect()` cannot promote diagnostic
+evidence. The native `ExecutionCoverageInspection` object likewise has no
+`select()` or promotion method. Existing `ExecutionCoverage.summary()` and
+`select()` contracts are unchanged.
+
+Identity changes, cancellation and failure remove live diagnostics and raw data;
+`inspect()` rechecks identity and cancellation before returning a snapshot.
+Saved snapshots remain historical evidence and confer no selection authority.
+The original `collect()` still requires qualification and a successful combined
+baseline before invoking any callback. This inspection path does not qualify
+Dealyv, an SDK adapter, or any production scope.
+
 `completion.drainTimeoutMs` defaults to 5 seconds after root exit (maximum 60 seconds),
 within the collection budget. Deadline, cancellation or callback failure kills the
 owned process group and bounds cleanup to 2 seconds; stream destruction never counts

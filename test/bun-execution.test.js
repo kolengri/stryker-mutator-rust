@@ -97,8 +97,117 @@ function fixture() {
   `);
   writeFileSync(files[1], "import { test, expect } from 'bun:test'; import { b } from './b.js'; test('b dynamic', () => expect(b(3)).toBeGreaterThan(0));");
   return { directory, files, sources: names.map((n) => join(directory, n)), mutants: response.result.mutants, instrumented: response.result,
-    session: () => new BunFileCoverageSession({ files, identityFiles: [...names.map((n) => join(directory, n)), childEntry], qualification, completion: { bunPath: 'bun' } }) };
+    session: (options = {}) => new BunFileCoverageSession({ files, identityFiles: [...names.map((n) => join(directory, n)), childEntry], qualification, completion: { bunPath: 'bun' }, ...options }) };
 }
+
+test('collect preserves qualification and baseline guard order without invoking callbacks', async () => {
+  let calls = 0;
+  for (const [options, baseline, reason] of [
+    [{}, undefined, 'File isolation/boundaries are unqualified'],
+    [{ qualification }, undefined, 'Exhaustive inactive baseline failed'],
+    [{ qualification, collectionBudgetMs: 0 }, { status: 'survived' }, 'Invalid coverage collection budget'],
+  ]) {
+    const session = new BunFileCoverageSession(options);
+    await session.collect(async () => { calls++; }, baseline);
+    assert.equal(session.reason, reason);
+    assert.equal(session.inspect('m').diagnostics.complete, false);
+    assert.equal(session.inspect('m').evidenceJson, undefined);
+  }
+  assert.equal(calls, 0);
+});
+
+bunTest('diagnostic acquisition before a combined baseline exposes Rust candidates without selection or promotion', async () => {
+  const f = fixture();
+  try {
+    for (const assertedQualification of [undefined, qualification]) {
+      const controller = new AbortController();
+      const session = f.session({ qualification: assertedQualification });
+      let calls = 0;
+      await session.collectEvidence(async (files, remainingMs) => {
+        calls++;
+        assert.ok(remainingMs > 0 && remainingMs <= 60_000);
+        const result = await run(files, session.env);
+        assert.equal(result.status, 'survived', result.stderr);
+        return result;
+      }, { signal: controller.signal });
+      assert.equal(calls, f.files.length);
+      const mutant = f.mutants.find((m) => session.inspect(m.id).candidateFiles?.includes(f.files[0]));
+      assert.ok(mutant, 'The instrumented fixture must have a positive root-only candidate');
+      const snapshot = session.inspect(mutant.id);
+      assert.deepEqual(snapshot.candidateFiles, [f.files[0]]);
+      assert.equal(Object.hasOwn(snapshot, 'files'), false);
+      assert.equal(snapshot.diagnostics.complete, true);
+      assert.equal(snapshot.diagnostics.files, f.files.length);
+      assert.equal(snapshot.diagnostics.participants, 5);
+      assert.equal(snapshot.diagnostics.roots.length, f.files.length);
+      const evidence = JSON.parse(snapshot.evidenceJson);
+      assert.equal(evidence.qualified, false);
+      assert.equal(evidence.runs.length, f.files.length);
+      const native = new (loadNative().ExecutionCoverageInspection)(snapshot.evidenceJson);
+      assert.equal(typeof native.select, 'undefined');
+      assert.deepEqual(JSON.parse(native.candidates(mutant.id, false)).candidateFiles, snapshot.candidateFiles);
+      assert.equal(JSON.parse(new (loadNative().ExecutionCoverage)(snapshot.evidenceJson).select(mutant.id, false)).files, null);
+      assert.equal(session.index, undefined);
+      assert.deepEqual(session.select(mutant.id), { files: undefined, reason: 'File isolation/boundaries are unqualified' });
+      assert.equal(session.inspect('unknown').candidateFiles, undefined);
+      assert.equal(session.inspect(mutant.id, { staticMutation: true }).reason, 'Static mutation');
+      assert.equal(session.inspect(mutant.id, { staticMutation: true }).candidateFiles, undefined);
+      assert.ok(f.mutants.some((m) => session.inspect(m.id).reason === 'Static mutation'));
+      await session.collect(async () => { calls++; }, { status: 'survived' });
+      await session.collectEvidence(async () => { calls++; });
+      assert.equal(calls, f.files.length, 'A diagnostic attempt cannot retry or promote');
+      assert.equal(session.stats.nativeSelections, 0);
+      assert.equal(session.stats.selectedPlans, 0);
+      if (assertedQualification) controller.abort(new Error('Diagnostic inspection cancelled'));
+      else {
+        writeFileSync(join(artifactRoot, 'untrusted-evidence.json'), snapshot.evidenceJson);
+        writeFileSync(f.sources[0], readFileSync(f.sources[0], 'utf8') + '\n// changed frozen identity');
+      }
+      const invalid = session.inspect(mutant.id);
+      assert.equal(invalid.diagnostics.complete, false);
+      assert.equal(invalid.candidateFiles, undefined);
+      assert.equal(invalid.evidenceJson, undefined);
+      assert.equal(session.select(mutant.id).files, undefined);
+      assert.equal(invalid.reason, assertedQualification ? 'Diagnostic inspection cancelled' : 'Frozen source/test/cwd identity changed');
+    }
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+bunTest('diagnostic failure, cancellation and concurrent acquisition discard all evidence', async () => {
+  const f = fixture();
+  try {
+    const failed = f.session({ qualification: undefined });
+    let calls = 0;
+    await failed.collectEvidence(async (files) => {
+      const result = await run(files, failed.env);
+      calls++;
+      return calls === f.files.length ? { ...result, status: 'killed' } : result;
+    });
+    assert.equal(calls, f.files.length);
+    assert.equal(failed.inspect('0').evidenceJson, undefined);
+    assert.equal(failed.inspect('0').diagnostics.complete, false);
+    assert.equal(failed.select('0').reason, 'Inactive file baseline failed: killed');
+
+    const cancelled = f.session({ qualification: undefined });
+    const controller = new AbortController();
+    controller.abort(new Error('Diagnostic collection cancelled'));
+    let cancelledCalls = 0;
+    await cancelled.collectEvidence(async () => { cancelledCalls++; }, { signal: controller.signal });
+    assert.equal(cancelledCalls, 0);
+    assert.equal(cancelled.inspect('0').evidenceJson, undefined);
+    assert.equal(cancelled.inspect('0').reason, 'Diagnostic collection cancelled');
+
+    const concurrent = f.session({ qualification: undefined });
+    await concurrent.collectEvidence(async () => {
+      await concurrent.collect(async () => { assert.fail('Concurrent callback'); }, { status: 'survived' });
+      return { status: 'survived' };
+    });
+    assert.equal(concurrent.inspect('0').diagnostics.complete, false);
+    assert.equal(concurrent.inspect('0').evidenceJson, undefined);
+    assert.equal(concurrent.select('0').files, undefined);
+    assert.match(concurrent.reason, /Concurrent coverage collection/);
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});
 
 function sameFileChildFixture(f, { coverage = false, childSetup = '', childAfter = '', command, options } = {}) {
   writeFileSync(f.files[0], `import {test,expect,afterAll} from 'bun:test';
