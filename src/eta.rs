@@ -169,6 +169,20 @@ struct Scope {
     baseline_ms: Option<f64>,
     completed: usize,
 }
+struct Forecast {
+    costs: [f64; 3],
+    durations: Vec<f64>,
+    from_baseline: bool,
+}
+impl Forecast {
+    fn remaining(&self, age: Option<f64>, timeout: Option<f64>) -> [f64; 3] {
+        let mut costs = self.costs;
+        if self.from_baseline {
+            costs[2] = costs[2].max(timeout.unwrap_or(costs[2]));
+        }
+        residual(costs, age, &self.durations, timeout)
+    }
+}
 pub(crate) struct Campaign {
     scopes: Vec<Scope>,
     clock: Instant,
@@ -599,31 +613,24 @@ impl Scope {
         self.plan = Some(plan);
         Ok(())
     }
-    fn forecast(&self, job: &Job, age: Option<f64>) -> Option<[f64; 3]> {
+    fn forecast(&self, job: &Job) -> Option<Forecast> {
         // A rolling window adapts to pace changes. Current observations replace,
         // rather than indefinitely blending with, source-matching older runs.
-        let current = self
-            .samples
-            .iter()
-            .filter(|s| s.reload == job.reload)
-            .collect::<Vec<_>>();
-        let samples = if current.is_empty() {
-            self.history_samples
-                .iter()
-                .filter(|s| s.reload == job.reload)
-                .collect::<Vec<_>>()
+        let samples = if self.samples.iter().any(|s| s.reload == job.reload) {
+            &self.samples
         } else {
-            current
+            &self.history_samples
         };
         let mut durations = samples
             .iter()
+            .filter(|s| s.reload == job.reload)
             .map(|s| match (job.baseline_ms, s.baseline_ms) {
                 (Some(base), Some(observed)) if base > 0.0 && observed > 0.0 => {
-                    Some(s.duration_ms * base / observed)
+                    s.duration_ms * base / observed
                 }
-                _ => Some(s.duration_ms),
+                _ => s.duration_ms,
             })
-            .collect::<Option<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         if durations.iter().any(|v| !duration(*v)) {
             return None;
         }
@@ -631,15 +638,21 @@ impl Scope {
             let base = job.baseline_ms.filter(|v| *v > 0.0)?;
             // The inactive run is evidence for a scale, not an accuracy claim.
             durations.push(base);
-            let low = base * 0.25;
-            let high = (base * 2.0).max(job.timeout_ms.unwrap_or(base));
-            return Some(residual([low, base, high], age, &durations, job.timeout_ms));
+            return Some(Forecast {
+                costs: [base * 0.25, base, base * 2.0],
+                durations,
+                from_baseline: true,
+            });
         }
         durations.sort_by(f64::total_cmp);
         let mean = durations.iter().sum::<f64>() / durations.len() as f64;
         let low = durations[durations.len() / 10].min(mean * 0.75);
         let high = durations[(durations.len() * 9 / 10).min(durations.len() - 1)].max(mean * 1.25);
-        Some(residual([low, mean, high], age, &durations, job.timeout_ms))
+        Some(Forecast {
+            costs: [low, mean, high],
+            durations,
+            from_baseline: false,
+        })
     }
     fn estimate(&self, at: f64) -> Value {
         if self.ended {
@@ -683,9 +696,20 @@ impl Scope {
         ];
         let mut slot = 0;
         let mut missing = 0;
+        // Jobs commonly share the same inactive scale. Normalize and sort each
+        // reload/scale distribution once per snapshot, not once per mutant.
+        // Age and timeout remain job-specific and never enter calibration.
+        let mut forecasts = HashMap::new();
+        let mut forecast = |job: &Job, age| {
+            forecasts
+                .entry((job.reload, job.baseline_ms.map(f64::to_bits)))
+                .or_insert_with(|| self.forecast(job))
+                .as_ref()
+                .map(|forecast| forecast.remaining(age, job.timeout_ms))
+        };
         for (job, status) in plan.jobs.iter().zip(&self.statuses) {
             if let Status::Running(start) = status {
-                if let Some(cost) = self.forecast(job, Some(at - start)) {
+                if let Some(cost) = forecast(job, Some(at - start)) {
                     for i in 0..3 {
                         timelines[i][slot] = cost[i];
                     }
@@ -705,7 +729,7 @@ impl Scope {
         }
         for (job, status) in plan.jobs.iter().zip(&self.statuses) {
             if matches!(status, Status::Queued) && plan.runners > 0 {
-                if let Some(cost) = self.forecast(job, None) {
+                if let Some(cost) = forecast(job, None) {
                     for i in 0..3 {
                         // Honor the supplied order and actual occupied workers.
                         let next = timelines[i]
@@ -736,22 +760,28 @@ fn residual(cost: [f64; 3], age: Option<f64>, samples: &[f64], timeout: Option<f
     let Some(age) = age else {
         return cost;
     };
-    let survivors = samples
+    let (sum, count) = samples
         .iter()
         .copied()
         .filter(|v| *v > age)
-        .collect::<Vec<_>>();
-    if !survivors.is_empty() {
-        let mean = survivors.iter().sum::<f64>() / survivors.len() as f64 - age;
+        .fold((0.0, 0), |(sum, count), value| (sum + value, count + 1));
+    if count > 0 {
+        let mean = sum / count as f64 - age;
         return [0.0, mean, (cost[2] - age).max(mean * 1.25)];
     }
     // Right-censored running jobs must not disappear at their old prediction.
-    // A timeout is a horizon, never a hard cap: recovery/retries can exceed it.
+    // Beyond the observed tail, retain the positive, scale-based heuristic.
+    // A configured timeout supplies no probability of using that budget: Core
+    // computes it from timeoutFactor * netTime + timeoutMS + overhead. It is an
+    // uncertainty scenario only, not half a timeout of expected remaining work.
+    // Recovery/retries may also exceed it, so it is never a hard cap.
     let horizon = timeout.unwrap_or(cost[2]);
-    let remaining = (cost[1] * 0.25)
-        .max((horizon - age).max(0.0) * 0.5)
-        .max(1.0);
-    [0.0, remaining, (cost[2] - age).max(remaining * 2.0)]
+    let remaining = (cost[1] * 0.25).max(1.0);
+    [
+        0.0,
+        remaining,
+        (cost[2] - age).max(horizon - age).max(remaining * 2.0),
+    ]
 }
 
 /// Shared with a native coordinator; snapshots remain callable on the JS thread.

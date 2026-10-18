@@ -136,7 +136,7 @@ fn effective_capacity_and_occupied_long_running_workers_control_the_tail() {
     );
     assert_eq!(
         remaining(&c, 160.0),
-        375.0,
+        325.0,
         "draining workers must finish before new work uses reduced capacity"
     );
     event(
@@ -325,4 +325,259 @@ fn extreme_normalization_is_unknown_instead_of_nonfinite_json() {
     assert!(value["remainingMs"].is_null());
     assert_eq!(value["state"], "partial");
     assert_eq!(value["knownRemainingMs"], 0.0);
+}
+
+#[test]
+fn configured_timeout_changes_uncertainty_not_the_expected_overrun_duration() {
+    for observed in [false, true] {
+        let mut predictions = vec![];
+        for timeout in [None, Some(300.0), Some(1_200_000.0)] {
+            let mut c = campaign(json!([{"id":"s"}]));
+            let mut p = plan(&[Some(100.0); 2], 1);
+            for job in p["jobs"].as_array_mut().unwrap() {
+                job["timeoutMs"] = json!(timeout);
+            }
+            begin(&mut c, p);
+            if observed {
+                event(
+                    &mut c,
+                    json!({"type":"finish","scopeId":"s","jobId":"0","atMs":10,"durationMs":100}),
+                );
+            }
+            event(
+                &mut c,
+                json!({"type":"start","scopeId":"s","jobId":"1","atMs":10}),
+            );
+            let snapshot = c.estimate(210.0).unwrap();
+            let central = remaining(&c, 210.0);
+            assert!(
+                central > 0.0,
+                "unfinished jobs retain positive residual work"
+            );
+            assert!(snapshot["range"]["upperMs"].as_f64().unwrap() >= central);
+            predictions.push(central);
+        }
+        assert_eq!(predictions[0], predictions[1]);
+        assert_eq!(
+            predictions[0], predictions[2],
+            "a configured limit is not a duration observation"
+        );
+    }
+}
+
+#[test]
+fn empirical_running_tail_conditions_on_only_longer_observations() {
+    let mut c = campaign(json!([{"id":"s"}]));
+    begin(&mut c, plan(&[Some(100.0); 4], 1));
+    for (id, wall) in [(0, 40), (1, 100), (2, 300)] {
+        event(
+            &mut c,
+            json!({"type":"finish","scopeId":"s","jobId":id.to_string(),"atMs":10,"durationMs":wall}),
+        );
+    }
+    event(
+        &mut c,
+        json!({"type":"start","scopeId":"s","jobId":"3","atMs":10}),
+    );
+    assert_eq!(
+        remaining(&c, 160.0),
+        150.0,
+        "E[T-age | T>age], not unconditional mean minus age"
+    );
+    assert!(
+        remaining(&c, 1_000.0) > 0.0,
+        "the observed maximum is not a deadline"
+    );
+}
+
+#[test]
+fn shared_forecasts_keep_baseline_normalization_reload_groups_and_timeouts_separate() {
+    let mut c = campaign(json!([{"id":"s"}]));
+    let mut p = plan(
+        &[
+            Some(100.0),
+            Some(100.0),
+            Some(100.0),
+            Some(200.0),
+            Some(100.0),
+            Some(200.0),
+        ],
+        2,
+    );
+    for id in [1, 4, 5] {
+        p["jobs"][id]["reload"] = json!(true);
+    }
+    p["jobs"][2]["timeoutMs"] = json!(1_200_000.0);
+    begin(&mut c, p);
+    event(
+        &mut c,
+        json!({"type":"finish","scopeId":"s","jobId":"0","atMs":10,"durationMs":50}),
+    );
+    event(
+        &mut c,
+        json!({"type":"finish","scopeId":"s","jobId":"1","atMs":10,"durationMs":300}),
+    );
+    // Remaining FIFO costs are [50,100,300,600]. Two workers finish at 350,700.
+    assert_eq!(remaining(&c, 10.0), 700.0);
+    for id in [2, 3] {
+        event(
+            &mut c,
+            json!({"type":"start","scopeId":"s","jobId":id.to_string(),"atMs":10}),
+        );
+    }
+    assert_eq!(remaining(&c, 30.0), 680.0);
+}
+
+#[test]
+fn dealyv_semantic_replay_keeps_baselines_inside_first_outer_mutant_runs() {
+    // Recorded SDK epochs relative to 1792299953847.148. First calls include
+    // each worker's inactive baseline; later calls use their active-run start.
+    // This replays semantic shape, not exact IPC timestamps (not captured).
+    // (id, outer start, outer finish): creation order differs from completion.
+    let calls: [(usize, f64, f64); 13] = [
+        (0, 0.004, 38_274.567),
+        (1, 0.0, 27_314.626),
+        (2, 0.163, 27_476.427),
+        (3, 391.803, 28_519.394),
+        (4, 0.015, 38_323.384),
+        (5, 854.264, 38_738.560),
+        (6, 407.570, 27_724.050),
+        (7, 920.497, 28_677.277),
+        (8, 27_320.386, 30_532.459),
+        (9, 27_480.140, 31_173.717),
+        (10, 27_727.155, 30_928.824),
+        (11, 28_532.582, 31_588.849),
+        (12, 28_680.854, 31_502.229),
+    ];
+    let mut c = campaign(json!([{"id":"s"}]));
+    event(&mut c, json!({"type":"begin","scopeId":"s","atMs":0}));
+    let mut p = plan(&[Some(9_025.0); 13], 4);
+    for job in p["jobs"].as_array_mut().unwrap() {
+        job["timeoutMs"] = json!(1_211_904.5);
+        job["reload"] = json!(true);
+    }
+    p["unmeasuredWork"] = json!(["checker processing time unmeasured"]);
+    event(
+        &mut c,
+        json!({"type":"plan","scopeId":"s","atMs":0,"plan":p}),
+    );
+    assert_eq!(c.estimate(0.0).unwrap()["state"], "partial");
+    event(
+        &mut c,
+        json!({"type":"capacity","scopeId":"s","atMs":0,"runners":8,"unmeasuredWork":[]}),
+    );
+    let mut events = calls
+        .iter()
+        .flat_map(|&(id, start, finish)| {
+            [
+                (
+                    start,
+                    json!({"type":"start","scopeId":"s","jobId":id.to_string(),"atMs":start}),
+                ),
+                (
+                    finish,
+                    json!({"type":"finish","scopeId":"s","jobId":id.to_string(),"atMs":finish}),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    events.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut events = events.into_iter().peekable();
+    for at in [9_152.852, 19_152.852, 29_152.852] {
+        while events.peek().is_some_and(|(time, _)| *time <= at) {
+            event(&mut c, events.next().unwrap().1);
+        }
+        let snapshot = c.estimate(at).unwrap();
+        let scope = &snapshot["scopes"][0];
+        assert_eq!(scope["plannedJobs"], 13);
+        assert_eq!(
+            scope["completedJobs"].as_u64().unwrap()
+                + scope["runningJobs"].as_u64().unwrap()
+                + scope["queuedJobs"].as_u64().unwrap(),
+            13
+        );
+        println!(
+            "dealyv replay at={at:.3} remaining={:.3} actual={:.3} completed={} running={} queued={}",
+            remaining(&c, at),
+            38_738.560 - at,
+            scope["completedJobs"],
+            scope["runningJobs"],
+            scope["queuedJobs"]
+        );
+        assert!(
+            remaining(&c, at) < 60_000.0,
+            "20-minute configuration must not create a ten-minute central forecast"
+        );
+    }
+    for (_, value) in events {
+        event(&mut c, value);
+    }
+    assert_eq!(c.scopes[0].completed, 13);
+    assert_eq!(c.scopes[0].samples.len(), 13);
+    assert_eq!(remaining(&c, 38_738.560), 0.0);
+    event(
+        &mut c,
+        json!({"type":"end","scopeId":"s","atMs":38_738.560}),
+    );
+    assert_eq!(c.estimate(38_738.560).unwrap()["state"], "complete");
+}
+
+#[test]
+fn dropped_and_late_events_do_not_fabricate_samples_or_completion() {
+    let mut c = campaign(json!([{"id":"s"},{"id":"undiscovered"}]));
+    begin(&mut c, plan(&[Some(100.0); 3], 2));
+    // A terminal checker result, and a dropped start with a measured IPC finish.
+    event(
+        &mut c,
+        json!({"type":"finish","scopeId":"s","jobId":"0","atMs":20,"sample":false}),
+    );
+    event(
+        &mut c,
+        json!({"type":"finish","scopeId":"s","jobId":"1","atMs":30,"durationMs":50,"attempts":1,"timedOut":true}),
+    );
+    event(
+        &mut c,
+        json!({"type":"start","scopeId":"s","jobId":"2","atMs":30}),
+    );
+    let last_at = c.last_at;
+    for invalid in [
+        json!({"type":"end","scopeId":"s","atMs":40}),
+        json!({"type":"finish","scopeId":"s","jobId":"1","atMs":40,"durationMs":1}),
+        json!({"type":"finish","scopeId":"s","jobId":"2","atMs":29}),
+    ] {
+        assert!(c.record(serde_json::from_value(invalid).unwrap()).is_err());
+        assert_eq!(c.last_at, last_at);
+    }
+    // Cancellation without a final finish/end cannot become a successful end.
+    let snapshot = c.estimate(10_000.0).unwrap();
+    assert_eq!(snapshot["state"], "partial");
+    assert!(snapshot["remainingMs"].is_null());
+    assert!(snapshot["range"]["upperMs"].is_null());
+    assert!(snapshot["knownRemainingMs"].as_f64().unwrap() > 0.0);
+    assert_eq!(snapshot["scopes"][0]["completedJobs"], 2);
+    assert_eq!(snapshot["scopes"][0]["runningJobs"], 1);
+    assert_eq!(snapshot["scopes"][0]["provenance"]["currentSamples"], 1);
+}
+
+#[test]
+fn timeout_budget_and_unmeasured_finish_do_not_invent_a_duration_scale() {
+    for timeout in [None, Some(1_200_000.0)] {
+        let mut c = campaign(json!([{"id":"s"}]));
+        let mut p = plan(&[None; 2], 1);
+        for job in p["jobs"].as_array_mut().unwrap() {
+            job["timeoutMs"] = json!(timeout);
+        }
+        begin(&mut c, p);
+        // A dropped start without an explicit duration retires the result only.
+        event(
+            &mut c,
+            json!({"type":"finish","scopeId":"s","jobId":"0","atMs":20}),
+        );
+        let snapshot = c.estimate(20.0).unwrap();
+        assert_eq!(snapshot["state"], "partial");
+        assert!(snapshot["remainingMs"].is_null());
+        assert_eq!(snapshot["knownRemainingMs"], 0.0);
+        assert_eq!(snapshot["scopes"][0]["completedJobs"], 1);
+        assert_eq!(snapshot["scopes"][0]["provenance"]["currentSamples"], 0);
+    }
 }
