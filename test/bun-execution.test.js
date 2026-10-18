@@ -100,6 +100,122 @@ function fixture() {
     session: () => new BunFileCoverageSession({ files, identityFiles: [...names.map((n) => join(directory, n)), childEntry], qualification, completion: { bunPath: 'bun' } }) };
 }
 
+function sameFileChildFixture(f, { coverage = false, childSetup = '', childAfter = '', command, options } = {}) {
+  writeFileSync(f.files[0], `import {test,expect,afterAll} from 'bun:test';
+    import {a,initial} from './a.js'; import {child} from './child.js';
+    if(process.env.SAME_FILE_CHILD==='1') {
+      ${childSetup}
+      test('child dynamic',()=>{
+        expect(Bun.main).toBe(import.meta.path);
+        expect(child()).toBe('child');
+        process.stdout.write('OWNED_CHILD_FILE '+JSON.stringify({file:Bun.main,testFile:import.meta.path})+'\\n');
+      });
+      ${childAfter}
+    } else {
+      test('root dynamic',()=>{ expect(a(1)).toBe(2); expect(initial).toBe(true); });
+      test('same-file child',()=>{
+        const result=Bun.spawnSync(${command ?? `[process.execPath,'--no-env-file','test',${coverage ? "'--coverage'," : ''}import.meta.path]`},
+          ${options ?? "{env:{...process.env,SAME_FILE_CHILD:'1'},timeout:2000}"});
+        ${command || options || childAfter ? '// Negative fixtures intentionally retain a successful root even when its child fails.' : `
+          expect(result.exitCode,result.stderr.toString()).toBe(0);
+          expect(Buffer.isBuffer(result.stdout)).toBe(true);expect(Buffer.isBuffer(result.stderr)).toBe(true);
+          const identity=result.stdout.toString().split('\\n').find(line=>line.startsWith('OWNED_CHILD_FILE '));
+          expect(JSON.parse(identity.slice('OWNED_CHILD_FILE '.length))).toEqual({file:import.meta.path,testFile:import.meta.path});
+          process.stdout.write(result.stdout);
+        `}
+      });
+    }
+  `);
+}
+
+bunTest('same-file Bun test children bind dynamic hooks while imports and child top-level hits stay static', async () => {
+  const f = fixture();
+  const witnesses = [];
+  try {
+    for (const coverage of [false, true]) {
+      sameFileChildFixture(f, { coverage });
+      const baseline = await run(f.files, {});
+      assert.equal(baseline.status, 'survived', baseline.stderr);
+      const session = f.session();
+      const receipts = [];
+      const results = [];
+      await session.collect(async (files) => {
+        const result = await run(files, session.env);
+        results.push(result);
+        const { directory } = JSON.parse(session.env.STRYKER_RUST_FILE_COVERAGE);
+        receipts.push(...readdirSync(directory).map((name) => readFileSync(join(directory, name), 'utf8').trim().split('\n').map(JSON.parse)));
+        return result;
+      }, baseline);
+      witnesses.push({ coverage, receipts, results, stats: session.stats, reason: session.reason });
+      writeFileSync(join(artifactRoot, 'same-file-child-witnesses.json'), JSON.stringify(witnesses, null, 2));
+      assert.equal(session.reason, 'Complete owned receipts');
+      assert.equal(session.stats.participants, 3);
+      const childIds = f.mutants.filter((mutant) => mutant.fileName === f.sources[2]).map((mutant) => mutant.id);
+      assert.ok(childIds.length > 0);
+      const childReceipt = receipts.find((events) => events[0].parent === 'root');
+      assert.equal(childReceipt?.[0].file, f.files[0]);
+      assert.ok(childReceipt.some((event) => event.type === 'hit' && event.phase === 'test' && childIds.includes(event.mutant)));
+      assert.ok(receipts.some((events) => events[0].parent === null && events.some((event) => event.type === 'hit' && event.phase === 'test')));
+      for (const id of childIds) assert.deepEqual(session.select(id).files, [f.files[0]]);
+      assert.ok(f.mutants.some((mutant) => session.select(mutant.id).reason === 'Static mutation'));
+      assert.equal(session.select('unknown').files, undefined);
+      assert.equal(session.select(childIds[0], { staticMutation: true }).files, undefined);
+    }
+    sameFileChildFixture(f, { coverage: true, childSetup: 'child();' });
+    const staticChild = f.session();
+    await staticChild.collect((files) => run(files, staticChild.env), { status: 'survived' });
+    assert.equal(staticChild.reason, 'Complete owned receipts');
+    for (const mutant of f.mutants.filter((mutant) => mutant.fileName === f.sources[2])) {
+      assert.equal(staticChild.select(mutant.id).reason, 'Static mutation');
+      assert.equal(staticChild.select(mutant.id).files, undefined);
+    }
+    writeFileSync(join(artifactRoot, 'same-file-child-witnesses.json'), JSON.stringify(witnesses, null, 2));
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+bunTest('positive root hits cannot hide unsupported same-file child forms, unfinished work or late child errors', async () => {
+  const f = fixture();
+  const witnesses = [];
+  try {
+    const scenarios = [
+      { name: 'other file', command: `[process.execPath,'--no-env-file','test',${JSON.stringify(f.files[1])}]` },
+      { name: 'additional test flag', command: "[process.execPath,'--no-env-file','test','--coverage','--timeout=100',import.meta.path]" },
+      { name: 'missing no-env-file', command: "[process.execPath,'test',import.meta.path]" },
+      { name: 'object form', command: "{cmd:[process.execPath,'--no-env-file','test',import.meta.path],env:{...process.env,SAME_FILE_CHILD:'1'}}" },
+      { name: 'changed cwd', options: "{env:{...process.env,SAME_FILE_CHILD:'1'},cwd:process.cwd()}" },
+      { name: 'redirected pipe', options: "{env:{...process.env,SAME_FILE_CHILD:'1'},stdout:'ignore'}" },
+      { name: 'unknown session', options: "{env:{...process.env,SAME_FILE_CHILD:'1',STRYKER_RUST_FILE_COVERAGE:''}}" },
+      { name: 'changed Bun options', options: "{env:{...process.env,SAME_FILE_CHILD:'1',BUN_OPTIONS:'--smol'}}" },
+      { name: 'unknown option', options: "{env:{...process.env,SAME_FILE_CHILD:'1'},lazy:true}" },
+      { name: 'inherited option', options: "Object.assign(Object.create({stdout:'ignore'}),{env:{...process.env,SAME_FILE_CHILD:'1'}})" },
+      { name: 'pending timer', childAfter: 'afterAll(()=>{setTimeout(()=>{},1000)});' },
+      { name: 'async timer callback', childAfter: 'afterAll(async()=>{await new Promise(done=>setTimeout(async()=>{child();done()},1))});' },
+      { name: 'late child error', childAfter: "afterAll(()=>{queueMicrotask(()=>{throw Error('late child error')})});" },
+      { name: 'caught child test failure', childAfter: "test('child failure',()=>{throw Error('caught by root')});" },
+    ];
+    for (const scenario of scenarios) {
+      sameFileChildFixture(f, scenario);
+      const session = f.session();
+      const receipts = [];
+      let result;
+      await session.collect(async (files) => {
+        result = await run(files, session.env);
+        const { directory } = JSON.parse(session.env.STRYKER_RUST_FILE_COVERAGE);
+        receipts.push(...readdirSync(directory).map((name) => readFileSync(join(directory, name), 'utf8').trim().split('\n').map(JSON.parse)));
+        return result;
+      }, { status: 'survived' });
+      witnesses.push({ scenario, reason: session.reason, result, receipts });
+      writeFileSync(join(artifactRoot, 'same-file-child-fallbacks.json'), JSON.stringify(witnesses, null, 2));
+      assert.equal(result.status, 'survived', `${scenario.name}\n${result.stderr}`);
+      assert.ok(receipts.some((events) => events[0].parent === null && events.some((event) => event.type === 'hit' && event.phase === 'test')));
+      assert.equal(session.index, undefined, scenario.name);
+      assert.equal(session.select('0').files, undefined, scenario.name);
+      assert.notEqual(session.reason, 'Complete owned receipts', scenario.name);
+    }
+    writeFileSync(join(artifactRoot, 'same-file-child-fallbacks.json'), JSON.stringify(witnesses, null, 2));
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});
+
 bunTest('caught in-scope launch rejections still invalidate an otherwise valid collection', async () => {
   const f = fixture();
   const rows = [];

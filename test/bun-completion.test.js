@@ -1,9 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ChildProcess, spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
+import { createHash, randomUUID } from 'node:crypto';
 import { BunProducer } from '../lib/bun-producer.js';
 import { BunFileCoverageSession } from '../lib/bun-execution.js';
 import { assertProcessStopped } from './helpers.js';
@@ -23,9 +24,9 @@ function fixture(body = "test('pass',()=>{});") {
   return { directory, file, context };
 }
 
-function launch(f, { early = false, stdio = ['ignore', 'pipe', 'pipe'], binary = 'bun' } = {}) {
-  const child = spawn(binary, ['--no-env-file', 'test', f.file], {
-    detached: true, stdio, env: { ...process.env, STRYKER_RUST_FILE_COVERAGE: JSON.stringify(f.context) },
+function launch(f, { early = false, stdio = ['ignore', 'pipe', 'pipe'], binary = 'bun', args = ['--no-env-file', 'test', f.file], env = {} } = {}) {
+  const child = spawn(binary, args, {
+    detached: true, stdio, env: { ...process.env, ...env, STRYKER_RUST_FILE_COVERAGE: JSON.stringify(f.context) },
   });
   let stdout = '', stderr = '';
   const seen = [];
@@ -37,6 +38,117 @@ function launch(f, { early = false, stdio = ['ignore', 'pipe', 'pipe'], binary =
   });
   return { child, result, seen };
 }
+
+owned('the exact exec-only wrapper preserves its cwd, environment, preload and real completion', async () => {
+  const f = fixture(`test('wrapper semantics',()=>{
+    if(process.cwd()!==process.env.EXPECTED_CWD || process.env.WRAPPER_MARKER!=='preserved' || !globalThis.__wrapperPreload)
+      throw Error('Changed wrapper semantics');
+  });`);
+  const before = Object.getOwnPropertyDescriptor(ChildProcess.prototype, 'spawn');
+  const binary = join(f.directory, 'mutation-bun.sh');
+  const preload = join(f.directory, 'options-preload.js');
+  const cwd = join(f.directory, 'scope');
+  mkdirSync(cwd);
+  writeFileSync(preload, 'globalThis.__wrapperPreload=true;');
+  writeFileSync(binary, readFileSync(new URL('./fixtures/bun/mutation-bun.sh', import.meta.url)), { mode: 0o700 });
+  const env = { MUTATION_TEST_DIRECTORY: cwd, MUTATION_DRY_RUN_LOG: '', EXPECTED_CWD: cwd,
+    WRAPPER_MARKER: 'preserved', BUN_OPTIONS: `--preload=${preload}`, __STRYKER_ACTIVE_MUTANT__: '' };
+  try {
+    const outcome = await new BunProducer({ bunPath: binary }).run(f.context, performance.now() + 2000,
+      () => launch(f, { binary, args: ['test', f.file], env }).result);
+    assert.equal(outcome.result.status, 'survived', outcome.result.stderr);
+    const events = outcome.completion.trim().split('\n').map(JSON.parse);
+    assert.equal(events[0].type, 'spawn');
+    assert.equal(events.at(-1).type, 'result');
+    assert.deepEqual(events.filter((event) => event.type === 'eof').map((event) => event.fd).sort(), [1, 2]);
+    assert.ok(events.some((event) => event.type === 'close' && event.code === 0));
+    assertProcessStopped(events[0].pid);
+    sameDescriptor(before);
+    writeFileSync(join(artifacts, 'wrapper-completion.json'), JSON.stringify(outcome, null, 2));
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+owned('wrapper tee mode, shell overrides, runtime changes and source tampering cannot authorize completion', async () => {
+  const f = fixture();
+  const before = Object.getOwnPropertyDescriptor(ChildProcess.prototype, 'spawn');
+  const binary = join(f.directory, 'mutation-bun.sh');
+  const source = readFileSync(new URL('./fixtures/bun/mutation-bun.sh', import.meta.url));
+  const dryLog = join(f.directory, 'must-not-exist.log');
+  const env = { MUTATION_TEST_DIRECTORY: f.directory, MUTATION_DRY_RUN_LOG: '', __STRYKER_ACTIVE_MUTANT__: '' };
+  writeFileSync(binary, source, { mode: 0o700 });
+  try {
+    for (const [override, reason] of [
+      [{ MUTATION_DRY_RUN_LOG: dryLog }, /exec-only/],
+      [{ MUTATION_DRY_RUN_LOG: undefined }, /exec-only/],
+      [{ __STRYKER_ACTIVE_MUTANT__: 'active' }, /exec-only/],
+      [{ BASH_ENV: '' }, /shell environment/],
+      [{ 'BASH_FUNC_bun%%': '() { exit 0; }' }, /shell environment/],
+      [{ PATH: '/bin' }, /unavailable|cwd\/runtime/],
+    ]) {
+      await assert.rejects(new BunProducer({ bunPath: binary }).run(f.context, performance.now() + 2000,
+        () => launch(f, { binary, args: ['test', f.file], env: { ...env, ...override } }).result), reason);
+      sameDescriptor(before);
+    }
+    assert.equal(existsSync(dryLog), false);
+    await assert.rejects(new BunProducer({ bunPath: binary }).run(f.context, performance.now() + 2000, async () => {
+      const result = await launch(f, { binary, args: ['test', f.file], env }).result;
+      writeFileSync(binary, Buffer.concat([source, Buffer.from('\n# changed\n')]));
+      return result;
+    }), /source changed/);
+    sameDescriptor(before);
+    await assert.rejects(new BunProducer({ bunPath: binary }).run(f.context, performance.now() + 2000,
+      () => { assert.fail('A changed wrapper must be rejected before its callback'); }), /Unqualified/);
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});
+
+// Supply normal installed modules read-only. Never manufacture SDK variants by
+// copying or patching node_modules as part of this qualification fixture.
+for (const [name, variable, digest] of [
+  ['original', 'STRYKER_RUST_BUN_RUNNER_ORIGINAL_MODULE', '6be2e6f1b685c6655682de8cc8f1989f66cc420d16b9fc5b963b93bf018588f0'],
+  ['quiet-count patch', 'STRYKER_RUST_BUN_RUNNER_COUNT_PATCH_MODULE', '42465984c4ef1f0003773c8c8b1d72d8526bc944ab68aea427ac191630bd60ee'],
+]) {
+  test(`the exact ${name} SDK public mutantRun retains owned completion`, { skip: !host || !bun || !process.env[variable] }, async () => {
+    const runnerModule = resolve(process.env[variable]);
+    assert.equal(createHash('sha256').update(readFileSync(runnerModule)).digest('hex'), digest);
+    const { BunTestRunner } = await import(pathToFileURL(runnerModule).href);
+    for (const wrapped of [false, true]) {
+      const f = fixture();
+      const binary = wrapped ? join(f.directory, 'mutation-bun.sh') : 'bun';
+      if (wrapped) writeFileSync(binary, readFileSync(new URL('./fixtures/bun/mutation-bun.sh', import.meta.url)), { mode: 0o700 });
+      const runner = new BunTestRunner(new Proxy({}, { get: () => () => {} }), {
+        mutate: [], coverageAnalysis: 'off', disableBail: true,
+        bun: { bunPath: binary, testFiles: [f.file], env: { STRYKER_RUST_FILE_COVERAGE: JSON.stringify(f.context),
+          MUTATION_TEST_DIRECTORY: f.directory, MUTATION_DRY_RUN_LOG: '' } },
+      });
+      try {
+        await runner.init();
+        const producer = new BunProducer({ bunPath: binary, runnerModule });
+        const outcome = await producer.run(f.context, performance.now() + 3000, () => runner.mutantRun({
+          activeMutant: { id: '', fileName: f.file, static: false }, testFilter: [f.file], disableBail: true, timeout: 2000,
+        }));
+        writeFileSync(join(artifacts, `${digest.slice(0, 8)}-sdk-${wrapped ? 'wrapper' : 'direct'}-completion.json`), JSON.stringify(outcome, null, 2));
+        assert.equal(outcome.result.status, 'survived');
+        assert.equal(outcome.result.nrOfTests, 1);
+        const events = outcome.completion.trim().split('\n').map(JSON.parse);
+        assert.ok(events.some((event) => event.type === 'close' && event.code === 0));
+        assert.equal(events.at(-1).type, 'result');
+      } finally { await runner.dispose(); rmSync(f.directory, { recursive: true, force: true }); }
+    }
+  });
+}
+
+owned('matching SDK package metadata cannot admit an unknown implementation', async () => {
+  const f = fixture();
+  const dist = join(f.directory, 'dist');
+  mkdirSync(dist);
+  writeFileSync(join(f.directory, 'package.json'), JSON.stringify({ name: '@hughescr/stryker-bun-runner', version: '1.6.0' }));
+  const runnerModule = join(dist, 'index.js');
+  writeFileSync(runnerModule, 'export class BunTestRunner {}');
+  try {
+    await assert.rejects(new BunProducer({ bunPath: 'bun', runnerModule }).run(f.context, performance.now() + 1000,
+      () => { assert.fail('Unknown SDK source must be rejected before its callback'); }), /Unqualified Bun runner/);
+  } finally { rmSync(f.directory, { recursive: true, force: true }); }
+});
 
 function sameDescriptor(before) {
   assert.deepEqual(Object.getOwnPropertyDescriptor(ChildProcess.prototype, 'spawn'), before);

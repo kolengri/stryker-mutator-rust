@@ -7,7 +7,8 @@ export class BunFileCoverageSession {
     qualification?: 'independent-files-bun-sync-v1';
     env?: Record<string, string | undefined>;
     collectionBudgetMs?: number;
-    /** Direct Bun executable; SDK adapters also pin their actual module path. */
+    /** Direct Bun or the exact qualified mutation-bun.sh in inactive exec-only mode;
+     * SDK adapters also pin their actual module path. */
     completion?: { bunPath: string; runnerModule?: string; drainTimeoutMs?: number };
   });
   readonly env: Record<string, string | undefined>;
